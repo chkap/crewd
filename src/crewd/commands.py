@@ -2,6 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import time
 from rich.console import Console
@@ -174,6 +175,53 @@ def cmd_goal(workspace: Path, edit: bool) -> int:
 
 
 # ─────────────────────────── run ───────────────────────────
+class _LoopController:
+    """Holds state for the foreground loop. Allows clean signal handling."""
+
+    def __init__(self, ws: Workspace, cfg: CrewConfig, backend, cwd: Path):
+        self.ws = ws
+        self.cfg = cfg
+        self.backend = backend
+        self.cwd = cwd
+        self._interrupted = False
+
+    def request_stop(self, signum, frame):
+        if self._interrupted:
+            console.print("\n[red]double signal — exiting hard[/]")
+            sys.exit(130)
+        console.print(f"\n[yellow]signal {signum} received — finishing current tick then stopping[/]")
+        self._interrupted = True
+
+    def loop(self, once: bool) -> int:
+        cycle = self.ws.read_cycle()
+        while True:
+            if self.ws.is_stopped():
+                console.print(f"[yellow]STOPPED sentinel present; exiting at cycle {cycle}[/]")
+                return 0
+            if self._interrupted:
+                console.print("[yellow]interrupted; exiting cleanly[/]")
+                return 0
+            cycle += 1
+            self.ws.write_cycle(cycle)
+            console.print(f"\n[bold cyan]── cycle {cycle} ──[/]")
+            for r in ROLES:
+                if r not in self.cfg.roles:
+                    continue
+                if self.ws.is_stopped() or self._interrupted:
+                    break
+                _tick_role(self.ws, self.cfg, self.backend, r, cycle, self.cwd)
+            if once:
+                return 0
+            if self.cfg.loop.max_cycles and cycle >= self.cfg.loop.max_cycles:
+                console.print(f"[blue]reached max_cycles={self.cfg.loop.max_cycles}[/]")
+                return 0
+            # Sleep in 1-second slices so signals/STOPPED are picked up promptly
+            for _ in range(self.cfg.loop.sleep_secs):
+                if self._interrupted or self.ws.is_stopped():
+                    break
+                time.sleep(1)
+
+
 def cmd_run(workspace: Path, once: bool, role: str | None) -> int:
     """Foreground loop. Walks roles in fixed order each cycle, sleeping between cycles.
 
@@ -205,29 +253,19 @@ def cmd_run(workspace: Path, once: bool, role: str | None) -> int:
         return 2
 
     if role:
-        # Single-role tick
         cycle = ws.read_cycle()
-        rc = _tick_role(ws, cfg, backend, role, cycle, co)
-        return rc
+        return _tick_role(ws, cfg, backend, role, cycle, co)
 
     ws.resume()  # clear STOPPED if present (run is explicit intent)
-    cycle = ws.read_cycle()
-    while True:
-        if ws.is_stopped():
-            console.print(f"[yellow]STOPPED sentinel present; exiting at cycle {cycle}[/]")
-            return 0
-        cycle += 1
-        ws.write_cycle(cycle)
-        console.print(f"\n[bold cyan]── cycle {cycle} ──[/]")
-        for r in ROLES:
-            if r not in cfg.roles:
-                continue
-            if ws.is_stopped():
-                break
-            _tick_role(ws, cfg, backend, r, cycle, co)
-        if once or (cfg.loop.max_cycles and cycle >= cfg.loop.max_cycles):
-            return 0
-        time.sleep(cfg.loop.sleep_secs)
+    ctrl = _LoopController(ws, cfg, backend, co)
+    # Install signal handlers (SIGINT, SIGTERM) — graceful stop
+    prev_int = signal.signal(signal.SIGINT, ctrl.request_stop)
+    prev_term = signal.signal(signal.SIGTERM, ctrl.request_stop)
+    try:
+        return ctrl.loop(once)
+    finally:
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
 
 
 def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, cwd: Path) -> int:
@@ -290,3 +328,96 @@ def cmd_status(workspace: Path) -> int:
             table.add_row(f"  {r}", f"{cfg.roles[r].model} ({cfg.roles[r].family})")
     console.print(table)
     return 0
+
+
+def cmd_resume(workspace: Path) -> int:
+    ws = Workspace(workspace.resolve())
+    if not ws.is_initialized():
+        console.print(f"[red]no workspace at[/] {workspace}")
+        return 1
+    if ws.is_stopped():
+        ws.resume()
+        console.print("[green]✓[/] STOPPED sentinel cleared")
+    else:
+        console.print("[blue]not stopped — nothing to do[/]")
+    return 0
+
+
+def cmd_logs(workspace: Path, role: str | None, cycle: int | None, tail: int, follow: bool) -> int:
+    """Show role logs.
+
+    No args: list recent logs across all roles.
+    --role X: list/show logs for role X.
+    --role X --cycle N: print that specific log.
+    --tail N: tail last N lines.
+    --follow: tail -f the latest log for --role.
+    """
+    ws = Workspace(workspace.resolve())
+    if not ws.is_initialized():
+        console.print(f"[red]no workspace at[/] {workspace}")
+        return 1
+
+    logs_root = ws.state_dir / "logs"
+    if not logs_root.exists():
+        console.print("[yellow]no logs yet[/]")
+        return 0
+
+    if role and cycle is not None:
+        path = ws.log_file(role, cycle)
+        if not path.exists():
+            console.print(f"[red]not found:[/] {path}")
+            return 1
+        _print_tail(path, tail)
+        return 0
+
+    if role and follow:
+        # Tail the latest log for the role
+        rdir = logs_root / role
+        latest = _latest_log(rdir)
+        if not latest:
+            console.print(f"[yellow]no logs for {role}[/]")
+            return 0
+        console.print(f"[blue]tailing[/] {latest}  (Ctrl-C to stop)")
+        try:
+            subprocess.run(["tail", "-n", str(tail), "-F", str(latest)])
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    if role:
+        rdir = logs_root / role
+        latest = _latest_log(rdir)
+        if not latest:
+            console.print(f"[yellow]no logs for {role}[/]")
+            return 0
+        _print_tail(latest, tail)
+        return 0
+
+    # No role: list recent across all roles
+    table = Table(title="recent logs")
+    table.add_column("role"); table.add_column("cycle"); table.add_column("size"); table.add_column("path")
+    rows = []
+    for r in ROLES:
+        rdir = logs_root / r
+        if not rdir.exists():
+            continue
+        for f in sorted(rdir.glob("*.log")):
+            rows.append((r, f.stem, f.stat().st_size, f))
+    rows.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    for role_, cyc, sz, p in rows[:20]:
+        table.add_row(role_, cyc, f"{sz}B", str(p))
+    console.print(table)
+    return 0
+
+
+def _latest_log(rdir: Path) -> Path | None:
+    if not rdir.exists():
+        return None
+    files = sorted(rdir.glob("*.log"))
+    return files[-1] if files else None
+
+
+def _print_tail(path: Path, n: int) -> None:
+    lines = path.read_text(errors="replace").splitlines()
+    for line in lines[-n:]:
+        console.print(line, highlight=False)

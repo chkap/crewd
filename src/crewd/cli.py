@@ -79,5 +79,23 @@ def status(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
     raise typer.Exit(commands.cmd_status(_ws_opt(workspace)))
 
 
+@app.command()
+def resume(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
+    """Clear STOPPED sentinel."""
+    raise typer.Exit(commands.cmd_resume(_ws_opt(workspace)))
+
+
+@app.command()
+def logs(
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+    role: Optional[str] = typer.Option(None, "--role", "-r"),
+    cycle: Optional[int] = typer.Option(None, "--cycle", "-c"),
+    tail: int = typer.Option(50, "--tail", "-n"),
+    follow: bool = typer.Option(False, "--follow", "-f"),
+):
+    """List or print role logs."""
+    raise typer.Exit(commands.cmd_logs(_ws_opt(workspace), role, cycle, tail, follow))
+
+
 if __name__ == "__main__":
     app()
