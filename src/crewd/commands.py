@@ -1,6 +1,7 @@
 """Command implementations. Each command is a function called from cli.py."""
 from __future__ import annotations
 from pathlib import Path
+from datetime import datetime, timezone
 import subprocess
 import signal
 import sys
@@ -12,6 +13,7 @@ from .config import CrewConfig, default_config, ROLES
 from .workspace import Workspace
 from .templates_render import render, write_if_absent
 from .backends import get_backend
+from . import registry
 
 console = Console()
 
@@ -36,6 +38,9 @@ def cmd_init(path: Path, name: str | None, repo: str | None) -> int:
 
     # Per-role agent.md
     _render_agent_files(ws, cfg)
+
+    # Register in user-level registry so `crewd list` finds it
+    registry.register(name, path, repo)
 
     console.print(f"[green]✓[/] initialized workspace at [bold]{path}[/]")
     console.print(f"  edit [cyan]{ws.goal_md}[/] then run: [bold]crewd attach <owner/repo>[/] (or pass --repo at init)")
@@ -80,6 +85,7 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
         cfg.target.branch = branch
     cfg.save(ws.crew_yaml)
     _render_agent_files(ws, cfg)  # refresh agent.md with repo name
+    registry.register(cfg.name, ws.root, repo)  # update registry repo field
 
     co = ws.checkout_dir(cfg.target.checkout)
     if clone and not co.exists():
@@ -280,7 +286,10 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, c
     prompt = (
         f"This is cycle {cycle}. Read the latest GitHub issues + comments in "
         f"`{cfg.target.repo}` and execute your role's responsibilities. "
-        f"GOAL.md is at `{ws.goal_md}`. Do one tick and stop."
+        f"GOAL.md is at `{ws.goal_md}`. "
+        f"If `{ws.state_dir / 'inbox' / (role + '.md')}` exists, read its messages "
+        f"from the human operator FIRST, then truncate that file to empty. "
+        f"Do one tick and stop."
     )
     add_dirs = [ws.root]  # workspace as readable context
     console.print(f"  [magenta]{role}[/] ({role_cfg.model}) → {log_path}")
@@ -421,3 +430,73 @@ def _print_tail(path: Path, n: int) -> None:
     lines = path.read_text(errors="replace").splitlines()
     for line in lines[-n:]:
         console.print(line, highlight=False)
+
+
+# ─────────────────────────── list / cd ───────────────────────────
+def cmd_list(prune: bool) -> int:
+    """List registered workspaces."""
+    if prune:
+        removed = registry.prune_missing()
+        for p in removed:
+            console.print(f"[yellow]pruned[/] {p}")
+    entries = registry.all_workspaces()
+    if not entries:
+        console.print("[yellow]no workspaces registered[/]  (run [bold]crewd init <path>[/])")
+        return 0
+    table = Table(title="crewd workspaces")
+    table.add_column("name"); table.add_column("repo"); table.add_column("path"); table.add_column("status")
+    for w in entries:
+        ws = Workspace(Path(w["path"]))
+        if not ws.is_initialized():
+            status = "[red]missing[/]"
+        elif ws.is_stopped():
+            status = "[yellow]stopped[/]"
+        else:
+            status = f"cycle {ws.read_cycle()}"
+        table.add_row(w["name"], w.get("repo") or "-", w["path"], status)
+    console.print(table)
+    return 0
+
+
+def cmd_cd(name: str) -> int:
+    """Print absolute path of a registered workspace by name (for shell `cd $(crewd cd foo)`)."""
+    entry = registry.find(name)
+    if not entry:
+        console.print(f"[red]no workspace matching[/] {name}")
+        return 1
+    print(entry["path"])
+    return 0
+
+
+# ─────────────────────────── talk ───────────────────────────
+def cmd_talk(workspace: Path, role: str, message: str) -> int:
+    """Append a message from the human operator to a role's inbox file.
+
+    The inbox file lives at state/inbox/<role>.md and the role reads it on its
+    next tick (we instruct the agent in its prompt to consume + clear it).
+    This is the operator's way to nudge a role without touching GitHub issues.
+    """
+    ws = Workspace(workspace.resolve())
+    if not ws.is_initialized():
+        console.print(f"[red]no workspace at[/] {workspace}")
+        return 1
+    if role not in ROLES:
+        console.print(f"[red]unknown role:[/] {role}  (one of {ROLES})")
+        return 1
+    inbox = ws.state_dir / "inbox" / f"{role}.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with open(inbox, "a") as f:
+        f.write(f"\n---\n## [operator @ {ts}]\n{message}\n")
+    console.print(f"[green]✓[/] queued message for [bold]{role}[/] → {inbox}")
+    return 0
+
+
+# ─────────────────────────── tick ───────────────────────────
+def cmd_tick(workspace: Path, role: str) -> int:
+    """Force-run a single tick for one role, ignoring the loop schedule.
+
+    Equivalent to `crewd run --role <role>` but reads better as an imperative
+    operator action ("tick the worker right now").
+    """
+    return cmd_run(workspace, once=False, role=role)

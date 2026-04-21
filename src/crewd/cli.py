@@ -97,5 +97,36 @@ def logs(
     raise typer.Exit(commands.cmd_logs(_ws_opt(workspace), role, cycle, tail, follow))
 
 
+@app.command(name="list")
+def list_(prune: bool = typer.Option(False, "--prune", help="Remove registry entries whose path no longer exists.")):
+    """List all registered crewd workspaces."""
+    raise typer.Exit(commands.cmd_list(prune))
+
+
+@app.command()
+def cd(name: str = typer.Argument(..., help="Workspace name (exact or unique prefix).")):
+    """Print the absolute path of a registered workspace. Use as: cd $(crewd cd <name>)."""
+    raise typer.Exit(commands.cmd_cd(name))
+
+
+@app.command()
+def talk(
+    role: str = typer.Argument(..., help="Target role: lead | worker | verifier | advisory."),
+    message: str = typer.Argument(..., help="Message to queue for the role."),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+):
+    """Queue an operator message in a role's inbox; consumed on next tick."""
+    raise typer.Exit(commands.cmd_talk(_ws_opt(workspace), role, message))
+
+
+@app.command()
+def tick(
+    role: str = typer.Argument(..., help="Role to tick once."),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+):
+    """Force a single tick for one role, ignoring the loop schedule."""
+    raise typer.Exit(commands.cmd_tick(_ws_opt(workspace), role))
+
+
 if __name__ == "__main__":
     app()
