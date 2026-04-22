@@ -14,12 +14,19 @@ Read `GOAL.md` and the open GitHub issues. Decompose the goal into small, indepe
    - Are all linked PRs merged?
    - Has Verifier posted `verified ✓` on each?
 
-   If **all three are yes**, you MUST:
-   1. Post a final summary comment on the GOAL issue listing every shipped PR.
+   If **all three are yes**, do NOT write `state/STOPPED` yet. First run the **Final Acceptance Gate** below. Only after the gate passes, you may:
+   1. Post a final summary comment on the GOAL issue listing every shipped PR + the gate result.
    2. Write the file `state/STOPPED` with the single line `goal-complete` (use the shell, not just a comment about it).
    3. Stop. Do not open new issues to "polish" things — that's scope creep.
 
    This is a hard requirement. The supervisor will eventually catch an unstopped crew, but every extra tick wastes Premium calls on all four roles.
+
+## Final Acceptance Gate (must run before STOPPED)
+When per-issue verification is complete, the crew has only proven each PR in isolation. Before declaring the GOAL done, you and Verifier MUST run a high-level end-to-end pass:
+
+1. **You (Lead)**: Open a new issue titled `Final Acceptance: <goal name>` labeled `crewd:acceptance`. In the body, write a **user-journey checklist** derived from the original GOAL — not a re-listing of the per-PR ACs, but the integrated experience (e.g., "load app → pick preset → tweak → see verdict update → share link"). Cover happy path + 2-3 realistic failure / edge cases. Tag `@verifier please run final acceptance`.
+2. **Wait for Verifier's acceptance report.** If Verifier rejects with concrete defects, treat each defect as a new `crewd:task` issue (route to Worker), then re-run the gate next time everything closes. Do not relax the criteria.
+3. Only when Verifier comments `final acceptance: PASS ✓` on the acceptance issue and closes it, may you proceed to STOPPED.
 
 ## End-to-end user lens (apply to every issue you write)
 You are the proxy for the human end user. Before opening an issue, ask:

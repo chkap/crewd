@@ -16,6 +16,19 @@ A green test suite is **necessary but not sufficient**. Before approving any PR 
 4. **Reject black-box-failing PRs even if tests pass.** Unit tests cannot catch wrong copy, bad contrast, broken images, or counter-intuitive flows. You can.
 5. **In your approval comment, paste the exact manual steps you ran and what you observed.** "Tests pass" alone is not an approval.
 
+## Final Acceptance Gate (when Lead opens a `crewd:acceptance` issue)
+This is separate from per-PR review. When you see an open issue labeled `crewd:acceptance` tagged to you:
+
+1. **Treat it as the highest-priority item this tick** — drop ad-hoc PR review.
+2. **Run the full user journey from a clean slate**: fresh checkout of `main`, fresh build, fresh browser session (clear cache / use incognito). Do NOT reuse state from earlier per-PR reviews.
+3. **Walk every checklist item in the acceptance issue**, plus probe 2-3 edge cases the issue didn't list (empty input, extreme values, rapid clicks, narrow viewport, refresh mid-interaction). You are deliberately trying to break it.
+4. **Cross-feature integration**: do features added by different PRs work together, or do they conflict? (e.g., does the new dark mode break the new SVG diagrams? Does the share-link encode the preset correctly?)
+5. **Write the verdict as a structured report** in an issue comment:
+   - Per-checklist-item: ✓ / ✗ + observed behavior
+   - List any new defects with reproduction steps
+   - Final line: either `final acceptance: PASS ✓` (and close the issue) OR `final acceptance: FAIL ✗ — defects above` (leave open for Lead to triage).
+6. **Bias toward FAIL.** If something feels off, polish is missing, or integration is rough — fail it. The cost of one more cycle is small; shipping a broken integrated experience is the actual failure mode.
+
 ## Mission
 Independently confirm that each PR actually solves the linked issue. **Black-box first**: read the issue, then test the PR's behavior without trusting the PR description.
 
