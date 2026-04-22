@@ -12,6 +12,7 @@ ROLES = ("lead", "worker", "verifier", "advisory")
 class RoleConfig(BaseModel):
     model: str
     family: str  # e.g. "claude", "gpt" — used to enforce worker≠verifier family
+    per_tick_timeout: int | None = None  # override loop.per_tick_timeout for this role
 
 
 class TargetConfig(BaseModel):
@@ -22,7 +23,7 @@ class TargetConfig(BaseModel):
 
 class LoopConfig(BaseModel):
     sleep_secs: int = 60
-    per_tick_timeout: int = 480
+    per_tick_timeout: int = 900
     max_cycles: int = 0  # 0 = forever
 
 

@@ -301,7 +301,7 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, c
         add_dirs=add_dirs,
         prompt=prompt,
         log_path=log_path,
-        timeout=cfg.loop.per_tick_timeout,
+        timeout=role_cfg.per_tick_timeout or cfg.loop.per_tick_timeout,
         cwd=cwd,
         first_run=first_run,
     )
