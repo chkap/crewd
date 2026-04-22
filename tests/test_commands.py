@@ -52,12 +52,14 @@ def test_cmd_doctor_passes_when_healthy(tmp_ws: Workspace, monkeypatch):
 def test_cmd_doctor_reports_template_goal(tmp_ws: Workspace, monkeypatch):
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
     commands._render_agent_files(tmp_ws, cfg)
-    # GOAL still has placeholder text
+    # GOAL still has placeholder text — now surfaced as a warning, not an error.
     tmp_ws.goal_md.write_text("Replace this file with your concrete goal\n")
     monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
     monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
     rc = commands.cmd_doctor(tmp_ws.root)
-    assert rc == 1
+    # Doctor exits 0 because the placeholder is "warn" severity, not "error".
+    # The warning should still appear in output.
+    assert rc == 0
 
 
 def test_cmd_doctor_reports_family_mismatch(tmp_ws: Workspace, monkeypatch):
@@ -72,11 +74,11 @@ def test_cmd_doctor_reports_family_mismatch(tmp_ws: Workspace, monkeypatch):
     assert rc == 1
 
 
-def test_cmd_doctor_reports_backend_unhealthy(tmp_ws: Workspace, monkeypatch):
-    cfg = CrewConfig.load(tmp_ws.crew_yaml)
-    commands._render_agent_files(tmp_ws, cfg)
+def test_cmd_doctor_missing_agent_md_is_error(tmp_ws: Workspace, monkeypatch):
+    """Doctor flags missing agents/<role>.agent.md as an error."""
     tmp_ws.goal_md.write_text("# GOAL\n\nReal.\n")
-    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=False))
+    # Don't render agents — they should be missing
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
     monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
     rc = commands.cmd_doctor(tmp_ws.root)
     assert rc == 1

@@ -5,6 +5,7 @@ import typer
 from typing import Optional
 
 from . import commands
+from .workspace import find_workspace
 
 app = typer.Typer(
     name="crewd",
@@ -15,7 +16,20 @@ app = typer.Typer(
 
 
 def _ws_opt(workspace: Optional[Path]) -> Path:
-    return workspace or Path.cwd()
+    """Resolve -w. If None, walk up from cwd looking for crew.yaml. Errors loudly."""
+    if workspace is not None:
+        return workspace
+    found = find_workspace(Path.cwd())
+    if found is not None:
+        return found
+    cwd = Path.cwd().resolve()
+    checked = [cwd, *cwd.parents]
+    typer.echo("error: no workspace found (no crew.yaml in cwd or any ancestor).", err=True)
+    typer.echo("checked:", err=True)
+    for c in checked:
+        typer.echo(f"  - {c}", err=True)
+    typer.echo("\nhint: pass -w/--workspace <path>, or run from inside a workspace, or `crewd init <path>`.", err=True)
+    raise typer.Exit(2)
 
 
 @app.command()
@@ -41,7 +55,7 @@ def attach(
 
 @app.command()
 def doctor(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
-    """Verify workspace, backend, and config sanity."""
+    """Print workspace status dashboard with diagnostics."""
     raise typer.Exit(commands.cmd_doctor(_ws_opt(workspace)))
 
 
@@ -59,9 +73,10 @@ def run(
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
     once: bool = typer.Option(False, "--once", help="Run a single cycle, then exit."),
     role: Optional[str] = typer.Option(None, "--role", help="Tick only this role once, then exit."),
+    no_auto_render: bool = typer.Option(False, "--no-auto-render", help="Skip auto re-render of agents/ from crew.yaml."),
 ):
     """Run the round-table loop in foreground."""
-    raise typer.Exit(commands.cmd_run(_ws_opt(workspace), once, role))
+    raise typer.Exit(commands.cmd_run(_ws_opt(workspace), once, role, auto_render=not no_auto_render))
 
 
 @app.command()
@@ -123,9 +138,10 @@ def talk(
 def tick(
     role: str = typer.Argument(..., help="Role to tick once."),
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+    no_auto_render: bool = typer.Option(False, "--no-auto-render", help="Skip auto re-render of agents/ from crew.yaml."),
 ):
     """Force a single tick for one role, ignoring the loop schedule."""
-    raise typer.Exit(commands.cmd_tick(_ws_opt(workspace), role))
+    raise typer.Exit(commands.cmd_tick(_ws_opt(workspace), role, auto_render=not no_auto_render))
 
 
 @app.command(name="new-goal")

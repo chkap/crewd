@@ -74,6 +74,28 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:
         agent_path.write_text(rendered)
 
 
+def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
+    """If crew.yaml is newer than any agent.md, or any are missing, re-render.
+
+    Returns True iff a re-render happened. Logs a one-line notice when it does.
+    """
+    if not ws.crew_yaml.exists():
+        return False
+    yaml_mtime = ws.crew_yaml.stat().st_mtime
+    needs = False
+    for role in ROLES:
+        if role not in cfg.roles:
+            continue
+        amd = ws.agent_file(role)
+        if not amd.exists() or amd.stat().st_mtime < yaml_mtime:
+            needs = True
+            break
+    if needs:
+        _render_agent_files(ws, cfg)
+        console.print("[blue]ℹ[/] auto-rendered agents/ from crew.yaml (use --no-auto-render to skip)")
+    return needs
+
+
 # ─────────────────────────── attach ───────────────────────────
 def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> int:
     ws = Workspace(workspace.resolve())
@@ -109,69 +131,172 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
 
 
 # ─────────────────────────── doctor ───────────────────────────
+def _inbox_summary(ws: Workspace, role: str) -> tuple[int, str | None]:
+    """Return (count, last_sender) for a role's inbox file. Best-effort parse."""
+    inbox = ws.state_dir / "inbox" / f"{role}.md"
+    if not inbox.exists():
+        return 0, None
+    try:
+        body = inbox.read_text(errors="replace")
+    except Exception:
+        return 0, None
+    headers = [ln for ln in body.splitlines() if ln.startswith("## [")]
+    last = None
+    if headers:
+        h = headers[-1].lstrip("# ").strip("[] ")
+        last = h.split("@", 1)[0].strip() or None
+    return len(headers), last
+
+
+def _read_goal_cycle(ws: Workspace) -> int | None:
+    """Best-effort read of cycle from state/goal.json if present (PR1 forward-compat)."""
+    gj = ws.state_dir / "goal.json"
+    if not gj.exists():
+        return None
+    try:
+        import json
+        data = json.loads(gj.read_text())
+        c = data.get("cycle")
+        if c is None:
+            c = data.get("cycles_used")
+        return int(c) if c is not None else None
+    except Exception:
+        return None
+
+
 def cmd_doctor(workspace: Path) -> int:
     ws = Workspace(workspace.resolve())
-    errs: list[str] = []
+    issues: list[tuple[str, str]] = []  # (severity, message); severity in {"error","warn"}
+
+    console.rule(f"[bold]crewd doctor[/] — {ws.root}")
+
     if not ws.is_initialized():
-        console.print(f"[red]no workspace at[/] {workspace}")
+        console.print(f"[red]✗ no crew.yaml at[/] {ws.root}")
         return 1
-    cfg = CrewConfig.load(ws.crew_yaml)
 
-    # Backend health
-    backend = get_backend(cfg.backend)
-    errs += backend.doctor()
-
-    # gh
     try:
-        r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
-        if r.returncode != 0:
-            errs.append("gh CLI not authenticated. Run: gh auth login")
-    except FileNotFoundError:
-        errs.append("gh CLI not found on PATH.")
+        cfg = CrewConfig.load(ws.crew_yaml)
+    except Exception as e:
+        console.print(f"[red]✗ crew.yaml invalid:[/] {e}")
+        return 1
+
+    console.print(
+        f"[green]✓[/] crew.yaml valid  ([bold]{cfg.name}[/], "
+        f"backend=[cyan]{cfg.backend}[/], target=[cyan]{cfg.target.repo or '(unset)'}[/])"
+    )
+
+    # Roles table
+    roles_tbl = Table(title="roles", show_lines=False)
+    roles_tbl.add_column("role"); roles_tbl.add_column("model"); roles_tbl.add_column("family")
+    roles_tbl.add_column("agent.md"); roles_tbl.add_column("session-state"); roles_tbl.add_column("last log")
+    yaml_mtime = ws.crew_yaml.stat().st_mtime
+    for role in ROLES:
+        if role not in cfg.roles:
+            continue
+        rc = cfg.roles[role]
+        amd = ws.agent_file(role)
+        if amd.exists():
+            if amd.stat().st_mtime < yaml_mtime:
+                amd_str = "[yellow]stale[/]"
+                issues.append(("warn", f"agents/{role}.agent.md is older than crew.yaml — re-render needed"))
+            else:
+                amd_str = "[green]ok[/]"
+        else:
+            amd_str = "[red]missing[/]"
+            issues.append(("error", f"agents/{role}.agent.md missing — run init/attach or `crewd run` (auto-render)"))
+        sdir = ws.role_cfg_dir(role) / "session-state"
+        if sdir.exists():
+            if not sdir.is_dir():
+                sess_str = "[red]corrupt[/]"
+                issues.append(("error", f"cfg/{role}/session-state exists but is not a directory"))
+            else:
+                sess_str = "[green]present[/]"
+        else:
+            sess_str = "[dim]none[/]"
+        ldir = ws.state_dir / "logs" / role
+        last_log_str = "[dim]—[/]"
+        if ldir.exists():
+            logs_ = sorted(ldir.glob("*.log"))
+            if logs_:
+                ts = datetime.fromtimestamp(logs_[-1].stat().st_mtime, tz=timezone.utc)
+                last_log_str = ts.isoformat(timespec="seconds")
+        roles_tbl.add_row(role, rc.model, rc.family, amd_str, sess_str, last_log_str)
+    console.print(roles_tbl)
 
     # Family check
-    errs += cfg.validate_families()
+    for e in cfg.validate_families():
+        issues.append(("error", e))
 
-    # Target attached?
+    # State table
+    cycle = ws.read_cycle()
+    goal_cycle = _read_goal_cycle(ws)
+    src = "cycle.txt"
+    if goal_cycle is not None:
+        cycle = goal_cycle
+        src = "goal.json"
+    state_tbl = Table(title="state")
+    state_tbl.add_column("field"); state_tbl.add_column("value")
+    state_tbl.add_row("STOPPED", "yes" if ws.is_stopped() else "no")
+    state_tbl.add_row(
+        "cycle",
+        f"{cycle} / {cfg.loop.max_cycles or '∞'}  (from {src})",
+    )
+    if ws.is_stopped() and cycle == 0:
+        issues.append(("error", "STOPPED present at cycle 0 — workspace is stuck. Run `crewd resume` then `crewd run`."))
+    if cfg.loop.max_cycles and cycle >= cfg.loop.max_cycles:
+        issues.append(("warn", f"cycle ({cycle}) has reached max_cycles ({cfg.loop.max_cycles})"))
+    console.print(state_tbl)
+
+    # Inbox table
+    in_tbl = Table(title="inbox")
+    in_tbl.add_column("role"); in_tbl.add_column("pending"); in_tbl.add_column("last sender")
+    for role in ROLES:
+        if role not in cfg.roles:
+            continue
+        cnt, sender = _inbox_summary(ws, role)
+        in_tbl.add_row(role, str(cnt), sender or "—")
+    console.print(in_tbl)
+
+    # Recent activity
+    logs_root = ws.state_dir / "logs"
+    recent: list[tuple[Path, float]] = []
+    if logs_root.exists():
+        for p in logs_root.rglob("*.log"):
+            recent.append((p, p.stat().st_mtime))
+    recent.sort(key=lambda x: x[1], reverse=True)
+    act_tbl = Table(title="recent activity (last 3 cycle logs)")
+    act_tbl.add_column("when"); act_tbl.add_column("path")
+    if recent:
+        for p, mt in recent[:3]:
+            act_tbl.add_row(datetime.fromtimestamp(mt, tz=timezone.utc).isoformat(timespec="seconds"), str(p))
+    else:
+        act_tbl.add_row("—", "(no logs yet)")
+    console.print(act_tbl)
+
+    # Soft warnings
     if not cfg.target.repo:
-        errs.append("no target repo attached. Run: crewd attach <owner/repo>")
+        issues.append(("warn", "no target repo attached. Run: crewd attach <owner/repo>"))
     else:
         co = ws.checkout_dir(cfg.target.checkout)
         if not co.exists():
-            errs.append(f"target checkout missing at {co}. Run: crewd attach {cfg.target.repo} --clone")
+            issues.append(("warn", f"target checkout missing at {co}. Run: crewd attach {cfg.target.repo} --clone"))
 
-    # Goal present and non-template?
     if not ws.goal_md.exists():
-        errs.append("GOAL.md missing.")
+        issues.append(("error", "GOAL.md missing."))
     else:
-        body = ws.goal_md.read_text()
+        body = ws.goal_md.read_text(errors="replace")
         if "Replace this file with your concrete goal" in body:
-            errs.append("GOAL.md still has template placeholder. Edit it before running.")
+            issues.append(("warn", "GOAL.md still has template placeholder. Edit it before running."))
 
-    # Agent files
-    for role in cfg.roles:
-        if not ws.agent_file(role).exists():
-            errs.append(f"agents/{role}.agent.md missing — re-run init or attach.")
+    if issues:
+        console.print("\n[bold]suggestions:[/]")
+        for sev, msg in issues:
+            tag = "[red]ERROR[/]" if sev == "error" else "[yellow]warn [/]"
+            console.print(f"  {tag} {msg}")
+    else:
+        console.print("\n[green]✓ no issues[/]")
 
-    # Print table
-    table = Table(title="crewd doctor", show_lines=False)
-    table.add_column("check"); table.add_column("status")
-    table.add_row("backend", cfg.backend)
-    table.add_row("target", cfg.target.repo or "(unset)")
-    table.add_row("workspace", str(ws.root))
-    table.add_row("checkout", str(ws.checkout_dir(cfg.target.checkout)))
-    table.add_row("families", "OK" if not cfg.validate_families() else "[red]MISMATCH[/]")
-    table.add_row("stopped", "yes" if ws.is_stopped() else "no")
-    table.add_row("cycle", str(ws.read_cycle()))
-    console.print(table)
-
-    if errs:
-        console.print("\n[red]issues:[/]")
-        for e in errs:
-            console.print(f"  • {e}")
-        return 1
-    console.print("\n[green]✓ all checks passed[/]")
-    return 0
+    return 1 if any(s == "error" for s, _ in issues) else 0
 
 
 # ─────────────────────────── goal ───────────────────────────
@@ -272,17 +397,21 @@ class _LoopController:
                 time.sleep(1)
 
 
-def cmd_run(workspace: Path, once: bool, role: str | None) -> int:
+def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:
     """Foreground loop. Walks roles in fixed order each cycle, sleeping between cycles.
 
     --once: run a single cycle then exit.
     --role X: tick only role X (single tick), ignore loop.
+    auto_render: if True (default), re-render agents/ when crew.yaml is newer.
     """
     ws = Workspace(workspace.resolve())
     if not ws.is_initialized():
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
     cfg = CrewConfig.load(ws.crew_yaml)
+
+    if auto_render:
+        check_and_render(ws, cfg)
 
     fam_errs = cfg.validate_families()
     if fam_errs:
@@ -553,13 +682,13 @@ def cmd_talk(workspace: Path, role: str, message: str) -> int:
 
 
 # ─────────────────────────── tick ───────────────────────────
-def cmd_tick(workspace: Path, role: str) -> int:
+def cmd_tick(workspace: Path, role: str, auto_render: bool = True) -> int:
     """Force-run a single tick for one role, ignoring the loop schedule.
 
     Equivalent to `crewd run --role <role>` but reads better as an imperative
     operator action ("tick the worker right now").
     """
-    return cmd_run(workspace, once=False, role=role)
+    return cmd_run(workspace, once=False, role=role, auto_render=auto_render)
 
 
 # ─────────────────────────── new-goal ───────────────────────────
@@ -671,4 +800,3 @@ def cmd_new_goal(workspace: Path, from_path: Path) -> int:
     console.print(f"  GOAL.md sha: {new_sha[:12]}…")
     console.print(f"  inbox notice queued: {inbox}")
     return 0
-
