@@ -77,21 +77,47 @@ class CopilotBackend:
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
+        # Graceful timeout escalation: SIGINT (like Ctrl+C, the path copilot's
+        # cancel handler is designed for) -> SIGTERM -> SIGKILL. Each gets a
+        # grace window to flush events.jsonl and close in-flight tool blocks.
+        # Avoids the orphan tool_use corruption that breaks --continue.
+        import signal
+        grace_int = 20   # copilot's own cancel handler
+        grace_term = 10  # fallback if SIGINT ignored
         with open(log_path, "wb") as logf:
             logf.write(f"$ {' '.join(cmd[:8])} ... (prompt {len(full_prompt)} chars)\n".encode())
             logf.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                cwd=str(cwd),
+                env=env,
+            )
             try:
-                result = subprocess.run(
-                    cmd,
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(cwd),
-                    env=env,
-                    timeout=timeout,
-                )
-                return result.returncode
+                return proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                logf.write(b"\n[crewd] TIMEOUT\n")
+                logf.write(f"\n[crewd] TIMEOUT after {timeout}s - sending SIGINT (Ctrl+C, grace {grace_int}s)\n".encode())
+                logf.flush()
+                proc.send_signal(signal.SIGINT)
+                try:
+                    proc.wait(timeout=grace_int)
+                    logf.write(b"[crewd] exited cleanly after SIGINT\n")
+                    return 130  # conventional exit code for SIGINT
+                except subprocess.TimeoutExpired:
+                    pass
+                logf.write(f"[crewd] SIGINT ignored - escalating to SIGTERM (grace {grace_term}s)\n".encode())
+                logf.flush()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=grace_term)
+                    logf.write(b"[crewd] exited after SIGTERM\n")
+                    return 143
+                except subprocess.TimeoutExpired:
+                    pass
+                logf.write(b"[crewd] SIGTERM ignored - escalating to SIGKILL (session MAY corrupt)\n")
+                proc.kill()
+                proc.wait()
                 return 124
 
 
