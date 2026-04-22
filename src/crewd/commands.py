@@ -681,6 +681,33 @@ def cmd_talk(workspace: Path, role: str, message: str) -> int:
     return 0
 
 
+# ─────────────────────────── inbox ───────────────────────────
+INBOX_PRIORITIES = ("OVERRIDE", "ADVICE", "INFO")
+
+
+def cmd_inbox_append(workspace: Path, role: str, priority: str, message: str) -> int:
+    """Append a properly-prefixed line to a role's inbox file."""
+    ws = Workspace(workspace.resolve())
+    if not ws.is_initialized():
+        console.print(f"[red]no workspace at[/] {workspace}")
+        return 1
+    if role not in ROLES:
+        console.print(f"[red]unknown role:[/] {role}  (one of {ROLES})")
+        return 1
+    pr = priority.upper()
+    if pr not in INBOX_PRIORITIES:
+        console.print(f"[red]unknown priority:[/] {priority}  (one of {INBOX_PRIORITIES})")
+        return 1
+    inbox = ws.state_dir / "inbox" / f"{role}.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    line = f"[{pr}] {ts} {message}\n"
+    with open(inbox, "a") as f:
+        f.write(line)
+    console.print(f"[green]✓[/] appended [{pr}] message for [bold]{role}[/] → {inbox}")
+    return 0
+
+
 # ─────────────────────────── tick ───────────────────────────
 def cmd_tick(workspace: Path, role: str, auto_render: bool = True) -> int:
     """Force-run a single tick for one role, ignoring the loop schedule.
