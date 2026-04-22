@@ -128,5 +128,14 @@ def tick(
     raise typer.Exit(commands.cmd_tick(_ws_opt(workspace), role))
 
 
+@app.command(name="new-goal")
+def new_goal(
+    from_path: Path = typer.Option(Path("./GOAL.md"), "--from", help="Source GOAL.md to install as the new epoch."),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+):
+    """Start a new goal epoch: bumps version, closes prior labeled issues, resets cycles."""
+    raise typer.Exit(commands.cmd_new_goal(_ws_opt(workspace), from_path))
+
+
 if __name__ == "__main__":
     app()

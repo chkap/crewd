@@ -56,6 +56,14 @@ class Workspace:
     def cycle_file(self) -> Path:
         return self.state_dir / "cycle.txt"
 
+    @property
+    def goal_json(self) -> Path:
+        return self.state_dir / "goal.json"
+
+    @property
+    def exit_reason_file(self) -> Path:
+        return self.state_dir / "exit-reason"
+
     def log_file(self, role: str, cycle: int) -> Path:
         return self.state_dir / "logs" / role / f"{cycle:04d}.log"
 
