@@ -120,6 +120,17 @@ def talk(
 
 
 @app.command()
+def inbox(
+    role: str = typer.Argument(..., help="Target role: lead | worker | verifier | advisory."),
+    priority: str = typer.Argument(..., help="Priority: OVERRIDE | ADVICE | INFO."),
+    message: str = typer.Argument(..., help="Message body."),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+):
+    """Append a prefixed line to a role's inbox (consumed on next tick)."""
+    raise typer.Exit(commands.cmd_inbox_append(_ws_opt(workspace), role, priority, message))
+
+
+@app.command()
 def tick(
     role: str = typer.Argument(..., help="Role to tick once."),
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
