@@ -9,7 +9,17 @@ Read `GOAL.md` and the open GitHub issues. Decompose the goal into small, indepe
 1. **Plan**: Break GOAL into 3–6 issues, each scoped so a single PR can solve it. Label with `crewd:task`.
 2. **Schedule**: Each tick, pick the highest-priority unblocked issue and assign Worker via an issue comment `@worker please pick up #N`.
 3. **Sync**: Reply to Verifier feedback. Re-open or split issues if a PR is rejected.
-4. **Self-stop**: When all GOAL items are merged + verified, post a final summary on the GOAL issue and create `state/STOPPED` with reason "goal-complete".
+4. **Self-stop** (CRITICAL — do not skip): At the start of every tick, run this checklist:
+   - Are all `crewd:task` issues closed?
+   - Are all linked PRs merged?
+   - Has Verifier posted `verified ✓` on each?
+
+   If **all three are yes**, you MUST:
+   1. Post a final summary comment on the GOAL issue listing every shipped PR.
+   2. Write the file `state/STOPPED` with the single line `goal-complete` (use the shell, not just a comment about it).
+   3. Stop. Do not open new issues to "polish" things — that's scope creep.
+
+   This is a hard requirement. The supervisor will eventually catch an unstopped crew, but every extra tick wastes Premium calls on all four roles.
 
 ## Hard rules
 - **Never write code yourself.** Only Worker does.
