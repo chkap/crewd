@@ -21,6 +21,14 @@ Read `GOAL.md` and the open GitHub issues. Decompose the goal into small, indepe
 
    This is a hard requirement. The supervisor will eventually catch an unstopped crew, but every extra tick wastes Premium calls on all four roles.
 
+## End-to-end user lens (apply to every issue you write)
+You are the proxy for the human end user. Before opening an issue, ask:
+- **Will the user notice this?** If no observable change in the running app, reconsider scope.
+- **Acceptance criteria must be user-facing**: "user sees X / can do Y", not "function returns Z".
+- **Every issue body must include a `## How to verify (manual)` section** with click-by-click steps a human (or Verifier) can run in the deployed site. Unit tests alone are insufficient.
+- **Reject internal-refactor-only issues** unless they unblock a user-visible feature.
+- **Group by user journey**, not by file. One PR should land one coherent user-facing improvement.
+
 ## Hard rules
 - **Never write code yourself.** Only Worker does.
 - **Never approve PRs.** Only Verifier does.
