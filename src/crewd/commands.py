@@ -9,7 +9,7 @@ import time
 from rich.console import Console
 from rich.table import Table
 
-from .config import CrewConfig, default_config, ROLES
+from .config import CrewConfig, GoalState, default_config, sha256_file, ROLES
 from .workspace import Workspace
 from .templates_render import render, write_if_absent
 from .backends import get_backend
@@ -49,7 +49,7 @@ def cmd_init(path: Path, name: str | None, repo: str | None) -> int:
     return 0
 
 
-def _render_agent_files(ws: Workspace, cfg: CrewConfig) -> None:
+def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:v1") -> None:
     ctx = {
         "workspace_name": cfg.name,
         "target_repo": cfg.target.repo,
@@ -58,6 +58,7 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig) -> None:
         "advisory_model": cfg.roles["advisory"].model if "advisory" in cfg.roles else "?",
         "worker_family": cfg.roles["worker"].family if "worker" in cfg.roles else "?",
         "verifier_family": cfg.roles["verifier"].family if "verifier" in cfg.roles else "?",
+        "goal_label": goal_label,
     }
     for role in ROLES:
         if role not in cfg.roles:
@@ -84,7 +85,14 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
     if branch:
         cfg.target.branch = branch
     cfg.save(ws.crew_yaml)
-    _render_agent_files(ws, cfg)  # refresh agent.md with repo name
+    # Use existing goal label if present, else default
+    goal_label = "goal:v1"
+    if ws.goal_json.exists():
+        try:
+            goal_label = GoalState.load(ws.goal_json).label
+        except Exception:
+            pass
+    _render_agent_files(ws, cfg, goal_label=goal_label)  # refresh agent.md with repo name
     registry.register(cfg.name, ws.root, repo)  # update registry repo field
 
     co = ws.checkout_dir(cfg.target.checkout)
@@ -181,14 +189,37 @@ def cmd_goal(workspace: Path, edit: bool) -> int:
 
 
 # ─────────────────────────── run ───────────────────────────
+def _load_or_init_goal_state(ws: Workspace) -> GoalState:
+    """Load goal.json, or create v1 from existing GOAL.md / cycle.txt for back-compat."""
+    if ws.goal_json.exists():
+        return GoalState.load(ws.goal_json)
+    sha = sha256_file(ws.goal_md) if ws.goal_md.exists() else ""
+    cycles = 0
+    if ws.cycle_file.exists():
+        try:
+            cycles = int(ws.cycle_file.read_text().strip() or "0")
+        except ValueError:
+            cycles = 0
+    state = GoalState(version=1, goal_md_sha256=sha, label="goal:v1", cycles=cycles)
+    state.save(ws.goal_json)
+    return state
+
+
+def _write_exit_reason(ws: Workspace, reason: str) -> None:
+    ws.state_dir.mkdir(parents=True, exist_ok=True)
+    ws.exit_reason_file.write_text(reason + "\n")
+    console.print(f"[blue]exit-reason:[/] {reason}")
+
+
 class _LoopController:
     """Holds state for the foreground loop. Allows clean signal handling."""
 
-    def __init__(self, ws: Workspace, cfg: CrewConfig, backend, cwd: Path):
+    def __init__(self, ws: Workspace, cfg: CrewConfig, backend, cwd: Path, goal_state: GoalState):
         self.ws = ws
         self.cfg = cfg
         self.backend = backend
         self.cwd = cwd
+        self.goal_state = goal_state
         self._interrupted = False
 
     def request_stop(self, signum, frame):
@@ -198,17 +229,25 @@ class _LoopController:
         console.print(f"\n[yellow]signal {signum} received — finishing current tick then stopping[/]")
         self._interrupted = True
 
+    def _save_cycle(self, cycle: int) -> None:
+        self.goal_state.cycles = cycle
+        self.goal_state.save(self.ws.goal_json)
+        # Mirror to legacy cycle.txt for back-compat with existing reads
+        self.ws.write_cycle(cycle)
+
     def loop(self, once: bool) -> int:
-        cycle = self.ws.read_cycle()
+        cycle = self.goal_state.cycles
         while True:
             if self.ws.is_stopped():
                 console.print(f"[yellow]STOPPED sentinel present; exiting at cycle {cycle}[/]")
+                _write_exit_reason(self.ws, "goal-complete")
                 return 0
             if self._interrupted:
                 console.print("[yellow]interrupted; exiting cleanly[/]")
+                _write_exit_reason(self.ws, "interrupted")
                 return 0
             cycle += 1
-            self.ws.write_cycle(cycle)
+            self._save_cycle(cycle)
             console.print(f"\n[bold cyan]── cycle {cycle} ──[/]")
             for r in ROLES:
                 if r not in self.cfg.roles:
@@ -216,10 +255,15 @@ class _LoopController:
                 if self.ws.is_stopped() or self._interrupted:
                     break
                 _tick_role(self.ws, self.cfg, self.backend, r, cycle, self.cwd)
+            if self.ws.is_stopped():
+                console.print(f"[yellow]STOPPED detected after cycle {cycle}[/]")
+                _write_exit_reason(self.ws, "goal-complete")
+                return 0
             if once:
                 return 0
             if self.cfg.loop.max_cycles and cycle >= self.cfg.loop.max_cycles:
                 console.print(f"[blue]reached max_cycles={self.cfg.loop.max_cycles}[/]")
+                _write_exit_reason(self.ws, "exhausted")
                 return 0
             # Sleep in 1-second slices so signals/STOPPED are picked up promptly
             for _ in range(self.cfg.loop.sleep_secs):
@@ -258,12 +302,28 @@ def cmd_run(workspace: Path, once: bool, role: str | None) -> int:
         console.print(f"[red]target checkout missing:[/] {co}. Run [bold]crewd attach --clone[/].")
         return 2
 
+    # Goal state: load or migrate
+    goal_state = _load_or_init_goal_state(ws)
+
+    # SHA mismatch detection: if GOAL.md changed since this epoch started
+    if ws.goal_md.exists() and goal_state.goal_md_sha256:
+        current_sha = sha256_file(ws.goal_md)
+        if current_sha != goal_state.goal_md_sha256:
+            console.print(
+                f"[red]GOAL.md changed since goal v{goal_state.version} started;[/] "
+                f"run [bold]crewd new-goal --from GOAL.md[/] to start a new epoch"
+            )
+            return 2
+
     if role:
-        cycle = ws.read_cycle()
+        cycle = goal_state.cycles
         return _tick_role(ws, cfg, backend, role, cycle, co)
 
+    # Clear stale exit-reason at start
+    if ws.exit_reason_file.exists():
+        ws.exit_reason_file.unlink()
     ws.resume()  # clear STOPPED if present (run is explicit intent)
-    ctrl = _LoopController(ws, cfg, backend, co)
+    ctrl = _LoopController(ws, cfg, backend, co, goal_state)
     # Install signal handlers (SIGINT, SIGTERM) — graceful stop
     prev_int = signal.signal(signal.SIGINT, ctrl.request_stop)
     prev_term = signal.signal(signal.SIGTERM, ctrl.request_stop)
@@ -500,3 +560,115 @@ def cmd_tick(workspace: Path, role: str) -> int:
     operator action ("tick the worker right now").
     """
     return cmd_run(workspace, once=False, role=role)
+
+
+# ─────────────────────────── new-goal ───────────────────────────
+def _close_label_issues(repo: str, label: str) -> tuple[int, list[str]]:
+    """Close all open issues with the given label. Returns (closed_count, errors)."""
+    errors: list[str] = []
+    closed = 0
+    try:
+        r = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--label", label,
+             "--state", "open", "--json", "number", "--limit", "200"],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            errors.append(f"gh issue list failed: {r.stderr.strip()}")
+            return 0, errors
+        import json as _json
+        try:
+            issues = _json.loads(r.stdout or "[]")
+        except _json.JSONDecodeError as e:
+            errors.append(f"gh json decode failed: {e}")
+            return 0, errors
+        for it in issues:
+            num = it.get("number")
+            if num is None:
+                continue
+            cr = subprocess.run(
+                ["gh", "issue", "close", str(num), "--repo", repo,
+                 "--reason", "not planned",
+                 "--comment", f"Closed: superseded by new goal epoch (prior label `{label}`)."],
+                capture_output=True, text=True, check=False,
+            )
+            if cr.returncode == 0:
+                closed += 1
+            else:
+                errors.append(f"gh issue close #{num} failed: {cr.stderr.strip()}")
+    except FileNotFoundError:
+        errors.append("gh CLI not found on PATH")
+    except Exception as e:  # pragma: no cover
+        errors.append(f"unexpected error: {e}")
+    return closed, errors
+
+
+def cmd_new_goal(workspace: Path, from_path: Path) -> int:
+    """Bump goal epoch: replace GOAL.md, close prior labeled issues, reset state."""
+    ws = Workspace(workspace.resolve())
+    if not ws.is_initialized():
+        console.print(f"[red]no workspace at[/] {workspace}")
+        return 1
+    src = from_path if from_path.is_absolute() else (Path.cwd() / from_path)
+    if not src.exists():
+        console.print(f"[red]source GOAL file not found:[/] {src}")
+        return 1
+    cfg = CrewConfig.load(ws.crew_yaml)
+
+    # Determine next version
+    prior_label = None
+    if ws.goal_json.exists():
+        try:
+            prior = GoalState.load(ws.goal_json)
+            next_version = prior.version + 1
+            prior_label = prior.label
+        except Exception:
+            next_version = 1
+    else:
+        next_version = 1
+
+    # Copy/replace GOAL.md if src is different file
+    if src.resolve() != ws.goal_md.resolve():
+        ws.goal_md.write_text(src.read_text())
+    new_sha = sha256_file(ws.goal_md)
+
+    # Close prior labeled issues (best-effort)
+    if prior_label and cfg.target.repo:
+        for lbl in (prior_label,):  # close issues bearing the prior epoch label
+            closed, errs = _close_label_issues(cfg.target.repo, lbl)
+            console.print(f"[blue]closed {closed} issues labeled[/] {lbl}")
+            for e in errs:
+                console.print(f"  [yellow]warn:[/] {e}")
+
+    # Remove STOPPED + exit-reason
+    ws.resume()
+    if ws.exit_reason_file.exists():
+        ws.exit_reason_file.unlink()
+
+    # Write new GoalState
+    new_label = f"goal:v{next_version}"
+    new_state = GoalState(version=next_version, goal_md_sha256=new_sha, label=new_label, cycles=0)
+    new_state.save(ws.goal_json)
+    # Reset legacy cycle.txt to 0 too
+    ws.write_cycle(0)
+
+    # Re-render agent files with new label
+    _render_agent_files(ws, cfg, goal_label=new_label)
+
+    # Append [OVERRIDE] line to lead inbox
+    inbox = ws.state_dir / "inbox" / "lead.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with open(inbox, "a") as f:
+        f.write(
+            f"\n---\n## [OVERRIDE @ {ts}]\n"
+            f"New goal epoch: **{new_label}** (v{next_version}). "
+            f"GOAL.md updated from `{src}`. "
+            f"Re-plan from scratch using label `{new_label}` for all new issues.\n"
+        )
+
+    console.print(f"[green]✓[/] new goal epoch [bold]{new_label}[/] (v{next_version})")
+    console.print(f"  GOAL.md sha: {new_sha[:12]}…")
+    console.print(f"  inbox notice queued: {inbox}")
+    return 0
+
