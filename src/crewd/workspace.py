@@ -108,3 +108,16 @@ class Workspace:
 
     def is_stopped(self) -> bool:
         return self.stopped_sentinel.exists()
+
+
+def find_workspace(start: Path | None = None) -> Path | None:
+    """Walk up from `start` (default cwd) looking for a directory with crew.yaml.
+
+    Git-style discovery. Returns the first ancestor directory containing
+    crew.yaml, or None if none found before filesystem root.
+    """
+    p = (start or Path.cwd()).resolve()
+    for candidate in [p, *p.parents]:
+        if (candidate / "crew.yaml").exists():
+            return candidate
+    return None
