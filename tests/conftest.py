@@ -17,7 +17,10 @@ def tmp_ws(tmp_path: Path) -> Workspace:
     cfg = default_config(name="testcrew", repo="acme/widget")
     cfg.save(ws.crew_yaml)
     ws.goal_md.write_text("# GOAL\n\nDo the thing.\n")
-    # Fake checkout so doctor / run don't bail
-    co = ws.checkout_dir(cfg.target.checkout)
+    # Fake repo dir so doctor / run don't bail
+    co = ws.repo_dir(cfg.target.checkout)
     co.mkdir(parents=True, exist_ok=True)
+    # Create fake per-role worktrees
+    for role in ("lead", "worker", "verifier", "advisory"):
+        ws.role_worktree(role).mkdir(parents=True, exist_ok=True)
     return ws

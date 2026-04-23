@@ -47,7 +47,7 @@ def attach(
     repo: str = typer.Argument(..., help="Target repo owner/name."),
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
     branch: Optional[str] = typer.Option(None, "--branch"),
-    clone: bool = typer.Option(True, "--clone/--no-clone", help="Clone repo into workspace/checkout."),
+    clone: bool = typer.Option(True, "--clone/--no-clone", help="Clone repo into workspace/repo."),
 ):
     """Attach a target GitHub repo to the workspace."""
     raise typer.Exit(commands.cmd_attach(_ws_opt(workspace), repo, branch, clone))

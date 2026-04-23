@@ -22,7 +22,7 @@ class RoleConfig(BaseModel):
 class TargetConfig(BaseModel):
     repo: str | None = None  # "owner/name", None until attached
     branch: str = "main"
-    checkout: str = "./checkout"  # relative to workspace
+    checkout: str = "./repo"  # relative to workspace
 
 
 class LoopConfig(BaseModel):

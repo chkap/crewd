@@ -4,7 +4,7 @@
 
 `crewd` packages a 4-role autonomous coding crew into a reusable CLI. One workspace per crew, attachable to any GitHub repo. Each role is a `gh copilot` session with its own `--config-dir` (so its conversation is independent and resumable), a per-role `agent.md` describing responsibilities, and a fixed-order round-table loop that ticks each role once per cycle.
 
-The four roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/checkout/`, and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
+The four roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
 
 ---
 
@@ -57,10 +57,18 @@ my-crew/
 │   ├── verifier.agent.md
 │   └── advisory.agent.md
 ├── cfg/                      # per-role copilot --config-dir (private session-state)
-│   ├── lead/session-state/
-│   ├── worker/session-state/
-│   ├── verifier/session-state/
-│   └── advisory/session-state/
+│   ├── lead/
+│   │   ├── session-state/
+│   │   └── worktree/         # git worktree (role cwd, contains AGENTS.md)
+│   ├── worker/
+│   │   ├── session-state/
+│   │   └── worktree/
+│   ├── verifier/
+│   │   ├── session-state/
+│   │   └── worktree/
+│   └── advisory/
+│       ├── session-state/
+│       └── worktree/
 ├── state/
 │   ├── STOPPED               # sentinel: loop exits at next check
 │   ├── run.pid               # daemon PID (present only when daemon is running)
@@ -69,8 +77,10 @@ my-crew/
 │   ├── exit-reason           # written on graceful exit
 │   ├── inbox/<role>.md       # operator → role messages
 │   └── logs/<role>/<NNNN>.log
-└── checkout/                 # target repo clone (cwd for every role)
+└── repo/                     # target repo clone (main branch)
 ```
+
+Each role gets its own git worktree at `cfg/<role>/worktree/` created from the main clone. An `AGENTS.md` file is rendered into each worktree — Copilot CLI auto-loads it from cwd, replacing the previous prompt-injection approach.
 
 ---
 
@@ -97,7 +107,7 @@ Hard rules baked into `doctor` and `run`:
 | Command                                  | Purpose                                                                        |
 | ---------------------------------------- | ------------------------------------------------------------------------------ |
 | `init <path> [--name N --repo R]`        | Scaffold a new workspace + register it.                                        |
-| `attach <owner/repo> [--branch --no-clone]` | Attach (or re-attach) target repo, clone into `checkout/`.                  |
+| `attach <owner/repo> [--branch --no-clone]` | Attach (or re-attach) target repo, clone into `repo/`, create per-role worktrees. |
 | `doctor`                                 | Status dashboard with diagnostics (roles, state, inbox, recent logs, issues). |
 | `refresh`                                | Force re-render `agents/*.agent.md` from templates + `crew.yaml`.              |
 | `goal [--edit] [--from FILE]`            | Print, `$EDITOR`-edit, or install `GOAL.md` from a file.                       |
@@ -124,7 +134,7 @@ name: my-crew
 target:
   repo: myorg/my-app          # null until attached
   branch: main
-  checkout: ./checkout
+  checkout: ./repo
 goal_file: ./GOAL.md
 roles:
   lead:     {model: claude-sonnet-4.6, family: claude}
@@ -179,6 +189,7 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 | Copilot `--continue` fails with `CAPIError 400`               | `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-run (fresh session). |
 | `family check: worker.family == verifier.family`              | Edit `crew.yaml` so they differ; rerun.                                            |
 | `target checkout missing`                                     | `crewd attach <owner/repo> --clone`                                                |
+| `target repo clone missing`                                   | `crewd attach <owner/repo> --clone`                                                |
 | `GOAL.md changed since goal vN started`                       | `crewd new-goal --from GOAL.md` to start a new epoch.                              |
 | Lead immediately writes `STOPPED` after restart with new GOAL | You forgot `new-goal`. Run it; verify `state/inbox/lead.md` has `[OVERRIDE]`.      |
 

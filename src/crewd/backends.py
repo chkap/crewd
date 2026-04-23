@@ -25,7 +25,6 @@ class Backend(Protocol):
         role: str,
         model: str,
         config_dir: Path,
-        agent_md: Path,
         add_dirs: list[Path],
         prompt: str,
         log_path: Path,
@@ -51,7 +50,6 @@ class CopilotBackend:
         role: str,
         model: str,
         config_dir: Path,
-        agent_md: Path,
         add_dirs: list[Path],
         prompt: str,
         log_path: Path,
@@ -70,10 +68,7 @@ class CopilotBackend:
         cmd += ["--model", model, "--no-color", "--allow-all-tools"]
         for d in add_dirs:
             cmd += ["--add-dir", str(d)]
-        # Custom-instructions: prepend agent.md as the role prompt header
-        agent_text = agent_md.read_text() if agent_md.exists() else ""
-        full_prompt = f"{agent_text}\n\n---\n\n{prompt}" if agent_text else prompt
-        cmd += ["-p", full_prompt]
+        cmd += ["-p", prompt]
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
@@ -85,7 +80,7 @@ class CopilotBackend:
         grace_int = 20   # copilot's own cancel handler
         grace_term = 10  # fallback if SIGINT ignored
         with open(log_path, "wb") as logf:
-            logf.write(f"$ {' '.join(cmd[:8])} ... (prompt {len(full_prompt)} chars)\n".encode())
+            logf.write(f"$ {' '.join(cmd[:8])} ... (prompt {len(prompt)} chars)\n".encode())
             logf.flush()
             proc = subprocess.Popen(
                 cmd,

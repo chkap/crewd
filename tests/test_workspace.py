@@ -47,10 +47,16 @@ def test_cycle_counter(tmp_path: Path):
     assert ws.read_cycle() == 0
 
 
-def test_checkout_dir_resolution(tmp_path: Path):
+def test_repo_dir_resolution(tmp_path: Path):
     ws = Workspace(tmp_path / "ws")
     # Relative
-    assert ws.checkout_dir("./checkout") == (tmp_path / "ws" / "checkout").resolve()
+    assert ws.repo_dir("./repo") == (tmp_path / "ws" / "repo").resolve()
     # Absolute
     abs_path = tmp_path / "elsewhere" / "repo"
-    assert ws.checkout_dir(str(abs_path)) == abs_path
+    assert ws.repo_dir(str(abs_path)) == abs_path
+
+
+def test_role_worktree_path(tmp_path: Path):
+    ws = Workspace(tmp_path / "ws")
+    assert ws.role_worktree("lead") == tmp_path / "ws" / "cfg" / "lead" / "worktree"
+    assert ws.role_worktree("worker") == tmp_path / "ws" / "cfg" / "worker" / "worktree"

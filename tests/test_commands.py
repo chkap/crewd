@@ -145,8 +145,8 @@ def test_cmd_run_aborts_on_unhealthy_backend(tmp_ws: Workspace, monkeypatch):
 
 
 def test_cmd_run_aborts_when_checkout_missing(tmp_ws: Workspace, monkeypatch):
-    # Remove the checkout dir
-    co = tmp_ws.checkout_dir("./checkout")
+    # Remove the repo dir
+    co = tmp_ws.repo_dir("./repo")
     import shutil; shutil.rmtree(co)
     backend = _StubBackend(healthy=True)
     monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
@@ -257,7 +257,7 @@ class _StubBackend:
     def doctor(self) -> list[str]:
         return [] if self._healthy else ["stub backend forced unhealthy"]
 
-    def run_role(self, role, model, config_dir, agent_md, add_dirs, prompt, log_path, timeout, cwd, first_run):
+    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run):
         self.calls.append({
             "role": role,
             "model": model,

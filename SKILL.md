@@ -16,7 +16,7 @@ A CLI (`uv` + `typer` + `jinja2` + `pydantic`) that runs a 4-role autonomous cod
 - **verifier** — reviews PRs, merges. No code. Two tiers: per-PR + final `crewd:acceptance` gate.
 - **advisory** — research, citations, design pointers. No code, no merges.
 
-Each role is a `gh copilot` subprocess with its own `--config-dir` (private resumable conversation), driven by a per-role `agents/<role>.agent.md` rendered from Jinja templates. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
+Each role is a `gh copilot` subprocess with its own `--config-dir` (private resumable conversation), driven by an `AGENTS.md` file auto-loaded from its per-role git worktree at `cfg/<role>/worktree/`. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
 
 ## When to use this skill
 
@@ -67,8 +67,9 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 <workspace>/
 ├── crew.yaml              ← edit to change models / families / loop
 ├── GOAL.md                ← spec; do NOT hand-edit after run starts (use new-goal)
-├── agents/<role>.agent.md ← derived from src/crewd/templates/agents/*.j2; auto re-rendered
+├── agents/<role>.agent.md ← derived from src/crewd/templates/agents/*.j2; auto re-rendered (reference copy)
 ├── cfg/<role>/session-state/   ← copilot --config-dir (rotate on corruption, see below)
+├── cfg/<role>/worktree/        ← git worktree from repo/ (role cwd, contains AGENTS.md)
 ├── state/STOPPED          ← sentinel; loop exits at next check
 ├── state/run.pid          ← daemon PID (only when daemon is running)
 ├── state/cycle.txt        ← legacy mirror
@@ -76,7 +77,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 ├── state/exit-reason      ← written on graceful exit
 ├── state/inbox/<role>.md  ← operator → role messages (consumed + moved to .processed by role)
 ├── state/logs/<role>/NNNN.log  ← per-tick output
-└── checkout/              ← target repo clone (cwd for every role)
+└── repo/              ← target repo clone (main branch; per-role worktrees in cfg/)
 ```
 
 ## Operator nudges
@@ -131,6 +132,7 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 | Copilot `--continue` fails with `CAPIError 400` (orphan tool_use) | `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-tick (fresh session). |
 | `family check: worker.family == verifier.family`                 | Edit `crew.yaml` so families differ (e.g. gpt vs claude). Auto re-render handles agents/.               |
 | `target checkout missing`                                        | `crewd attach <owner/repo> --clone`                                                                     |
+| `target repo clone missing`                                      | `crewd attach <owner/repo> --clone`                                                                     |
 | `GOAL.md changed since goal vN started`                          | `crewd new-goal --from GOAL.md` (don't bypass — see Hard rule #4).                                      |
 | Lead writes `STOPPED` immediately after restart with new GOAL    | You forgot `new-goal`. Run it; confirm `state/inbox/lead.md` ends with `[OVERRIDE]`.                    |
 | Want to kill the loop cleanly                                    | `crewd stop` (writes STOPPED + sends SIGINT to daemon). `crewd stop --force` sends SIGKILL.             |

@@ -17,10 +17,14 @@ Workspace structure:
       logs/daemon.log      — daemon stdout/stderr
     cfg/                   — per-role copilot --config-dir target
       lead/
+        worktree/          — git worktree (cwd for this role)
       worker/
+        worktree/
       verifier/
+        worktree/
       advisory/
-    checkout/              — target repo clone (configurable)
+        worktree/
+    repo/                  — main target repo clone (configurable)
 """
 from __future__ import annotations
 from pathlib import Path
@@ -77,9 +81,12 @@ class Workspace:
     def role_cfg_dir(self, role: str) -> Path:
         return self.cfg_dir / role
 
-    def checkout_dir(self, configured: str = "./checkout") -> Path:
+    def repo_dir(self, configured: str = "./repo") -> Path:
         p = Path(configured)
         return p if p.is_absolute() else (self.root / p).resolve()
+
+    def role_worktree(self, role: str) -> Path:
+        return self.cfg_dir / role / "worktree"
 
     def ensure_skeleton(self) -> None:
         for d in [self.agents_dir, self.state_dir, self.state_dir / "logs", self.cfg_dir]:

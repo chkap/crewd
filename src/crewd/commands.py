@@ -65,15 +65,19 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:
     for role in ROLES:
         if role not in cfg.roles:
             continue
-        agent_path = ws.agent_file(role)
         rendered = render(
             f"agents/{role}.agent.md.j2",
             role_model=cfg.roles[role].model,
             **ctx,
         )
-        # Always (re)write — these are derived from cfg + templates
+        # Write agents/<role>.agent.md (reference/debugging)
+        agent_path = ws.agent_file(role)
         agent_path.parent.mkdir(parents=True, exist_ok=True)
         agent_path.write_text(rendered)
+        # Write AGENTS.md into role worktree (primary instruction delivery)
+        wt = ws.role_worktree(role)
+        if wt.exists():
+            (wt / "AGENTS.md").write_text(rendered)
 
 
 def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
@@ -116,8 +120,36 @@ def cmd_refresh(workspace: Path) -> int:
     for role in ROLES:
         if role in cfg.roles:
             console.print(f"  [green]✓[/] {ws.agent_file(role).name}")
+            wt = ws.role_worktree(role)
+            if wt.exists():
+                console.print(f"  [green]✓[/] AGENTS.md → {wt / 'AGENTS.md'}")
     console.print(f"[green]✓[/] agents/ refreshed from templates")
     return 0
+
+
+# ─────────────────────────── worktree helpers ───────────────────────────
+def _setup_worktrees(ws: Workspace, cfg: CrewConfig, repo_dir: Path) -> list[Path]:
+    """Create per-role git worktrees from the main repo clone.
+
+    Returns list of worktree paths that were created (skips existing).
+    """
+    created: list[Path] = []
+    branch = cfg.target.branch
+    for role in ROLES:
+        if role not in cfg.roles:
+            continue
+        wt = ws.role_worktree(role)
+        if wt.exists():
+            continue
+        rc = subprocess.run(
+            ["git", "-C", str(repo_dir), "worktree", "add", "--detach", str(wt), branch],
+            capture_output=True, text=True, check=False,
+        )
+        if rc.returncode == 0:
+            created.append(wt)
+        else:
+            console.print(f"    [yellow]worktree add for {role} failed: {rc.stderr.strip()}[/]")
+    return created
 
 
 # ─────────────────────────── attach ───────────────────────────
@@ -141,7 +173,7 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
     _render_agent_files(ws, cfg, goal_label=goal_label)  # refresh agent.md with repo name
     registry.register(cfg.name, ws.root, repo)  # update registry repo field
 
-    co = ws.checkout_dir(cfg.target.checkout)
+    co = ws.repo_dir(cfg.target.checkout)
     if clone and not co.exists():
         console.print(f"[blue]cloning[/] {repo} → {co}")
         rc = subprocess.run(
@@ -150,6 +182,13 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
         ).returncode
         if rc != 0:
             console.print(f"[yellow]clone failed (rc={rc}); attach config saved anyway[/]")
+        else:
+            # Create per-role git worktrees from the main clone
+            created = _setup_worktrees(ws, cfg, co)
+            for wt_path in created:
+                console.print(f"  [green]✓[/] worktree {wt_path}")
+            # Render AGENTS.md into each worktree
+            _render_agent_files(ws, cfg, goal_label=goal_label)
     console.print(f"[green]✓[/] attached to [bold]{repo}[/] @ {cfg.target.branch}")
     return 0
 
@@ -301,9 +340,9 @@ def cmd_doctor(workspace: Path) -> int:
     if not cfg.target.repo:
         issues.append(("warn", "no target repo attached. Run: crewd attach <owner/repo>"))
     else:
-        co = ws.checkout_dir(cfg.target.checkout)
+        co = ws.repo_dir(cfg.target.checkout)
         if not co.exists():
-            issues.append(("warn", f"target checkout missing at {co}. Run: crewd attach {cfg.target.repo} --clone"))
+            issues.append(("warn", f"target repo clone missing at {co}. Run: crewd attach {cfg.target.repo} --clone"))
 
     if not ws.goal_md.exists():
         issues.append(("error", "GOAL.md missing."))
@@ -372,11 +411,10 @@ def _write_exit_reason(ws: Workspace, reason: str) -> None:
 class _LoopController:
     """Holds state for the foreground loop. Allows clean signal handling."""
 
-    def __init__(self, ws: Workspace, cfg: CrewConfig, backend, cwd: Path, goal_state: GoalState):
+    def __init__(self, ws: Workspace, cfg: CrewConfig, backend, goal_state: GoalState):
         self.ws = ws
         self.cfg = cfg
         self.backend = backend
-        self.cwd = cwd
         self.goal_state = goal_state
         self._interrupted = False
 
@@ -412,7 +450,7 @@ class _LoopController:
                     continue
                 if self.ws.is_stopped() or self._interrupted:
                     break
-                _tick_role(self.ws, self.cfg, self.backend, r, cycle, self.cwd)
+                _tick_role(self.ws, self.cfg, self.backend, r, cycle)
             if self.ws.is_stopped():
                 console.print(f"[yellow]STOPPED detected after cycle {cycle}[/]")
                 _write_exit_reason(self.ws, "goal-complete")
@@ -430,10 +468,10 @@ class _LoopController:
                 time.sleep(1)
 
 
-def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfig, object, Path, GoalState] | int:
+def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfig, object, GoalState] | int:
     """Shared pre-flight checks for foreground and daemon run modes.
 
-    Returns (ws, cfg, backend, checkout, goal_state) on success, or an int exit code on failure.
+    Returns (ws, cfg, backend, goal_state) on success, or an int exit code on failure.
     """
     ws = Workspace(workspace.resolve())
     if not ws.is_initialized():
@@ -457,9 +495,9 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             console.print(f"[red]backend:[/] {e}")
         return 2
 
-    co = ws.checkout_dir(cfg.target.checkout)
+    co = ws.repo_dir(cfg.target.checkout)
     if not co.exists():
-        console.print(f"[red]target checkout missing:[/] {co}. Run [bold]crewd attach --clone[/].")
+        console.print(f"[red]target repo clone missing:[/] {co}. Run [bold]crewd attach --clone[/].")
         return 2
 
     goal_state = _load_or_init_goal_state(ws)
@@ -473,7 +511,7 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             )
             return 2
 
-    return ws, cfg, backend, co, goal_state
+    return ws, cfg, backend, goal_state
 
 
 def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:
@@ -486,17 +524,17 @@ def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = T
     result = _preflight(workspace, auto_render)
     if isinstance(result, int):
         return result
-    ws, cfg, backend, co, goal_state = result
+    ws, cfg, backend, goal_state = result
 
     if role:
         cycle = goal_state.cycles
-        return _tick_role(ws, cfg, backend, role, cycle, co)
+        return _tick_role(ws, cfg, backend, role, cycle)
 
     # Clear stale exit-reason at start
     if ws.exit_reason_file.exists():
         ws.exit_reason_file.unlink()
     ws.resume()  # clear STOPPED if present (run is explicit intent)
-    ctrl = _LoopController(ws, cfg, backend, co, goal_state)
+    ctrl = _LoopController(ws, cfg, backend, goal_state)
     # Install signal handlers (SIGINT, SIGTERM) — graceful stop
     prev_int = signal.signal(signal.SIGINT, ctrl.request_stop)
     prev_term = signal.signal(signal.SIGTERM, ctrl.request_stop)
@@ -518,7 +556,7 @@ def cmd_run_daemon(workspace: Path, once: bool, auto_render: bool = True) -> int
     result = _preflight(workspace, auto_render)
     if isinstance(result, int):
         return result
-    ws, cfg, backend, co, goal_state = result
+    ws, cfg, backend, goal_state = result
 
     if ws.is_daemon_alive():
         pid = ws.read_pid()
@@ -562,7 +600,7 @@ def cmd_run_daemon(workspace: Path, once: bool, auto_render: bool = True) -> int
         ws.exit_reason_file.unlink()
     ws.resume()
 
-    ctrl = _LoopController(ws, cfg, backend, co, goal_state)
+    ctrl = _LoopController(ws, cfg, backend, goal_state)
     signal.signal(signal.SIGINT, ctrl.request_stop)
     signal.signal(signal.SIGTERM, ctrl.request_stop)
     try:
@@ -576,7 +614,7 @@ def cmd_run_daemon(workspace: Path, once: bool, auto_render: bool = True) -> int
     _os._exit(rc)
 
 
-def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, cwd: Path) -> int:
+def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -> int:
     if role not in cfg.roles:
         console.print(f"[red]unknown role:[/] {role}")
         return 1
@@ -584,6 +622,15 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, c
     cfg_dir = ws.role_cfg_dir(role)
     log_path = ws.log_file(role, cycle)
     first_run = not (cfg_dir / "session-state").exists()
+
+    # Resolve cwd: prefer per-role worktree, fall back to main repo dir
+    wt = ws.role_worktree(role)
+    if wt.exists():
+        cwd = wt
+    else:
+        cwd = ws.repo_dir(cfg.target.checkout)
+        if wt != cwd:
+            console.print(f"    [yellow]warn: worktree {wt} not found, using repo dir[/]")
 
     prompt = (
         f"This is cycle {cycle}. Read the latest GitHub issues + comments in "
@@ -599,7 +646,6 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, c
         role=role,
         model=role_cfg.model,
         config_dir=cfg_dir,
-        agent_md=ws.agent_file(role),
         add_dirs=add_dirs,
         prompt=prompt,
         log_path=log_path,
