@@ -145,7 +145,7 @@ crewd talk worker "small PRs only — split #42 into 3 PRs"
 crewd inbox lead OVERRIDE "drop feature X, focus on auth bug"
 ```
 
-The role consumes its inbox file at the start of its next tick and truncates it. `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
+The role consumes its inbox file at the start of its next tick and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (preserving an audit trail). `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
 
 **Start a new goal on the same workspace**
 

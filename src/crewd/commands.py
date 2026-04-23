@@ -53,6 +53,7 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:
     ctx = {
         "workspace_name": cfg.name,
         "target_repo": cfg.target.repo,
+        "target_branch": cfg.target.branch,
         "worker_model": cfg.roles["worker"].model if "worker" in cfg.roles else "?",
         "verifier_model": cfg.roles["verifier"].model if "verifier" in cfg.roles else "?",
         "advisory_model": cfg.roles["advisory"].model if "advisory" in cfg.roles else "?",

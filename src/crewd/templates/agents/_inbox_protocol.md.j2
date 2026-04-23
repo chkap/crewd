@@ -1,0 +1,7 @@
+## Inbox protocol
+`state/inbox/<your-role>.md` may contain messages. Each message line is prefixed:
+- `[OVERRIDE]` — human or supervisor override; READ FIRST, takes precedence over GOAL.md and your prior session memory.
+- `[ADVICE]` — peer advice; consider but you may push back with reason.
+- `[INFO]` — fyi only; no action required.
+
+After reading, MOVE the inbox file to `state/inbox/<your-role>.processed.<unix-ts>.md` (don't just clear it — preserve audit trail).

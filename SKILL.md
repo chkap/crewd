@@ -71,7 +71,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" run               # loop until STOP
 ├── state/cycle.txt        ← legacy mirror
 ├── state/goal.json        ← {version, label, goal_md_sha256, cycles}
 ├── state/exit-reason      ← written on graceful exit
-├── state/inbox/<role>.md  ← operator → role messages (consumed + truncated by role)
+├── state/inbox/<role>.md  ← operator → role messages (consumed + moved to .processed by role)
 ├── state/logs/<role>/NNNN.log  ← per-tick output
 └── checkout/              ← target repo clone (cwd for every role)
 ```
@@ -88,7 +88,7 @@ crewd inbox advisory ADVICE "investigate https://example.com/postmortem"
 crewd inbox verifier INFO "expect a doc-only PR shortly"
 ```
 
-Priorities: `OVERRIDE > ADVICE > INFO`. The role consumes the inbox at the start of its next tick and truncates it, so messages don't pile up.
+Priorities: `OVERRIDE > ADVICE > INFO`. The role consumes the inbox at the start of its next tick and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (audit trail), so messages don't pile up.
 
 ## Goal lifecycle (epochs)
 
