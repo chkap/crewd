@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 .python-version
+.pytest_cache/
 
 # uv
 # (uv.lock IS committed)

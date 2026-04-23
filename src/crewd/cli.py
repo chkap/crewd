@@ -63,9 +63,10 @@ def doctor(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
 def goal(
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
     edit: bool = typer.Option(False, "--edit", "-e", help="Open GOAL.md in $EDITOR."),
+    from_path: Optional[Path] = typer.Option(None, "--from", help="Install GOAL.md from this file."),
 ):
     """Print or edit GOAL.md."""
-    raise typer.Exit(commands.cmd_goal(_ws_opt(workspace), edit))
+    raise typer.Exit(commands.cmd_goal(_ws_opt(workspace), edit, from_path=from_path))
 
 
 @app.command()

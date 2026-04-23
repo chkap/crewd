@@ -300,11 +300,20 @@ def cmd_doctor(workspace: Path) -> int:
 
 
 # ─────────────────────────── goal ───────────────────────────
-def cmd_goal(workspace: Path, edit: bool) -> int:
+def cmd_goal(workspace: Path, edit: bool, *, from_path: Path | None = None) -> int:
     ws = Workspace(workspace.resolve())
     if not ws.is_initialized():
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
+    if from_path is not None:
+        src = from_path if from_path.is_absolute() else (Path.cwd() / from_path)
+        if not src.exists():
+            console.print(f"[red]source GOAL file not found:[/] {src}")
+            return 1
+        if src.resolve() != ws.goal_md.resolve():
+            ws.goal_md.write_text(src.read_text())
+        console.print(f"[green]✓[/] GOAL.md installed from {src}")
+        return 0
     if edit:
         editor = subprocess.os.environ.get("EDITOR", "vi")
         subprocess.run([editor, str(ws.goal_md)])

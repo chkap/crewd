@@ -92,7 +92,7 @@ Hard rules baked into `doctor` and `run`:
 | `init <path> [--name N --repo R]`        | Scaffold a new workspace + register it.                                        |
 | `attach <owner/repo> [--branch --no-clone]` | Attach (or re-attach) target repo, clone into `checkout/`.                  |
 | `doctor`                                 | Status dashboard with diagnostics (roles, state, inbox, recent logs, issues). |
-| `goal [--edit]`                          | Print or `$EDITOR`-edit `GOAL.md`.                                             |
+| `goal [--edit] [--from FILE]`            | Print, `$EDITOR`-edit, or install `GOAL.md` from a file.                       |
 | `run [--once] [--role R] [--no-auto-render]` | Foreground round-table loop. `--once` runs one cycle, `--role` ticks one role. |
 | `tick <role>`                            | Imperative single tick of one role (alias for `run --role`).                   |
 | `stop [--reason]`                        | Place `STOPPED` sentinel; loop exits at next check.                            |
