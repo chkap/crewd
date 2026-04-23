@@ -922,6 +922,13 @@ def cmd_new_goal(workspace: Path, from_path: Path) -> int:
     else:
         next_version = 1
 
+    # Archive prior GOAL.md before overwriting
+    if ws.goal_md.exists() and prior_label:
+        archive_name = f"GOAL.v{next_version - 1}.md"
+        archive_path = ws.state_dir / archive_name
+        archive_path.write_text(ws.goal_md.read_text())
+        console.print(f"[blue]ℹ[/] archived prior GOAL.md → {archive_path}")
+
     # Copy/replace GOAL.md if src is different file
     if src.resolve() != ws.goal_md.resolve():
         ws.goal_md.write_text(src.read_text())
