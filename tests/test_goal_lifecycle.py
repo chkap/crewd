@@ -135,8 +135,8 @@ def test_cmd_new_goal_increments_and_closes_issues(tmp_ws: Workspace, monkeypatc
     assert "[OVERRIDE" in body
     assert "goal:v3" in body
 
-    # Agent files mention new label
-    assert "goal:v3" in tmp_ws.agent_file("lead").read_text()
+    # AGENTS.md mentions new label
+    assert "goal:v3" in (tmp_ws.role_cfg_dir("lead") / "AGENTS.md").read_text()
 
 
 def test_cmd_new_goal_handles_gh_failure_gracefully(tmp_ws: Workspace, monkeypatch):

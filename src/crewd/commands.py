@@ -71,10 +71,6 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:
             role_name=role,
             **ctx,
         )
-        # Write agents/<role>.agent.md (reference/debugging)
-        agent_path = ws.agent_file(role)
-        agent_path.parent.mkdir(parents=True, exist_ok=True)
-        agent_path.write_text(rendered)
         # Write AGENTS.md into cfg/<role>/ (Copilot auto-loads from cwd)
         role_dir = ws.role_cfg_dir(role)
         role_dir.mkdir(parents=True, exist_ok=True)
@@ -82,7 +78,7 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:
 
 
 def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
-    """If crew.yaml is newer than any agent.md, or any are missing, re-render.
+    """If crew.yaml is newer than any AGENTS.md, or any are missing, re-render.
 
     Returns True iff a re-render happened. Logs a one-line notice when it does.
     """
@@ -93,13 +89,13 @@ def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
     for role in ROLES:
         if role not in cfg.roles:
             continue
-        amd = ws.agent_file(role)
+        amd = ws.role_cfg_dir(role) / "AGENTS.md"
         if not amd.exists() or amd.stat().st_mtime < yaml_mtime:
             needs = True
             break
     if needs:
         _render_agent_files(ws, cfg)
-        console.print("[blue]ℹ[/] auto-rendered agents/ from crew.yaml (use --no-auto-render to skip)")
+        console.print("[blue]ℹ[/] auto-rendered AGENTS.md from crew.yaml (use --no-auto-render to skip)")
     return needs
 
 
@@ -146,9 +142,8 @@ def cmd_refresh(workspace: Path) -> int:
     _render_agent_files(ws, cfg, goal_label=goal_label)
     for role in ROLES:
         if role in cfg.roles:
-            console.print(f"  [green]✓[/] {ws.agent_file(role).name}")
             console.print(f"  [green]✓[/] {ws.role_cfg_dir(role) / 'AGENTS.md'}")
-    console.print(f"[green]✓[/] refreshed (agents/ + AGENTS.md)")
+    console.print(f"[green]✓[/] refreshed")
     return 0
 
 
@@ -276,22 +271,22 @@ def cmd_doctor(workspace: Path) -> int:
     # Roles table
     roles_tbl = Table(title="roles", show_lines=False)
     roles_tbl.add_column("role"); roles_tbl.add_column("model"); roles_tbl.add_column("family")
-    roles_tbl.add_column("agent.md"); roles_tbl.add_column("session-state"); roles_tbl.add_column("last log")
+    roles_tbl.add_column("AGENTS.md"); roles_tbl.add_column("session-state"); roles_tbl.add_column("last log")
     yaml_mtime = ws.crew_yaml.stat().st_mtime
     for role in ROLES:
         if role not in cfg.roles:
             continue
         rc = cfg.roles[role]
-        amd = ws.agent_file(role)
+        amd = ws.role_cfg_dir(role) / "AGENTS.md"
         if amd.exists():
             if amd.stat().st_mtime < yaml_mtime:
                 amd_str = "[yellow]stale[/]"
-                issues.append(("warn", f"agents/{role}.agent.md is older than crew.yaml — re-render needed"))
+                issues.append(("warn", f"cfg/{role}/AGENTS.md is older than crew.yaml — run `crewd refresh`"))
             else:
                 amd_str = "[green]ok[/]"
         else:
             amd_str = "[red]missing[/]"
-            issues.append(("error", f"agents/{role}.agent.md missing — run init/attach or `crewd run` (auto-render)"))
+            issues.append(("error", f"cfg/{role}/AGENTS.md missing — run `crewd refresh`"))
         sdir = ws.role_cfg_dir(role) / "session-state"
         if sdir.exists():
             if not sdir.is_dir():

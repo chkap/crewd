@@ -67,7 +67,6 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 <workspace>/
 ├── crew.yaml              ← edit to change models / families / loop
 ├── GOAL.md                ← spec; do NOT hand-edit after run starts (use new-goal)
-├── agents/<role>.agent.md ← derived from src/crewd/templates/agents/*.j2; auto re-rendered (reference copy)
 ├── cfg/<role>/AGENTS.md        ← role instructions (Copilot auto-loads from cwd)
 ├── cfg/<role>/session-state/   ← copilot --config-dir (rotate on corruption, see below)
 ├── cfg/<role>/worktree/        ← git worktree from repo/ (isolated repo copy)

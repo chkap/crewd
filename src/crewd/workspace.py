@@ -4,29 +4,28 @@ Workspace structure:
   <workspace>/
     crew.yaml              — config
     GOAL.md                — current goal/spec
-    agents/                — per-role .agent.md files (role + responsibilities)
-      lead.agent.md
-      worker.agent.md
-      verifier.agent.md
-      advisory.agent.md
     state/                 — runtime state
       STOPPED              — sentinel: loop won't tick
       run.pid              — daemon PID (present only when daemon is running)
       cycle.txt            — current cycle counter
       logs/<role>/<cycle>.log
       logs/daemon.log      — daemon stdout/stderr
-    cfg/                   — per-role copilot --config-dir target
+    cfg/                   — per-role working directory + copilot config
       lead/
         AGENTS.md          — role instructions (Copilot auto-loads from cwd)
-        worktree/          — git worktree (cwd for this role)
+        session-state/     — copilot --config-dir session data
+        worktree/          — git worktree (isolated repo copy)
       worker/
         AGENTS.md
+        session-state/
         worktree/
       verifier/
         AGENTS.md
+        session-state/
         worktree/
       advisory/
         AGENTS.md
+        session-state/
         worktree/
     repo/                  — main target repo clone (configurable)
 """
@@ -47,13 +46,6 @@ class Workspace:
     @property
     def goal_md(self) -> Path:
         return self.root / "GOAL.md"
-
-    @property
-    def agents_dir(self) -> Path:
-        return self.root / "agents"
-
-    def agent_file(self, role: str) -> Path:
-        return self.agents_dir / f"{role}.agent.md"
 
     @property
     def state_dir(self) -> Path:
@@ -93,7 +85,7 @@ class Workspace:
         return self.cfg_dir / role / "worktree"
 
     def ensure_skeleton(self) -> None:
-        for d in [self.agents_dir, self.state_dir, self.state_dir / "logs", self.cfg_dir]:
+        for d in [self.state_dir, self.state_dir / "logs", self.cfg_dir]:
             d.mkdir(parents=True, exist_ok=True)
         for role in ("lead", "worker", "verifier", "advisory"):
             (self.state_dir / "logs" / role).mkdir(parents=True, exist_ok=True)

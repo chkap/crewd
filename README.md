@@ -51,12 +51,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop
 my-crew/
 ├── crew.yaml                 # config (roles, models, families, loop, target)
 ├── GOAL.md                   # human-authored spec for this epoch
-├── agents/                   # rendered from src/crewd/templates/agents/*.j2
-│   ├── lead.agent.md
-│   ├── worker.agent.md
-│   ├── verifier.agent.md
-│   └── advisory.agent.md
-├── cfg/                      # per-role copilot --config-dir (role cwd)
+├── cfg/                      # per-role working directory + copilot config
 │   ├── lead/
 │   │   ├── AGENTS.md          # role instructions (Copilot auto-loads from cwd)
 │   │   ├── session-state/

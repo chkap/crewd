@@ -20,7 +20,7 @@ def test_cmd_init_creates_complete_workspace(tmp_path: Path):
     assert ws.crew_yaml.exists()
     assert ws.goal_md.exists()
     for role in ("lead", "worker", "verifier", "advisory"):
-        body = ws.agent_file(role).read_text()
+        body = (ws.role_cfg_dir(role) / "AGENTS.md").read_text()
         assert "newcrew" in body
         assert "acme/widget" in body
     cfg = CrewConfig.load(ws.crew_yaml)
@@ -75,7 +75,7 @@ def test_cmd_doctor_reports_family_mismatch(tmp_ws: Workspace, monkeypatch):
 
 
 def test_cmd_doctor_missing_agent_md_is_error(tmp_ws: Workspace, monkeypatch):
-    """Doctor flags missing agents/<role>.agent.md as an error."""
+    """Doctor flags missing cfg/<role>/AGENTS.md as an error."""
     tmp_ws.goal_md.write_text("# GOAL\n\nReal.\n")
     # Don't render agents — they should be missing
     monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))

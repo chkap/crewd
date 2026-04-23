@@ -9,7 +9,6 @@ def test_paths_are_relative_to_root(tmp_path: Path):
     ws = Workspace(tmp_path / "ws")
     assert ws.crew_yaml == tmp_path / "ws" / "crew.yaml"
     assert ws.goal_md == tmp_path / "ws" / "GOAL.md"
-    assert ws.agent_file("worker") == tmp_path / "ws" / "agents" / "worker.agent.md"
     assert ws.role_cfg_dir("lead") == tmp_path / "ws" / "cfg" / "lead"
     assert ws.log_file("verifier", 7) == tmp_path / "ws" / "state" / "logs" / "verifier" / "0007.log"
 
