@@ -98,6 +98,28 @@ def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
     return needs
 
 
+# ─────────────────────────── refresh ───────────────────────────
+def cmd_refresh(workspace: Path) -> int:
+    """Force re-render agents/*.agent.md from templates + crew.yaml."""
+    ws = Workspace(workspace.resolve())
+    if not ws.is_initialized():
+        console.print(f"[red]no workspace at[/] {workspace}")
+        return 1
+    cfg = CrewConfig.load(ws.crew_yaml)
+    goal_label = "goal:v1"
+    if ws.goal_json.exists():
+        try:
+            goal_label = GoalState.load(ws.goal_json).label
+        except Exception:
+            pass
+    _render_agent_files(ws, cfg, goal_label=goal_label)
+    for role in ROLES:
+        if role in cfg.roles:
+            console.print(f"  [green]✓[/] {ws.agent_file(role).name}")
+    console.print(f"[green]✓[/] agents/ refreshed from templates")
+    return 0
+
+
 # ─────────────────────────── attach ───────────────────────────
 def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> int:
     ws = Workspace(workspace.resolve())

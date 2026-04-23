@@ -60,6 +60,12 @@ def doctor(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
 
 
 @app.command()
+def refresh(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
+    """Force re-render agents/*.agent.md from templates + crew.yaml."""
+    raise typer.Exit(commands.cmd_refresh(_ws_opt(workspace)))
+
+
+@app.command()
 def goal(
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
     edit: bool = typer.Option(False, "--edit", "-e", help="Open GOAL.md in $EDITOR."),
