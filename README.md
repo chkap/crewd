@@ -56,17 +56,21 @@ my-crew/
 │   ├── worker.agent.md
 │   ├── verifier.agent.md
 │   └── advisory.agent.md
-├── cfg/                      # per-role copilot --config-dir (private session-state)
+├── cfg/                      # per-role copilot --config-dir (role cwd)
 │   ├── lead/
+│   │   ├── AGENTS.md          # role instructions (Copilot auto-loads from cwd)
 │   │   ├── session-state/
-│   │   └── worktree/         # git worktree (role cwd, contains AGENTS.md)
+│   │   └── worktree/         # git worktree (isolated repo copy)
 │   ├── worker/
+│   │   ├── AGENTS.md
 │   │   ├── session-state/
 │   │   └── worktree/
 │   ├── verifier/
+│   │   ├── AGENTS.md
 │   │   ├── session-state/
 │   │   └── worktree/
 │   └── advisory/
+│       ├── AGENTS.md
 │       ├── session-state/
 │       └── worktree/
 ├── state/

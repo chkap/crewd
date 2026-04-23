@@ -68,16 +68,17 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:
         rendered = render(
             f"agents/{role}.agent.md.j2",
             role_model=cfg.roles[role].model,
+            role_name=role,
             **ctx,
         )
         # Write agents/<role>.agent.md (reference/debugging)
         agent_path = ws.agent_file(role)
         agent_path.parent.mkdir(parents=True, exist_ok=True)
         agent_path.write_text(rendered)
-        # Write AGENTS.md into role worktree (primary instruction delivery)
-        wt = ws.role_worktree(role)
-        if wt.exists():
-            (wt / "AGENTS.md").write_text(rendered)
+        # Write AGENTS.md into cfg/<role>/ (Copilot auto-loads from cwd)
+        role_dir = ws.role_cfg_dir(role)
+        role_dir.mkdir(parents=True, exist_ok=True)
+        (role_dir / "AGENTS.md").write_text(rendered)
 
 
 def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
@@ -120,9 +121,7 @@ def cmd_refresh(workspace: Path) -> int:
     for role in ROLES:
         if role in cfg.roles:
             console.print(f"  [green]✓[/] {ws.agent_file(role).name}")
-            wt = ws.role_worktree(role)
-            if wt.exists():
-                console.print(f"  [green]✓[/] AGENTS.md → {wt / 'AGENTS.md'}")
+            console.print(f"  [green]✓[/] {ws.role_cfg_dir(role) / 'AGENTS.md'}")
     console.print(f"[green]✓[/] agents/ refreshed from templates")
     return 0
 
@@ -623,14 +622,10 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
     log_path = ws.log_file(role, cycle)
     first_run = not (cfg_dir / "session-state").exists()
 
-    # Resolve cwd: prefer per-role worktree, fall back to main repo dir
+    # cwd = cfg/<role>/ so Copilot auto-loads AGENTS.md from there.
+    # The role's git worktree is added via --add-dir for file access.
+    cwd = ws.role_cfg_dir(role)
     wt = ws.role_worktree(role)
-    if wt.exists():
-        cwd = wt
-    else:
-        cwd = ws.repo_dir(cfg.target.checkout)
-        if wt != cwd:
-            console.print(f"    [yellow]warn: worktree {wt} not found, using repo dir[/]")
 
     prompt = (
         f"This is cycle {cycle}. Read the latest GitHub issues + comments in "
@@ -641,6 +636,8 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
         f"Do one tick and stop."
     )
     add_dirs = [ws.root]  # workspace as readable context
+    if wt.exists():
+        add_dirs.append(wt)
     console.print(f"  [magenta]{role}[/] ({role_cfg.model}) → {log_path}")
     rc = backend.run_role(
         role=role,

@@ -17,12 +17,16 @@ Workspace structure:
       logs/daemon.log      — daemon stdout/stderr
     cfg/                   — per-role copilot --config-dir target
       lead/
+        AGENTS.md          — role instructions (Copilot auto-loads from cwd)
         worktree/          — git worktree (cwd for this role)
       worker/
+        AGENTS.md
         worktree/
       verifier/
+        AGENTS.md
         worktree/
       advisory/
+        AGENTS.md
         worktree/
     repo/                  — main target repo clone (configurable)
 """

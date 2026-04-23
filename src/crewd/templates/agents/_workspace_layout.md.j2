@@ -1,0 +1,15 @@
+
+## Workspace layout
+
+Your current working directory is `cfg/{{ role_name }}/` inside the crewd workspace. Key paths:
+
+| Path | Purpose |
+|------|---------|
+| `./AGENTS.md` | This file — your role instructions (auto-loaded by Copilot) |
+| `./worktree/` | Your **personal git worktree** of `{{ target_repo or "(repo)" }}` @ `{{ target_branch | default("main") }}`. All git operations (branch, commit, push) happen here. |
+| `./session-state/` | Copilot session state (do not modify) |
+| `../../GOAL.md` | The current goal specification |
+| `../../state/inbox/{{ role_name }}.md` | Your inbox (operator messages) |
+| `../../repo/` | Main repo clone (shared — do **not** work here directly; use your worktree) |
+
+**Important**: Always `cd worktree/` before running git commands, editing source files, or building/testing. Your worktree is an isolated copy — you won't conflict with other roles.

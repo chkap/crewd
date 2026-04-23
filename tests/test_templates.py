@@ -11,6 +11,7 @@ def test_render_lead_agent_includes_workspace_and_repo():
         workspace_name="demo",
         target_repo="acme/widget",
         role_model="claude-opus-4.7",
+        role_name="lead",
         worker_model="gpt-5.4",
         verifier_model="claude-opus-4.7",
         advisory_model="gpt-5.2",
@@ -19,6 +20,7 @@ def test_render_lead_agent_includes_workspace_and_repo():
     assert "acme/widget" in out
     assert "claude-opus-4.7" in out
     assert "Worker is `gpt-5.4`" in out
+    assert "cfg/lead/" in out  # workspace layout included
 
 
 def test_render_worker_warns_about_family_difference():
@@ -27,6 +29,7 @@ def test_render_worker_warns_about_family_difference():
         workspace_name="demo",
         target_repo="acme/widget",
         role_model="gpt-5.4",
+        role_name="worker",
         worker_model="gpt-5.4",
         verifier_model="claude-opus-4.7",
         advisory_model="gpt-5.2",
@@ -35,6 +38,7 @@ def test_render_worker_warns_about_family_difference():
     )
     assert "different family (`claude`)" in out
     assert "Never merge your own PR" in out
+    assert "cfg/worker/" in out
 
 
 def test_render_verifier_emphasizes_blackbox():
@@ -43,6 +47,7 @@ def test_render_verifier_emphasizes_blackbox():
         workspace_name="demo",
         target_repo=None,
         role_model="claude-opus-4.7",
+        role_name="verifier",
         worker_model="gpt-5.4",
         verifier_model="claude-opus-4.7",
         advisory_model="gpt-5.2",
@@ -59,6 +64,7 @@ def test_render_advisory_minimal():
         workspace_name="demo",
         target_repo="acme/widget",
         role_model="gpt-5.2",
+        role_name="advisory",
         worker_model="gpt-5.4",
         verifier_model="claude-opus-4.7",
         advisory_model="gpt-5.2",
