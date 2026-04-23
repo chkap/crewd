@@ -32,7 +32,13 @@ uv --directory ~/crewd run crewd -w "$(pwd)" tick lead
 uv --directory ~/crewd run crewd -w "$(pwd)" run --once
 
 # 6. Run the loop in the background until STOPPED, max-cycles, or signal
-uv --directory ~/crewd run crewd -w "$(pwd)" run
+uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon
+
+# 7. Check on it
+uv --directory ~/crewd run crewd -w "$(pwd)" status
+
+# 8. Stop gracefully (writes STOPPED + sends SIGINT to daemon)
+uv --directory ~/crewd run crewd -w "$(pwd)" stop
 ```
 
 > ⚠️ When invoking via `uv --directory ~/crewd run crewd`, **always pass `-w "$(pwd)"`** — `uv --directory` changes uv's resolution cwd to the crewd repo, so workspace auto-discovery would otherwise pick the wrong directory.
@@ -57,6 +63,7 @@ my-crew/
 │   └── advisory/session-state/
 ├── state/
 │   ├── STOPPED               # sentinel: loop exits at next check
+│   ├── run.pid               # daemon PID (present only when daemon is running)
 │   ├── cycle.txt             # legacy cycle mirror
 │   ├── goal.json             # current epoch (version, label, sha, cycles)
 │   ├── exit-reason           # written on graceful exit
@@ -93,11 +100,11 @@ Hard rules baked into `doctor` and `run`:
 | `attach <owner/repo> [--branch --no-clone]` | Attach (or re-attach) target repo, clone into `checkout/`.                  |
 | `doctor`                                 | Status dashboard with diagnostics (roles, state, inbox, recent logs, issues). |
 | `goal [--edit] [--from FILE]`            | Print, `$EDITOR`-edit, or install `GOAL.md` from a file.                       |
-| `run [--once] [--role R] [--no-auto-render]` | Foreground round-table loop. `--once` runs one cycle, `--role` ticks one role. |
+| `run [--once] [--role R] [--daemon] [--no-auto-render]` | Foreground loop (default) or background daemon (`--daemon`). `--once` / `--role` as before. |
 | `tick <role>`                            | Imperative single tick of one role (alias for `run --role`).                   |
-| `stop [--reason]`                        | Place `STOPPED` sentinel; loop exits at next check.                            |
+| `stop [--reason] [--force]`              | Write `STOPPED` + signal daemon (`SIGINT`; `--force` sends `SIGKILL`).         |
 | `resume`                                 | Clear `STOPPED`.                                                               |
-| `status`                                 | Compact one-table status.                                                      |
+| `status`                                 | Compact one-table status (includes daemon PID + alive check).                  |
 | `logs [--role R] [--cycle N] [-n N] [-f]` | List or tail role logs.                                                       |
 | `list [--prune]`                         | List registered workspaces (user-level registry).                              |
 | `cd <name>`                              | Print abs path of a registered workspace (use as `cd $(crewd cd foo)`).        |
@@ -119,10 +126,10 @@ target:
   checkout: ./checkout
 goal_file: ./GOAL.md
 roles:
-  lead:     {model: claude-opus-4.7, family: claude}
-  worker:   {model: gpt-5.4,         family: gpt}
-  verifier: {model: claude-opus-4.7, family: claude}
-  advisory: {model: gpt-5.2,         family: gpt}
+  lead:     {model: claude-sonnet-4.6, family: claude}
+  worker:   {model: gpt-5.4,           family: gpt}
+  verifier: {model: claude-sonnet-4.6, family: claude}
+  advisory: {model: gpt-5.4,           family: gpt}
   # per-role override:
   # worker: {model: ..., family: ..., per_tick_timeout: 1800}
 loop:

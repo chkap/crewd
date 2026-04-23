@@ -75,18 +75,26 @@ def run(
     once: bool = typer.Option(False, "--once", help="Run a single cycle, then exit."),
     role: Optional[str] = typer.Option(None, "--role", help="Tick only this role once, then exit."),
     no_auto_render: bool = typer.Option(False, "--no-auto-render", help="Skip auto re-render of agents/ from crew.yaml."),
+    daemon: bool = typer.Option(False, "--daemon", "-d", help="Fork the loop into a background daemon process."),
 ):
-    """Run the round-table loop in foreground."""
-    raise typer.Exit(commands.cmd_run(_ws_opt(workspace), once, role, auto_render=not no_auto_render))
+    """Run the round-table loop (foreground by default, --daemon for background)."""
+    ws = _ws_opt(workspace)
+    if daemon:
+        if role:
+            typer.echo("error: --daemon cannot be used with --role", err=True)
+            raise typer.Exit(2)
+        raise typer.Exit(commands.cmd_run_daemon(ws, once, auto_render=not no_auto_render))
+    raise typer.Exit(commands.cmd_run(ws, once, role, auto_render=not no_auto_render))
 
 
 @app.command()
 def stop(
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
     reason: str = typer.Option("manual", "--reason"),
+    force: bool = typer.Option(False, "--force", "-f", help="Send SIGKILL instead of SIGINT to the daemon."),
 ):
-    """Place STOPPED sentinel — running `run` will exit at next check."""
-    raise typer.Exit(commands.cmd_stop(_ws_opt(workspace), reason))
+    """Stop the crew: write STOPPED sentinel and signal the daemon if running."""
+    raise typer.Exit(commands.cmd_stop(_ws_opt(workspace), reason, force=force))
 
 
 @app.command()

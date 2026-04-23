@@ -6,6 +6,7 @@ import subprocess
 import signal
 import sys
 import time
+import os
 from rich.console import Console
 from rich.table import Table
 
@@ -407,12 +408,10 @@ class _LoopController:
                 time.sleep(1)
 
 
-def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:
-    """Foreground loop. Walks roles in fixed order each cycle, sleeping between cycles.
+def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfig, object, Path, GoalState] | int:
+    """Shared pre-flight checks for foreground and daemon run modes.
 
-    --once: run a single cycle then exit.
-    --role X: tick only role X (single tick), ignore loop.
-    auto_render: if True (default), re-render agents/ when crew.yaml is newer.
+    Returns (ws, cfg, backend, checkout, goal_state) on success, or an int exit code on failure.
     """
     ws = Workspace(workspace.resolve())
     if not ws.is_initialized():
@@ -441,10 +440,8 @@ def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = T
         console.print(f"[red]target checkout missing:[/] {co}. Run [bold]crewd attach --clone[/].")
         return 2
 
-    # Goal state: load or migrate
     goal_state = _load_or_init_goal_state(ws)
 
-    # SHA mismatch detection: if GOAL.md changed since this epoch started
     if ws.goal_md.exists() and goal_state.goal_md_sha256:
         current_sha = sha256_file(ws.goal_md)
         if current_sha != goal_state.goal_md_sha256:
@@ -453,6 +450,21 @@ def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = T
                 f"run [bold]crewd new-goal --from GOAL.md[/] to start a new epoch"
             )
             return 2
+
+    return ws, cfg, backend, co, goal_state
+
+
+def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:
+    """Foreground loop. Walks roles in fixed order each cycle, sleeping between cycles.
+
+    --once: run a single cycle then exit.
+    --role X: tick only role X (single tick), ignore loop.
+    auto_render: if True (default), re-render agents/ when crew.yaml is newer.
+    """
+    result = _preflight(workspace, auto_render)
+    if isinstance(result, int):
+        return result
+    ws, cfg, backend, co, goal_state = result
 
     if role:
         cycle = goal_state.cycles
@@ -471,6 +483,75 @@ def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = T
     finally:
         signal.signal(signal.SIGINT, prev_int)
         signal.signal(signal.SIGTERM, prev_term)
+
+
+def cmd_run_daemon(workspace: Path, once: bool, auto_render: bool = True) -> int:
+    """Fork the run loop into a background daemon process.
+
+    Pre-flight checks run in the foreground so errors are visible immediately.
+    On success the foreground exits 0 and the daemon PID is printed.
+    """
+    import os as _os
+
+    result = _preflight(workspace, auto_render)
+    if isinstance(result, int):
+        return result
+    ws, cfg, backend, co, goal_state = result
+
+    if ws.is_daemon_alive():
+        pid = ws.read_pid()
+        console.print(f"[red]daemon already running[/] (PID {pid}). Stop it first with [bold]crewd stop[/].")
+        return 1
+
+    # Double-fork to fully detach
+    pid1 = _os.fork()
+    if pid1 > 0:
+        # Parent: wait briefly for child to write PID, then report
+        time.sleep(0.3)
+        daemon_pid = ws.read_pid()
+        if daemon_pid and ws.is_daemon_alive():
+            console.print(f"[green]✓[/] daemon started (PID {daemon_pid})")
+            console.print(f"  log: {ws.daemon_log}")
+            console.print(f"  stop: [bold]crewd stop[/]")
+        else:
+            console.print(f"[green]✓[/] daemon forked (check [bold]crewd status[/] shortly)")
+        return 0
+
+    # First child: new session
+    _os.setsid()
+    pid2 = _os.fork()
+    if pid2 > 0:
+        _os._exit(0)  # first child exits
+
+    # Second child (daemon): redirect IO, write PID, run loop
+    ws.daemon_log.parent.mkdir(parents=True, exist_ok=True)
+    log_fd = _os.open(str(ws.daemon_log), _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o644)
+    dev_null = _os.open(_os.devnull, _os.O_RDONLY)
+    _os.dup2(dev_null, 0)
+    _os.dup2(log_fd, 1)
+    _os.dup2(log_fd, 2)
+    _os.close(dev_null)
+    _os.close(log_fd)
+
+    ws.write_pid(_os.getpid())
+
+    # Clear stale state
+    if ws.exit_reason_file.exists():
+        ws.exit_reason_file.unlink()
+    ws.resume()
+
+    ctrl = _LoopController(ws, cfg, backend, co, goal_state)
+    signal.signal(signal.SIGINT, ctrl.request_stop)
+    signal.signal(signal.SIGTERM, ctrl.request_stop)
+    try:
+        rc = ctrl.loop(once)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        rc = 1
+    finally:
+        ws.clear_pid()
+    _os._exit(rc)
 
 
 def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, cwd: Path) -> int:
@@ -510,10 +591,26 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int, c
 
 
 # ─────────────────────────── stop / status ───────────────────────────
-def cmd_stop(workspace: Path, reason: str) -> int:
+def cmd_stop(workspace: Path, reason: str, force: bool = False) -> int:
     ws = Workspace(workspace.resolve())
     ws.stop(reason)
     console.print(f"[green]✓[/] STOPPED ({reason})")
+
+    pid = ws.read_pid()
+    if pid is not None and ws.is_daemon_alive():
+        sig = signal.SIGKILL if force else signal.SIGINT
+        sig_name = "SIGKILL" if force else "SIGINT"
+        try:
+            os.kill(pid, sig)
+            console.print(f"[green]✓[/] sent {sig_name} to daemon (PID {pid})")
+        except OSError as exc:
+            console.print(f"[yellow]warn:[/] could not signal PID {pid}: {exc}")
+        if force:
+            ws.clear_pid()
+    elif pid is not None:
+        # Stale PID file
+        console.print(f"[blue]ℹ[/] clearing stale PID file (PID {pid} not running)")
+        ws.clear_pid()
     return 0
 
 
@@ -530,6 +627,16 @@ def cmd_status(workspace: Path) -> int:
     table.add_row("branch", cfg.target.branch)
     table.add_row("cycle", str(ws.read_cycle()))
     table.add_row("stopped", "yes" if ws.is_stopped() else "no")
+    # Daemon status
+    pid = ws.read_pid()
+    if pid is not None:
+        alive = ws.is_daemon_alive()
+        status = f"PID {pid} ([green]running[/])" if alive else f"PID {pid} ([red]dead[/])"
+        table.add_row("daemon", status)
+        if not alive:
+            ws.clear_pid()
+    else:
+        table.add_row("daemon", "[dim]not running[/]")
     table.add_row("backend", cfg.backend)
     for r in ROLES:
         if r in cfg.roles:

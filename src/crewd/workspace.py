@@ -11,8 +11,10 @@ Workspace structure:
       advisory.agent.md
     state/                 — runtime state
       STOPPED              — sentinel: loop won't tick
+      run.pid              — daemon PID (present only when daemon is running)
       cycle.txt            — current cycle counter
       logs/<role>/<cycle>.log
+      logs/daemon.log      — daemon stdout/stderr
     cfg/                   — per-role copilot --config-dir target
       lead/
       worker/
@@ -23,6 +25,7 @@ Workspace structure:
 from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
+import os
 
 
 @dataclass
@@ -108,6 +111,41 @@ class Workspace:
 
     def is_stopped(self) -> bool:
         return self.stopped_sentinel.exists()
+
+    # ── PID file (daemon mode) ──
+
+    @property
+    def pid_file(self) -> Path:
+        return self.state_dir / "run.pid"
+
+    @property
+    def daemon_log(self) -> Path:
+        return self.state_dir / "logs" / "daemon.log"
+
+    def write_pid(self, pid: int) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.pid_file.write_text(str(pid) + "\n")
+
+    def read_pid(self) -> int | None:
+        if not self.pid_file.exists():
+            return None
+        try:
+            return int(self.pid_file.read_text().strip())
+        except (ValueError, OSError):
+            return None
+
+    def clear_pid(self) -> None:
+        self.pid_file.unlink(missing_ok=True)
+
+    def is_daemon_alive(self) -> bool:
+        pid = self.read_pid()
+        if pid is None:
+            return False
+        try:
+            os.kill(pid, 0)  # signal 0 = existence check
+            return True
+        except OSError:
+            return False
 
 
 def find_workspace(start: Path | None = None) -> Path | None:

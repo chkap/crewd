@@ -116,9 +116,9 @@ def default_config(name: str, repo: str | None = None) -> CrewConfig:
         name=name,
         target=TargetConfig(repo=repo),
         roles={
-            "lead": RoleConfig(model="claude-opus-4.7", family="claude"),
+            "lead": RoleConfig(model="claude-sonnet-4.6", family="claude"),
             "worker": RoleConfig(model="gpt-5.4", family="gpt"),
-            "verifier": RoleConfig(model="claude-opus-4.7", family="claude"),
-            "advisory": RoleConfig(model="gpt-5.2", family="gpt"),
+            "verifier": RoleConfig(model="claude-sonnet-4.6", family="claude"),
+            "advisory": RoleConfig(model="gpt-5.4", family="gpt"),
         },
     )

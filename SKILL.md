@@ -54,7 +54,9 @@ $EDITOR GOAL.md                                                # write the spec
 uv --directory ~/crewd run crewd -w "$(pwd)" doctor            # must be 0 errors
 uv --directory ~/crewd run crewd -w "$(pwd)" tick lead         # smoke-test 1 role
 uv --directory ~/crewd run crewd -w "$(pwd)" run --once        # one full cycle
-uv --directory ~/crewd run crewd -w "$(pwd)" run               # loop until STOPPED
+uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon     # loop in background
+uv --directory ~/crewd run crewd -w "$(pwd)" status           # check daemon + crew state
+uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (STOPPED + SIGINT)
 ```
 
 `init` registers the workspace in `~/.crewd/registry.json` so `crewd list` / `crewd cd <name>` work from anywhere.
@@ -68,6 +70,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" run               # loop until STOP
 ├── agents/<role>.agent.md ← derived from src/crewd/templates/agents/*.j2; auto re-rendered
 ├── cfg/<role>/session-state/   ← copilot --config-dir (rotate on corruption, see below)
 ├── state/STOPPED          ← sentinel; loop exits at next check
+├── state/run.pid          ← daemon PID (only when daemon is running)
 ├── state/cycle.txt        ← legacy mirror
 ├── state/goal.json        ← {version, label, goal_md_sha256, cycles}
 ├── state/exit-reason      ← written on graceful exit
@@ -130,11 +133,11 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 | `target checkout missing`                                        | `crewd attach <owner/repo> --clone`                                                                     |
 | `GOAL.md changed since goal vN started`                          | `crewd new-goal --from GOAL.md` (don't bypass — see Hard rule #4).                                      |
 | Lead writes `STOPPED` immediately after restart with new GOAL    | You forgot `new-goal`. Run it; confirm `state/inbox/lead.md` ends with `[OVERRIDE]`.                    |
-| Want to kill the loop cleanly                                    | `kill -INT <pid>` (finishes current tick, writes exit-reason). Second signal aborts hard.               |
+| Want to kill the loop cleanly                                    | `crewd stop` (writes STOPPED + sends SIGINT to daemon). `crewd stop --force` sends SIGKILL.             |
 
 ## Graceful shutdown semantics
 
-`run` installs `SIGINT`/`SIGTERM` handlers that flip an interrupt flag — the current tick finishes, then `state/exit-reason` is written and the loop exits 0. The backend escalates child copilot processes `SIGINT → SIGTERM → SIGKILL` (SIGINT preferred — copilot has a dedicated handler that flushes events.jsonl cleanest, avoiding the orphan tool_use that breaks `--continue`).
+`run` (foreground or `--daemon`) installs `SIGINT`/`SIGTERM` handlers that flip an interrupt flag — the current tick finishes, then `state/exit-reason` is written and the loop exits 0. `crewd stop` writes the `STOPPED` sentinel and sends `SIGINT` to the daemon PID if running; `--force` sends `SIGKILL`. The backend escalates child copilot processes `SIGINT → SIGTERM → SIGKILL` (SIGINT preferred — copilot has a dedicated handler that flushes events.jsonl cleanest, avoiding the orphan tool_use that breaks `--continue`).
 
 ## What NOT to do
 
