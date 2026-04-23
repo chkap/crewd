@@ -113,7 +113,7 @@ Hard rules baked into `doctor` and `run`:
 | `init <path> [--name N --repo R]`        | Scaffold a new workspace + register it.                                        |
 | `attach <owner/repo> [--branch --no-clone]` | Attach (or re-attach) target repo, clone into `repo/`, create per-role worktrees. |
 | `doctor`                                 | Status dashboard with diagnostics (roles, state, inbox, recent logs, issues). |
-| `refresh`                                | Force re-render `agents/*.agent.md` from templates + `crew.yaml`.              |
+| `refresh`                                | Re-render agents/ + AGENTS.md; migrate old workspace layout if needed.         |
 | `goal [--edit] [--from FILE]`            | Print, `$EDITOR`-edit, or install `GOAL.md` from a file.                       |
 | `run [--once] [--role R] [--daemon] [--no-auto-render]` | Foreground loop (default) or background daemon (`--daemon`). `--once` / `--role` as before. |
 | `tick <role>`                            | Imperative single tick of one role (alias for `run --role`).                   |

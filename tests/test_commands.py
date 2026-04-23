@@ -277,3 +277,35 @@ def _fake_gh_ok(cmd, *a, **kw):
     """Fake successful gh auth status."""
     class R: returncode = 0; stdout = ""; stderr = ""
     return R()
+
+
+# ─── refresh / migration ───
+def test_cmd_refresh_renders_agents_md(tmp_ws: Workspace):
+    """refresh creates AGENTS.md in cfg/<role>/."""
+    rc = commands.cmd_refresh(tmp_ws.root)
+    assert rc == 0
+    for role in ("lead", "worker", "verifier", "advisory"):
+        agents_md = tmp_ws.role_cfg_dir(role) / "AGENTS.md"
+        assert agents_md.exists(), f"AGENTS.md missing for {role}"
+        assert tmp_ws.cfg.name if hasattr(tmp_ws, "cfg") else "testcrew" in agents_md.read_text()
+
+
+def test_cmd_refresh_migrates_checkout_to_repo(tmp_ws: Workspace):
+    """refresh renames checkout/ → repo/ and updates crew.yaml."""
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    # Simulate old layout: rename repo/ back to checkout/, reset config
+    repo = tmp_ws.repo_dir(cfg.target.checkout)
+    old_checkout = tmp_ws.root / "checkout"
+    if repo.exists():
+        repo.rename(old_checkout)
+    cfg.target.checkout = "./checkout"
+    cfg.save(tmp_ws.crew_yaml)
+
+    rc = commands.cmd_refresh(tmp_ws.root)
+    assert rc == 0
+
+    # Verify migration happened
+    reloaded = CrewConfig.load(tmp_ws.crew_yaml)
+    assert reloaded.target.checkout == "./repo"
+    assert (tmp_ws.root / "repo").exists()
+    assert not (tmp_ws.root / "checkout").exists()

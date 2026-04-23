@@ -105,12 +105,38 @@ def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
 
 # ─────────────────────────── refresh ───────────────────────────
 def cmd_refresh(workspace: Path) -> int:
-    """Force re-render agents/*.agent.md from templates + crew.yaml."""
+    """Force re-render agents/*.agent.md + AGENTS.md from templates + crew.yaml.
+
+    Also performs workspace migration if needed:
+    - Renames checkout/ → repo/ if the old layout is detected
+    - Updates crew.yaml checkout path accordingly
+    - Creates per-role git worktrees if missing
+    """
     ws = Workspace(workspace.resolve())
     if not ws.is_initialized():
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
     cfg = CrewConfig.load(ws.crew_yaml)
+
+    # ── migrate: checkout/ → repo/ ──
+    old_co = (ws.root / "checkout").resolve()
+    target_co = (ws.root / "repo").resolve()
+    if old_co.exists() and old_co != target_co and not target_co.exists():
+        old_co.rename(target_co)
+        console.print(f"[blue]ℹ[/] migrated checkout/ → repo/")
+    if cfg.target.checkout == "./checkout":
+        cfg.target.checkout = "./repo"
+        cfg.save(ws.crew_yaml)
+        console.print(f"[blue]ℹ[/] updated crew.yaml checkout → ./repo")
+
+    # ── create worktrees if repo exists but worktrees don't ──
+    repo = ws.repo_dir(cfg.target.checkout)
+    if repo.exists():
+        created = _setup_worktrees(ws, cfg, repo)
+        for wt_path in created:
+            console.print(f"  [green]✓[/] worktree {wt_path}")
+
+    # ── render templates ──
     goal_label = "goal:v1"
     if ws.goal_json.exists():
         try:
@@ -122,7 +148,7 @@ def cmd_refresh(workspace: Path) -> int:
         if role in cfg.roles:
             console.print(f"  [green]✓[/] {ws.agent_file(role).name}")
             console.print(f"  [green]✓[/] {ws.role_cfg_dir(role) / 'AGENTS.md'}")
-    console.print(f"[green]✓[/] agents/ refreshed from templates")
+    console.print(f"[green]✓[/] refreshed (agents/ + AGENTS.md)")
     return 0
 
 

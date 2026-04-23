@@ -61,7 +61,7 @@ def doctor(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
 
 @app.command()
 def refresh(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
-    """Force re-render agents/*.agent.md from templates + crew.yaml."""
+    """Force re-render agents/ + AGENTS.md. Also migrates old workspace layout if needed."""
     raise typer.Exit(commands.cmd_refresh(_ws_opt(workspace)))
 
 
