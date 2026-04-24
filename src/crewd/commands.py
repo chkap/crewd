@@ -1052,5 +1052,5 @@ def cmd_new_goal(workspace: Path, from_path: Path) -> int:
 
     console.print(f"[green]✓[/] new goal epoch [bold]{new_label}[/] (v{next_version})")
     console.print(f"  GOAL.md sha: {new_sha[:12]}…")
-    console.print(f"  inbox notice queued: {inbox}")
+    console.print(f"  inbox notices queued in: {inbox_dir}")
     return 0
