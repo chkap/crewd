@@ -1025,17 +1025,30 @@ def cmd_new_goal(workspace: Path, from_path: Path) -> int:
     # Re-render agent files with new label
     _render_agent_files(ws, cfg, goal_label=new_label)
 
-    # Append [OVERRIDE] line to lead inbox
-    inbox = ws.state_dir / "inbox" / "lead.md"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
+    # Append [OVERRIDE] line to ALL role inboxes so every agent re-grounds
+    # to live `gh` state on its next tick (defense-in-depth against stale
+    # session memory from prior epochs).
+    inbox_dir = ws.state_dir / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with open(inbox, "a") as f:
-        f.write(
-            f"\n---\n## [OVERRIDE @ {ts}]\n"
-            f"New goal epoch: **{new_label}** (v{next_version}). "
-            f"GOAL.md updated from `{src}`. "
-            f"Re-plan from scratch using label `{new_label}` for all new issues.\n"
-        )
+    for role in ("lead", "worker", "verifier", "advisory"):
+        if role == "lead":
+            body = (
+                f"\n---\n## [OVERRIDE @ {ts}]\n"
+                f"New goal epoch: **{new_label}** (v{next_version}). "
+                f"GOAL.md updated from `{src}`. "
+                f"Re-plan from scratch using label `{new_label}` for all new issues.\n"
+            )
+        else:
+            body = (
+                f"\n---\n## [OVERRIDE @ {ts}]\n"
+                f"New goal epoch: **{new_label}** (v{next_version}). "
+                f"IGNORE any session memory tied to a prior `goal:vX` label. "
+                f"Re-query live `gh issue list --label crewd:task --state open` and "
+                f"`gh pr list --state open` to discover work; epoch is informational only.\n"
+            )
+        with open(inbox_dir / f"{role}.md", "a") as f:
+            f.write(body)
 
     console.print(f"[green]✓[/] new goal epoch [bold]{new_label}[/] (v{next_version})")
     console.print(f"  GOAL.md sha: {new_sha[:12]}…")
