@@ -18,7 +18,7 @@ def tmp_ws(tmp_path: Path) -> Workspace:
     cfg.save(ws.crew_yaml)
     ws.goal_md.write_text("# GOAL\n\nDo the thing.\n")
     # Fake repo dir so doctor / run don't bail
-    co = ws.repo_dir(cfg.target.checkout)
+    co = ws.repo_dir(cfg.target.repo)
     co.mkdir(parents=True, exist_ok=True)
     # Create fake per-role worktrees
     for role in ("lead", "worker", "verifier", "advisory"):

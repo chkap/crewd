@@ -131,7 +131,6 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 | `STOPPED` present at cycle 0                                     | `crewd resume && crewd run`                                                                             |
 | Copilot `--continue` fails with `CAPIError 400` (orphan tool_use) | `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-tick (fresh session). |
 | `family check: worker.family == verifier.family`                 | Edit `crew.yaml` so families differ (e.g. gpt vs claude). Auto re-render handles agents/.               |
-| `target checkout missing`                                        | `crewd attach <owner/repo> --clone`                                                                     |
 | `target repo clone missing`                                      | `crewd attach <owner/repo> --clone`                                                                     |
 | `GOAL.md changed since goal vN started`                          | `crewd new-goal --from GOAL.md` (don't bypass — see Hard rule #4).                                      |
 | Lead writes `STOPPED` immediately after restart with new GOAL    | You forgot `new-goal`. Run it; confirm `state/inbox/lead.md` ends with `[OVERRIDE]`.                    |

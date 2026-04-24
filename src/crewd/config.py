@@ -1,13 +1,13 @@
 """crew.yaml schema and Workspace path conventions."""
 from __future__ import annotations
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 ROLES = ("lead", "worker", "verifier", "advisory")
@@ -20,10 +20,53 @@ class RoleConfig(BaseModel):
 
 
 class TargetConfig(BaseModel):
-    repo: str | None = None  # "owner/name", None until attached
-    branch: str = "main"
-    checkout: str = "./repo"  # relative to workspace
+    """Target repo config.
 
+    Fields:
+      - ``remote``: GitHub ``owner/name`` identifier (was ``repo`` pre-v2).
+      - ``branch``: default branch.
+      - ``repo``:   local clone path under the workspace (was ``checkout`` pre-v2).
+
+    Backwards compatibility: old keys ``repo`` (for remote) and ``checkout``
+    (for local path) are still accepted on load and transparently mapped.
+    The legacy-``repo``→``remote`` heuristic fires when the value contains
+    ``/`` and does not start with ``.`` or ``/`` (i.e. looks like ``owner/name``,
+    not a local path). Avoid local clone paths shaped like ``sub/dir`` to
+    sidestep this edge case — prefer ``./sub/dir``.
+    """
+
+    remote: str | None = None           # "owner/name", None until attached
+    branch: str = "main"
+    repo: str = "./repo"                # local clone path, relative to workspace
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        # Legacy: target.checkout (local path) → target.repo
+        if "checkout" in d and "repo" not in d:
+            d["repo"] = d.pop("checkout")
+        elif "checkout" in d and "repo" in d:
+            # Ambiguous: if both present, assume old-style where repo = remote.
+            # This means: repo holds "owner/name", checkout holds local path.
+            if d.get("repo") and "/" in str(d["repo"]) and "remote" not in d:
+                d["remote"] = d.pop("repo")
+                d["repo"] = d.pop("checkout")
+            else:
+                d.pop("checkout", None)
+        else:
+            # No checkout key; but repo may still be an old-style "owner/name" remote
+            # (heuristic: contains "/" and no path separator prefix like "./")
+            if (
+                "remote" not in d
+                and isinstance(d.get("repo"), str)
+                and "/" in d["repo"]
+                and not d["repo"].startswith((".", "/"))
+            ):
+                d["remote"] = d.pop("repo")
+        return d
 
 class LoopConfig(BaseModel):
     sleep_secs: int = 60
@@ -111,10 +154,15 @@ class GoalState(BaseModel):
         )
 
 
-def default_config(name: str, repo: str | None = None) -> CrewConfig:
+def default_config(
+    name: str, remote: str | None = None, *, repo: str | None = None
+) -> CrewConfig:
+    # Back-compat: old callers passed ``repo="owner/name"``. New name is ``remote``.
+    if remote is None and repo is not None:
+        remote = repo
     return CrewConfig(
         name=name,
-        target=TargetConfig(repo=repo),
+        target=TargetConfig(remote=remote),
         roles={
             "lead": RoleConfig(model="claude-sonnet-4.6", family="claude"),
             "worker": RoleConfig(model="gpt-5.4", family="gpt"),

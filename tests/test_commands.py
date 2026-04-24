@@ -25,7 +25,7 @@ def test_cmd_init_creates_complete_workspace(tmp_path: Path):
         assert "acme/widget" in body
     cfg = CrewConfig.load(ws.crew_yaml)
     assert cfg.name == "newcrew"
-    assert cfg.target.repo == "acme/widget"
+    assert cfg.target.remote == "acme/widget"
 
 
 def test_cmd_init_refuses_if_already_initialized(tmp_path: Path):
@@ -291,21 +291,38 @@ def test_cmd_refresh_renders_agents_md(tmp_ws: Workspace):
 
 
 def test_cmd_refresh_migrates_checkout_to_repo(tmp_ws: Workspace):
-    """refresh renames checkout/ → repo/ and updates crew.yaml."""
+    """refresh renames checkout/ → repo/ and upgrades crew.yaml schema.
+
+    Old layout had ``target.repo = "owner/name"`` + ``target.checkout = "./repo"``.
+    New layout has ``target.remote = "owner/name"`` + ``target.repo = "./repo"``.
+    """
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
-    # Simulate old layout: rename repo/ back to checkout/, reset config
-    repo = tmp_ws.repo_dir(cfg.target.checkout)
+    # Simulate old layout: rename repo/ back to checkout/, write legacy YAML
+    repo = tmp_ws.repo_dir(cfg.target.repo)
     old_checkout = tmp_ws.root / "checkout"
     if repo.exists():
         repo.rename(old_checkout)
-    cfg.target.checkout = "./checkout"
-    cfg.save(tmp_ws.crew_yaml)
+    import yaml as _yaml
+    legacy = {
+        "name": cfg.name,
+        "target": {
+            "repo": cfg.target.remote,         # legacy: owner/name under `repo`
+            "branch": cfg.target.branch,
+            "checkout": "./checkout",          # legacy: local path under `checkout`
+        },
+        "goal_file": cfg.goal_file,
+        "roles": {r: cfg.roles[r].model_dump() for r in cfg.roles},
+        "loop": cfg.loop.model_dump(),
+        "backend": cfg.backend,
+    }
+    tmp_ws.crew_yaml.write_text(_yaml.safe_dump(legacy, sort_keys=False))
 
     rc = commands.cmd_refresh(tmp_ws.root)
     assert rc == 0
 
-    # Verify migration happened
+    # Verify migration happened: dirs renamed and schema upgraded
     reloaded = CrewConfig.load(tmp_ws.crew_yaml)
-    assert reloaded.target.checkout == "./repo"
+    assert reloaded.target.remote == cfg.target.remote  # was under `repo:` key
+    assert reloaded.target.repo == "./repo"             # was under `checkout:` key
     assert (tmp_ws.root / "repo").exists()
     assert not (tmp_ws.root / "checkout").exists()

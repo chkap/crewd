@@ -9,7 +9,8 @@ from crewd.config import CrewConfig, RoleConfig, default_config
 def test_default_config_has_four_roles():
     cfg = default_config("demo", "acme/widget")
     assert set(cfg.roles) == {"lead", "worker", "verifier", "advisory"}
-    assert cfg.target.repo == "acme/widget"
+    assert cfg.target.remote == "acme/widget"
+    assert cfg.target.repo == "./repo"
     assert cfg.target.branch == "main"
     assert cfg.backend == "copilot"
 
@@ -40,6 +41,7 @@ def test_save_load_roundtrip(tmp_path: Path):
     cfg.save(p)
     loaded = CrewConfig.load(p)
     assert loaded.name == "demo"
-    assert loaded.target.repo == "acme/widget"
+    assert loaded.target.remote == "acme/widget"
+    assert loaded.target.repo == "./repo"
     assert loaded.loop.sleep_secs == 30
     assert loaded.roles["worker"].family == "gpt"

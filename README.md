@@ -22,7 +22,7 @@ uv --directory ~/crewd run crewd init my-crew --repo myorg/my-app
 cd my-crew
 uv --directory ~/crewd run crewd -w "$(pwd)" goal --edit
 
-# 3. Sanity check (config, families, target checkout, agents/, inbox)
+# 3. Sanity check (config, families, target repo clone, agents/, inbox)
 uv --directory ~/crewd run crewd -w "$(pwd)" doctor
 
 # 4. Smoke test: one tick of one role
@@ -131,9 +131,9 @@ Hard rules baked into `doctor` and `run`:
 ```yaml
 name: my-crew
 target:
-  repo: myorg/my-app          # null until attached
+  remote: myorg/my-app        # GitHub owner/name; null until attached
   branch: main
-  checkout: ./repo
+  repo: ./repo                # local clone path (relative to workspace)
 goal_file: ./GOAL.md
 roles:
   lead:     {model: claude-sonnet-4.6, family: claude}
@@ -187,7 +187,6 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 | `STOPPED` present at cycle 0 (doctor flags it)                | `crewd resume && crewd run`                                                        |
 | Copilot `--continue` fails with `CAPIError 400`               | `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-run (fresh session). |
 | `family check: worker.family == verifier.family`              | Edit `crew.yaml` so they differ; rerun.                                            |
-| `target checkout missing`                                     | `crewd attach <owner/repo> --clone`                                                |
 | `target repo clone missing`                                   | `crewd attach <owner/repo> --clone`                                                |
 | `GOAL.md changed since goal vN started`                       | `crewd new-goal --from GOAL.md` to start a new epoch.                              |
 | Lead immediately writes `STOPPED` after restart with new GOAL | You forgot `new-goal`. Run it; verify `state/inbox/lead.md` has `[OVERRIDE]`.      |

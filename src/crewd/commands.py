@@ -31,7 +31,7 @@ def cmd_init(path: Path, name: str | None, repo: str | None) -> int:
     ws.ensure_skeleton()
 
     name = name or path.name
-    cfg = default_config(name=name, repo=repo)
+    cfg = default_config(name=name, remote=repo)
     cfg.save(ws.crew_yaml)
 
     # GOAL.md
@@ -53,7 +53,7 @@ def cmd_init(path: Path, name: str | None, repo: str | None) -> int:
 def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:v1") -> None:
     ctx = {
         "workspace_name": cfg.name,
-        "target_repo": cfg.target.repo,
+        "target_repo": cfg.target.remote,
         "target_branch": cfg.target.branch,
         "worker_model": cfg.roles["worker"].model if "worker" in cfg.roles else "?",
         "verifier_model": cfg.roles["verifier"].model if "verifier" in cfg.roles else "?",
@@ -105,7 +105,8 @@ def cmd_refresh(workspace: Path) -> int:
 
     Also performs workspace migration if needed:
     - Renames checkout/ → repo/ if the old layout is detected
-    - Updates crew.yaml checkout path accordingly
+    - Updates crew.yaml fields (legacy ``checkout``/``repo`` → new
+      ``repo``/``remote`` schema) via save() roundtrip
     - Creates per-role git worktrees if missing
     """
     ws = Workspace(workspace.resolve())
@@ -120,13 +121,16 @@ def cmd_refresh(workspace: Path) -> int:
     if old_co.exists() and old_co != target_co and not target_co.exists():
         old_co.rename(target_co)
         console.print(f"[blue]ℹ[/] migrated checkout/ → repo/")
-    if cfg.target.checkout == "./checkout":
-        cfg.target.checkout = "./repo"
+    if cfg.target.repo == "./checkout":
+        cfg.target.repo = "./repo"
         cfg.save(ws.crew_yaml)
-        console.print(f"[blue]ℹ[/] updated crew.yaml checkout → ./repo")
+        console.print(f"[blue]ℹ[/] updated crew.yaml target.repo → ./repo")
+    elif (ws.root / "repo").exists() or cfg.target.remote:
+        # Touch-save once to canonicalize legacy keys (checkout→repo, repo→remote)
+        cfg.save(ws.crew_yaml)
 
     # ── create worktrees if repo exists but worktrees don't ──
-    repo = ws.repo_dir(cfg.target.checkout)
+    repo = ws.repo_dir(cfg.target.repo)
     if repo.exists():
         created = _setup_worktrees(ws, cfg, repo)
         for wt_path in created:
@@ -179,7 +183,7 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
     cfg = CrewConfig.load(ws.crew_yaml)
-    cfg.target.repo = repo
+    cfg.target.remote = repo
     if branch:
         cfg.target.branch = branch
     cfg.save(ws.crew_yaml)
@@ -193,7 +197,7 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
     _render_agent_files(ws, cfg, goal_label=goal_label)  # refresh agent.md with repo name
     registry.register(cfg.name, ws.root, repo)  # update registry repo field
 
-    co = ws.repo_dir(cfg.target.checkout)
+    co = ws.repo_dir(cfg.target.repo)
     if clone and not co.exists():
         console.print(f"[blue]cloning[/] {repo} → {co}")
         rc = subprocess.run(
@@ -265,7 +269,7 @@ def cmd_doctor(workspace: Path) -> int:
 
     console.print(
         f"[green]✓[/] crew.yaml valid  ([bold]{cfg.name}[/], "
-        f"backend=[cyan]{cfg.backend}[/], target=[cyan]{cfg.target.repo or '(unset)'}[/])"
+        f"backend=[cyan]{cfg.backend}[/], target=[cyan]{cfg.target.remote or '(unset)'}[/])"
     )
 
     # Roles table
@@ -357,12 +361,12 @@ def cmd_doctor(workspace: Path) -> int:
     console.print(act_tbl)
 
     # Soft warnings
-    if not cfg.target.repo:
+    if not cfg.target.remote:
         issues.append(("warn", "no target repo attached. Run: crewd attach <owner/repo>"))
     else:
-        co = ws.repo_dir(cfg.target.checkout)
+        co = ws.repo_dir(cfg.target.repo)
         if not co.exists():
-            issues.append(("warn", f"target repo clone missing at {co}. Run: crewd attach {cfg.target.repo} --clone"))
+            issues.append(("warn", f"target repo clone missing at {co}. Run: crewd attach {cfg.target.remote} --clone"))
 
     if not ws.goal_md.exists():
         issues.append(("error", "GOAL.md missing."))
@@ -515,7 +519,7 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             console.print(f"[red]backend:[/] {e}")
         return 2
 
-    co = ws.repo_dir(cfg.target.checkout)
+    co = ws.repo_dir(cfg.target.repo)
     if not co.exists():
         console.print(f"[red]target repo clone missing:[/] {co}. Run [bold]crewd attach --clone[/].")
         return 2
@@ -650,7 +654,7 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
 
     prompt = (
         f"This is cycle {cycle}. Read the latest GitHub issues + comments in "
-        f"`{cfg.target.repo}` and execute your role's responsibilities. "
+        f"`{cfg.target.remote}` and execute your role's responsibilities. "
         f"GOAL.md is at `{ws.goal_md}`. "
         f"If `{ws.state_dir / 'inbox' / (role + '.md')}` exists, read its messages "
         f"from the human operator FIRST, then truncate that file to empty. "
@@ -709,7 +713,7 @@ def cmd_status(workspace: Path) -> int:
     table = Table(title=f"crewd status — {cfg.name}")
     table.add_column("field"); table.add_column("value")
     table.add_row("workspace", str(ws.root))
-    table.add_row("repo", cfg.target.repo or "(unset)")
+    table.add_row("remote", cfg.target.remote or "(unset)")
     table.add_row("branch", cfg.target.branch)
     table.add_row("cycle", str(ws.read_cycle()))
     table.add_row("stopped", "yes" if ws.is_stopped() else "no")
@@ -999,9 +1003,9 @@ def cmd_new_goal(workspace: Path, from_path: Path) -> int:
     new_sha = sha256_file(ws.goal_md)
 
     # Close prior labeled issues (best-effort)
-    if prior_label and cfg.target.repo:
+    if prior_label and cfg.target.remote:
         for lbl in (prior_label,):  # close issues bearing the prior epoch label
-            closed, errs = _close_label_issues(cfg.target.repo, lbl)
+            closed, errs = _close_label_issues(cfg.target.remote, lbl)
             console.print(f"[blue]closed {closed} issues labeled[/] {lbl}")
             for e in errs:
                 console.print(f"  [yellow]warn:[/] {e}")
