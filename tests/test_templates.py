@@ -21,6 +21,8 @@ def test_render_lead_agent_includes_workspace_and_repo():
     assert "claude-opus-4.7" in out
     assert "Worker is `gpt-5.4`" in out
     assert "cfg/lead/" in out  # workspace layout included
+    assert "decision log" in out
+    assert "genuinely necessary" in out
 
 
 def test_render_worker_warns_about_family_difference():
@@ -39,6 +41,8 @@ def test_render_worker_warns_about_family_difference():
     assert "different family (`claude`)" in out
     assert "Never merge your own PR" in out
     assert "cfg/worker/" in out
+    assert "implementation note" in out
+    assert "truly blocked" in out
 
 
 def test_render_verifier_emphasizes_blackbox():
@@ -56,6 +60,8 @@ def test_render_verifier_emphasizes_blackbox():
     )
     assert "Black-box" in out
     assert "(repo not yet attached)" in out  # falsy target_repo branch
+    assert "spec attack" in out
+    assert "regression-suspicious" in out
 
 
 def test_render_advisory_minimal():
@@ -73,6 +79,7 @@ def test_render_advisory_minimal():
     assert "research scientist / strategic advisor" in out
     assert "non-binding" in out
     assert "Options" in out
+    assert "truly necessary" in out
 
 
 def test_render_other_roles_reference_non_binding_advisory():
