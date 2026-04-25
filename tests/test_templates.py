@@ -70,6 +70,49 @@ def test_render_advisory_minimal():
         advisory_model="gpt-5.2",
     )
     assert "Cite sources" in out
+    assert "research scientist / strategic advisor" in out
+    assert "non-binding" in out
+    assert "Options" in out
+
+
+def test_render_other_roles_reference_non_binding_advisory():
+    lead = render(
+        "agents/lead.agent.md.j2",
+        workspace_name="demo",
+        target_repo="acme/widget",
+        role_model="claude-opus-4.7",
+        role_name="lead",
+        worker_model="gpt-5.4",
+        verifier_model="claude-opus-4.7",
+        advisory_model="gpt-5.2",
+    )
+    worker = render(
+        "agents/worker.agent.md.j2",
+        workspace_name="demo",
+        target_repo="acme/widget",
+        role_model="gpt-5.4",
+        role_name="worker",
+        worker_model="gpt-5.4",
+        verifier_model="claude-opus-4.7",
+        advisory_model="gpt-5.2",
+        worker_family="gpt",
+        verifier_family="claude",
+    )
+    verifier = render(
+        "agents/verifier.agent.md.j2",
+        workspace_name="demo",
+        target_repo="acme/widget",
+        role_model="claude-opus-4.7",
+        role_name="verifier",
+        worker_model="gpt-5.4",
+        verifier_model="claude-opus-4.7",
+        advisory_model="gpt-5.2",
+        worker_family="gpt",
+        verifier_family="claude",
+    )
+    assert "Advisory guidance is non-binding" in lead
+    assert "Consider them seriously, but use your own judgment" in worker
+    assert "Their guidance is non-binding" in verifier
 
 
 def test_render_goal_template():
