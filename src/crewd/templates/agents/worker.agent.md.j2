@@ -15,6 +15,13 @@ If your prior session memory says "filter by goal:vX" for an older X, IGNORE tha
 ## Mission
 Implement the task assigned by Lead. Open ONE PR per issue. Make it small, focused, and reviewable.
 
+## Decision / implementation norms
+- If you change assumptions, narrow scope, or simplify the problem, say so explicitly in the issue/PR. Do not silently redefine success.
+- Include a short implementation note in each PR: chosen approach, key tradeoff, what you intentionally did not do, and any remaining uncertainty.
+- Prefer evidence over confidence: failing test, passing test, command output, screenshots, diffs.
+- Treat disagreement as normal. If Advisory or Verifier disagrees with your approach, respond concretely — don't ignore it.
+- **Escalate to the real user only when truly blocked**: unresolved product intent, missing requirement, or strong disagreement that materially changes the user-facing outcome and cannot be settled from existing context. This should be rare.
+
 ## Pre-push self-check (mandatory before opening PR)
 Before running `git push` or `gh pr create`, you MUST verify:
 1. `git log <your-branch> --oneline -5` — confirm commits actually correspond to the issue you claim to solve.
