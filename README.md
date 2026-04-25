@@ -90,7 +90,7 @@ Each role gets its own git worktree at `cfg/<role>/worktree/` created from the m
 | **lead**     | no           | no            | plans, schedules, umbrella issues, prioritisation |
 | **worker**   | yes          | no            | branches, commits, PRs                          |
 | **verifier** | no           | **yes**       | per-PR review + final `crewd:acceptance` gate   |
-| **advisory** | no           | no            | sourced research, citations, design pointers    |
+| **advisory** | no           | no            | proactive research, tradeoffs, citations, risk spotting |
 
 Hard rules baked into `doctor` and `run`:
 
@@ -98,6 +98,15 @@ Hard rules baked into `doctor` and `run`:
 - All cross-role talk happens via GitHub issue / PR comments — never via shared files inside the workspace.
 - Only the verifier merges. Only the worker pushes code.
 - Two-tier verification: lightweight per-PR review + a heavy **Final Acceptance Gate** before the lead writes `STOPPED`.
+- Advisory is **proactive but non-binding**: it should surface alternatives, tradeoffs, prior art, weak test oracles, and hidden risks, but it does not become the decision-maker.
+- Ask the real user for input only in **true blocking cases**: unresolved product ambiguity, a material risk tradeoff, or strong cross-role disagreement that changes the shipped outcome. This should be rare.
+
+### Role decision norms
+
+- **Lead** keeps a lightweight decision log, actively invites Advisory on meaningful tradeoffs, and makes disagreement explicit instead of letting it stay implicit.
+- **Worker** must not silently redefine success when implementation gets hard; each PR should include a short implementation note covering approach, tradeoffs, and remaining uncertainty.
+- **Verifier** should perform a quick spec attack (`what is the weakest interpretation this PR could satisfy?`) and stay alert for regression risk even when tests are green.
+- **Advisory** should prefer broad-view strategic insight over micromanagement and use a structured lens: observation → options → tradeoffs → recommendation → confidence.
 
 ---
 
@@ -120,7 +129,7 @@ Hard rules baked into `doctor` and `run`:
 | `cd <name>`                              | Print abs path of a registered workspace (use as `cd $(crewd cd foo)`).        |
 | `talk <role> "<msg>"`                    | Append a free-form operator message to `state/inbox/<role>.md`.                |
 | `inbox <role> <OVERRIDE\|ADVICE\|INFO> "<msg>"` | Append a prioritised operator line to the inbox.                         |
-| `new-goal --from GOAL.md`                | Bump goal epoch: copy GOAL.md, close prior `goal:vN` issues, reset cycles, requeue lead with `[OVERRIDE]`. |
+| `new-goal --from GOAL.md`                | Bump goal epoch: copy GOAL.md, close prior `goal:vN` issues, reset cycles, and queue inbox override notices for all roles. |
 
 `-w / --workspace <path>` is accepted by all workspace-scoped commands. Without it, `crewd` walks up from cwd looking for `crew.yaml` (git-style discovery).
 
@@ -172,7 +181,7 @@ crewd new-goal --from GOAL.md
 crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 ```
 
-`new-goal` bumps `goal:vN`, closes prior open issues with the previous label, resets cycles, clears `STOPPED`, re-renders `agents/`, and queues an `[OVERRIDE]` line in `lead.md`. Required when reusing a workspace for a fresh goal — otherwise the resumed lead session sees the old `PASS` and writes `STOPPED` immediately.
+`new-goal` bumps `goal:vN`, closes prior open issues with the previous label, resets cycles, clears `STOPPED`, re-renders `agents/`, and queues `[OVERRIDE]` inbox notices for all roles. Required when reusing a workspace for a fresh goal — otherwise resumed sessions may follow the old goal state or old acceptance result instead of re-grounding on the new epoch.
 
 **Graceful shutdown**
 
