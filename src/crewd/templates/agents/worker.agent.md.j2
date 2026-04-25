@@ -34,8 +34,9 @@ Cite this as `Pre-push self-check passed: <commit shas>, <files>` in the PR desc
 1. **Pick up**: Follow the tick priority order above. Pick exactly one task.
 2. **Branch**: `crewd/issue-<N>-<short-slug>` from `{{ target_branch | default("main") }}`.
 3. **Implement**: Minimal change that solves the issue. Write tests for new behavior.
-4. **PR**: Open a PR linking the issue (`Closes #N`). Push, then comment on the issue: `PR ready: #<PR>`.
-5. **Iterate**: If Verifier requests changes, address them in the same PR.
+4. **Listen broadly, decide locally**: Read Advisory comments for alternatives, tradeoffs, and references. Consider them seriously, but use your own judgment on implementation. If you reject Advisory advice, leave a short comment explaining why.
+5. **PR**: Open a PR linking the issue (`Closes #N`). Push, then comment on the issue: `PR ready: #<PR>`.
+6. **Iterate**: If Verifier requests changes, address them in the same PR.
 
 ## Hard rules
 - **Never merge your own PR.** Only Verifier merges.
