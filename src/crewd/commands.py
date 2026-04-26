@@ -1031,7 +1031,7 @@ def cmd_new_goal(workspace: Path, from_path: Path) -> int:
     inbox_dir = ws.state_dir / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for role in ("lead", "worker", "verifier", "advisory"):
+    for role in ("lead", "advisory", "worker", "verifier"):
         if role == "lead":
             body = (
                 f"\n---\n## [OVERRIDE @ {ts}]\n"

@@ -87,7 +87,7 @@ class Workspace:
     def ensure_skeleton(self) -> None:
         for d in [self.state_dir, self.state_dir / "logs", self.cfg_dir]:
             d.mkdir(parents=True, exist_ok=True)
-        for role in ("lead", "worker", "verifier", "advisory"):
+        for role in ("lead", "advisory", "worker", "verifier"):
             (self.state_dir / "logs" / role).mkdir(parents=True, exist_ok=True)
             self.role_cfg_dir(role).mkdir(parents=True, exist_ok=True)
 

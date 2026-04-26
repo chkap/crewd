@@ -23,6 +23,10 @@ def test_render_lead_agent_includes_workspace_and_repo():
     assert "cfg/lead/" in out  # workspace layout included
     assert "decision log" in out
     assert "genuinely necessary" in out
+    assert "human-facing anchor" in out
+    assert "single umbrella GOAL issue" in out
+    assert "plain-language summary of the user goal" in out
+    assert "Close the GOAL issue" in out
 
 
 def test_render_worker_warns_about_family_difference():
@@ -43,6 +47,7 @@ def test_render_worker_warns_about_family_difference():
     assert "cfg/worker/" in out
     assert "implementation note" in out
     assert "truly blocked" in out
+    assert "Do not add a required `How to verify` section for Verifier" in out
 
 
 def test_render_verifier_emphasizes_blackbox():
@@ -62,6 +67,8 @@ def test_render_verifier_emphasizes_blackbox():
     assert "(repo not yet attached)" in out  # falsy target_repo branch
     assert "spec attack" in out
     assert "regression-suspicious" in out
+    assert "derive your own manual checks from the linked issue" in out
+    assert "Do not require a `How to verify` section from Worker" in out
 
 
 def test_render_advisory_minimal():

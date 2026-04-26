@@ -2,7 +2,7 @@
 
 > Multi-agent coding crew CLI — **Lead / Worker / Verifier / Advisory** running as separate Copilot CLI sessions, with GitHub Issues as the message bus.
 
-`crewd` packages a 4-role autonomous coding crew into a reusable CLI. One workspace per crew, attachable to any GitHub repo. Each role is a `gh copilot` session with its own `--config-dir` (so its conversation is independent and resumable), a per-role `agent.md` describing responsibilities, and a fixed-order round-table loop that ticks each role once per cycle.
+`crewd` packages a 4-role autonomous coding crew into a reusable CLI. One workspace per crew, attachable to any GitHub repo. Each role is a `gh copilot` session with its own `--config-dir` (so its conversation is independent and resumable), a per-role `agent.md` describing responsibilities, and a fixed-order round-table loop that ticks each role once per cycle in this order: **Lead → Advisory → Worker → Verifier**.
 
 The four roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
 

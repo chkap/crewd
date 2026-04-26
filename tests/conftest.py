@@ -21,6 +21,6 @@ def tmp_ws(tmp_path: Path) -> Workspace:
     co = ws.repo_dir(cfg.target.repo)
     co.mkdir(parents=True, exist_ok=True)
     # Create fake per-role worktrees
-    for role in ("lead", "worker", "verifier", "advisory"):
+    for role in ("lead", "advisory", "worker", "verifier"):
         ws.role_worktree(role).mkdir(parents=True, exist_ok=True)
     return ws

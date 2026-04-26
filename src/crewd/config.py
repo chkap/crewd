@@ -10,7 +10,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 
-ROLES = ("lead", "worker", "verifier", "advisory")
+ROLES = ("lead", "advisory", "worker", "verifier")
 
 
 class RoleConfig(BaseModel):

@@ -19,7 +19,7 @@ def test_cmd_init_creates_complete_workspace(tmp_path: Path):
     ws = Workspace(tmp_path / "newcrew")
     assert ws.crew_yaml.exists()
     assert ws.goal_md.exists()
-    for role in ("lead", "worker", "verifier", "advisory"):
+    for role in ("lead", "advisory", "worker", "verifier"):
         body = (ws.role_cfg_dir(role) / "AGENTS.md").read_text()
         assert "newcrew" in body
         assert "acme/widget" in body
@@ -92,8 +92,8 @@ def test_cmd_run_once_walks_all_roles(tmp_ws: Workspace, monkeypatch):
     monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
     rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
     assert rc == 0
-    # All four roles ticked exactly once
-    assert [c["role"] for c in backend.calls] == ["lead", "worker", "verifier", "advisory"]
+    # All four roles ticked exactly once in round-table order
+    assert [c["role"] for c in backend.calls] == ["lead", "advisory", "worker", "verifier"]
     # Cycle counter advanced
     assert tmp_ws.read_cycle() == 1
 
@@ -284,7 +284,7 @@ def test_cmd_refresh_renders_agents_md(tmp_ws: Workspace):
     """refresh creates AGENTS.md in cfg/<role>/."""
     rc = commands.cmd_refresh(tmp_ws.root)
     assert rc == 0
-    for role in ("lead", "worker", "verifier", "advisory"):
+    for role in ("lead", "advisory", "worker", "verifier"):
         agents_md = tmp_ws.role_cfg_dir(role) / "AGENTS.md"
         assert agents_md.exists(), f"AGENTS.md missing for {role}"
         assert tmp_ws.cfg.name if hasattr(tmp_ws, "cfg") else "testcrew" in agents_md.read_text()
