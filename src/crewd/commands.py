@@ -58,6 +58,7 @@ def _render_agent_files(ws: Workspace, cfg: CrewConfig, goal_label: str = "goal:
         "worker_model": cfg.roles["worker"].model if "worker" in cfg.roles else "?",
         "verifier_model": cfg.roles["verifier"].model if "verifier" in cfg.roles else "?",
         "advisory_model": cfg.roles["advisory"].model if "advisory" in cfg.roles else "?",
+        "advisory_enabled": "advisory" in cfg.roles,
         "worker_family": cfg.roles["worker"].family if "worker" in cfg.roles else "?",
         "verifier_family": cfg.roles["verifier"].family if "verifier" in cfg.roles else "?",
         "goal_label": goal_label,
