@@ -58,11 +58,14 @@ class CopilotBackend:
         first_run: bool,
     ) -> int:
         # Build copilot CLI invocation:
-        #   copilot --config-dir <cfg> [--continue] --model <m> --add-dir ... --no-color --allow-all-tools -p "<prompt>"
-        cmd = [
-            "copilot",
-            "--config-dir", str(config_dir),
-        ]
+        #   COPILOT_HOME=<cfg> copilot [--continue] --model <m> --add-dir ... --no-color --allow-all-tools -p "<prompt>"
+        #
+        # The Copilot CLI dropped the `--config-dir` flag; per-role config and
+        # session isolation is now achieved via the COPILOT_HOME env var, which
+        # overrides the directory where config + session-state are stored
+        # (defaults to $HOME/.copilot). Each role points COPILOT_HOME at its own
+        # cfg/<role>/ dir, so `--continue` resumes only that role's session.
+        cmd = ["copilot"]
         if not first_run:
             cmd.append("--continue")
         cmd += ["--model", model, "--no-color", "--allow-all-tools"]
@@ -71,7 +74,9 @@ class CopilotBackend:
         cmd += ["-p", prompt]
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        config_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
+        env["COPILOT_HOME"] = str(config_dir)
         # Graceful timeout escalation: SIGINT (like Ctrl+C, the path copilot's
         # cancel handler is designed for) -> SIGTERM -> SIGKILL. Each gets a
         # grace window to flush events.jsonl and close in-flight tool blocks.
@@ -80,7 +85,7 @@ class CopilotBackend:
         grace_int = 20   # copilot's own cancel handler
         grace_term = 10  # fallback if SIGINT ignored
         with open(log_path, "wb") as logf:
-            logf.write(f"$ {' '.join(cmd[:8])} ... (prompt {len(prompt)} chars)\n".encode())
+            logf.write(f"$ COPILOT_HOME={config_dir} {' '.join(cmd[:7])} ... (prompt {len(prompt)} chars)\n".encode())
             logf.flush()
             proc = subprocess.Popen(
                 cmd,

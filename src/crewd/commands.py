@@ -277,6 +277,7 @@ def cmd_doctor(workspace: Path) -> int:
     roles_tbl.add_column("role"); roles_tbl.add_column("model"); roles_tbl.add_column("family")
     roles_tbl.add_column("AGENTS.md"); roles_tbl.add_column("session-state"); roles_tbl.add_column("last log")
     yaml_mtime = ws.crew_yaml.stat().st_mtime
+    logs_root = ws.state_dir / "logs"
     for role in ROLES:
         if role not in cfg.roles:
             continue
@@ -300,7 +301,10 @@ def cmd_doctor(workspace: Path) -> int:
                 sess_str = "[green]present[/]"
         else:
             sess_str = "[dim]none[/]"
-        ldir = ws.state_dir / "logs" / role
+        ldir = logs_root / role
+        current_label = _goal_label_for_logs(ws)
+        if current_label:
+            ldir = ws.role_logs_dir(role, current_label)
         last_log_str = "[dim]—[/]"
         if ldir.exists():
             logs_ = sorted(ldir.glob("*.log"))
@@ -430,6 +434,15 @@ def _write_exit_reason(ws: Workspace, reason: str) -> None:
     ws.state_dir.mkdir(parents=True, exist_ok=True)
     ws.exit_reason_file.write_text(reason + "\n")
     console.print(f"[blue]exit-reason:[/] {reason}")
+
+
+def _goal_label_for_logs(ws: Workspace) -> str | None:
+    if not ws.goal_json.exists():
+        return None
+    try:
+        return GoalState.load(ws.goal_json).label
+    except Exception:
+        return None
 
 
 class _LoopController:
@@ -644,7 +657,8 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
         return 1
     role_cfg = cfg.roles[role]
     cfg_dir = ws.role_cfg_dir(role)
-    log_path = ws.log_file(role, cycle)
+    goal_label = _goal_label_for_logs(ws) or "goal:v1"
+    log_path = ws.log_file(role, cycle, goal_label)
     first_run = not (cfg_dir / "session-state").exists()
 
     # cwd = cfg/<role>/ so Copilot auto-loads AGENTS.md from there.
@@ -763,12 +777,16 @@ def cmd_logs(workspace: Path, role: str | None, cycle: int | None, tail: int, fo
         return 1
 
     logs_root = ws.state_dir / "logs"
+    current_goal_label = _goal_label_for_logs(ws)
     if not logs_root.exists():
         console.print("[yellow]no logs yet[/]")
         return 0
 
     if role and cycle is not None:
-        path = ws.log_file(role, cycle)
+        if not current_goal_label:
+            console.print("[red]current goal label unknown; no namespaced logs available[/]")
+            return 1
+        path = ws.log_file(role, cycle, current_goal_label)
         if not path.exists():
             console.print(f"[red]not found:[/] {path}")
             return 1
@@ -777,7 +795,7 @@ def cmd_logs(workspace: Path, role: str | None, cycle: int | None, tail: int, fo
 
     if role and follow:
         # Tail the latest log for the role
-        rdir = logs_root / role
+        rdir = _latest_role_logs_dir(logs_root, role)
         latest = _latest_log(rdir)
         if not latest:
             console.print(f"[yellow]no logs for {role}[/]")
@@ -790,7 +808,7 @@ def cmd_logs(workspace: Path, role: str | None, cycle: int | None, tail: int, fo
         return 0
 
     if role:
-        rdir = logs_root / role
+        rdir = _latest_role_logs_dir(logs_root, role)
         latest = _latest_log(rdir)
         if not latest:
             console.print(f"[yellow]no logs for {role}[/]")
@@ -800,17 +818,20 @@ def cmd_logs(workspace: Path, role: str | None, cycle: int | None, tail: int, fo
 
     # No role: list recent across all roles
     table = Table(title="recent logs")
-    table.add_column("role"); table.add_column("cycle"); table.add_column("size"); table.add_column("path")
+    table.add_column("goal"); table.add_column("role"); table.add_column("cycle"); table.add_column("size"); table.add_column("path")
     rows = []
-    for r in ROLES:
-        rdir = logs_root / r
-        if not rdir.exists():
+    for goal_dir in sorted(logs_root.iterdir()):
+        if not goal_dir.is_dir():
             continue
-        for f in sorted(rdir.glob("*.log")):
-            rows.append((r, f.stem, f.stat().st_size, f))
-    rows.sort(key=lambda x: (x[1], x[0]), reverse=True)
-    for role_, cyc, sz, p in rows[:20]:
-        table.add_row(role_, cyc, f"{sz}B", str(p))
+        for r in ROLES:
+            rdir = goal_dir / r
+            if not rdir.exists():
+                continue
+            for f in sorted(rdir.glob("*.log")):
+                rows.append((goal_dir.name, r, f.stem, f.stat().st_size, f))
+    rows.sort(key=lambda x: (x[2], x[1], x[0]), reverse=True)
+    for goal_name, role_, cyc, sz, p in rows[:20]:
+        table.add_row(goal_name, role_, cyc, f"{sz}B", str(p))
     console.print(table)
     return 0
 
@@ -820,6 +841,25 @@ def _latest_log(rdir: Path) -> Path | None:
         return None
     files = sorted(rdir.glob("*.log"))
     return files[-1] if files else None
+
+
+def _latest_role_logs_dir(logs_root: Path, role: str) -> Path:
+    candidates: list[tuple[float, Path]] = []
+    if not logs_root.exists():
+        return logs_root / role
+    for goal_dir in logs_root.iterdir():
+        if not goal_dir.is_dir():
+            continue
+        rdir = goal_dir / role
+        if not rdir.exists():
+            continue
+        latest = _latest_log(rdir)
+        if latest:
+            candidates.append((latest.stat().st_mtime, rdir))
+    if not candidates:
+        return logs_root / role
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
 
 
 def _print_tail(path: Path, n: int) -> None:
@@ -1031,7 +1071,9 @@ def cmd_new_goal(workspace: Path, from_path: Path) -> int:
     inbox_dir = ws.state_dir / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for role in ("lead", "advisory", "worker", "verifier"):
+    for role in ROLES:
+        if role not in cfg.roles:
+            continue
         if role == "lead":
             body = (
                 f"\n---\n## [OVERRIDE @ {ts}]\n"

@@ -16,7 +16,7 @@ A CLI (`uv` + `typer` + `jinja2` + `pydantic`) that runs a 4-role autonomous cod
 - **verifier** — reviews PRs, merges. No code. Two tiers: per-PR + final `crewd:acceptance` gate.
 - **advisory** — research, citations, design pointers. No code, no merges.
 
-Each role is a `gh copilot` subprocess with its own `--config-dir` (private resumable conversation), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
+Each role is a `gh copilot` subprocess with its own `COPILOT_HOME` set to `cfg/<role>/` (private resumable conversation + config), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
 
 ## When to use this skill
 
@@ -68,7 +68,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 ├── crew.yaml              ← edit to change models / families / loop
 ├── GOAL.md                ← spec; do NOT hand-edit after run starts (use new-goal)
 ├── cfg/<role>/AGENTS.md        ← role instructions (Copilot auto-loads from cwd)
-├── cfg/<role>/session-state/   ← copilot --config-dir (rotate on corruption, see below)
+├── cfg/<role>/session-state/   ← copilot session (COPILOT_HOME=cfg/<role>; rotate on corruption, see below)
 ├── cfg/<role>/worktree/        ← git worktree from repo/ (isolated repo copy)
 ├── state/STOPPED          ← sentinel; loop exits at next check
 ├── state/run.pid          ← daemon PID (only when daemon is running)

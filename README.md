@@ -2,9 +2,9 @@
 
 > Multi-agent coding crew CLI — **Lead / Worker / Verifier / Advisory** running as separate Copilot CLI sessions, with GitHub Issues as the message bus.
 
-`crewd` packages a 4-role autonomous coding crew into a reusable CLI. One workspace per crew, attachable to any GitHub repo. Each role is a `gh copilot` session with its own `--config-dir` (so its conversation is independent and resumable), a per-role `agent.md` describing responsibilities, and a fixed-order round-table loop that ticks each role once per cycle in this order: **Lead → Advisory → Worker → Verifier**.
+`crewd` packages a multi-role autonomous coding crew into a reusable CLI. The core loop is **Lead / Worker / Verifier**, with **Advisory as an optional fourth role** when you want proactive research and tradeoff analysis. Each role is a `gh copilot` session with its own `COPILOT_HOME` (pointed at `cfg/<role>/`, so its config + conversation are independent and resumable), a per-role `agent.md` describing responsibilities, and a fixed-order round-table loop that ticks each configured role once per cycle in this order: **Lead → Advisory → Worker → Verifier**.
 
-The four roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
+The roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
 
 ---
 
@@ -47,6 +47,8 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop
 
 ## Workspace layout
 
+`cfg/advisory/` exists only when the Advisory role is configured.
+
 ```
 my-crew/
 ├── crew.yaml                 # config (roles, models, families, loop, target)
@@ -83,7 +85,12 @@ Each role gets its own git worktree at `cfg/<role>/worktree/` created from the m
 
 ---
 
-## The four roles
+## The roles
+
+The default crew has four roles, but **Advisory is optional**. In practice:
+- **Lead / Worker / Verifier** are the required core loop.
+- **Advisory** is recommended for architecture, research, domain-heavy work, and tradeoff-sensitive goals.
+- To disable Advisory, omit the `advisory:` entry from `crew.yaml`.
 
 | Role         | Writes code? | Approves PRs? | Primary outputs                                 |
 | ------------ | ------------ | ------------- | ----------------------------------------------- |
@@ -148,7 +155,8 @@ roles:
   lead:     {model: claude-sonnet-4.6, family: claude}
   worker:   {model: gpt-5.4,           family: gpt}
   verifier: {model: claude-sonnet-4.6, family: claude}
-  advisory: {model: gpt-5.4,           family: gpt}
+  advisory: {model: gpt-5.4,           family: gpt}   # optional
+  # omit advisory entirely for a 3-role crew
   # per-role override:
   # worker: {model: ..., family: ..., per_tick_timeout: 1800}
 loop:
@@ -181,7 +189,7 @@ crewd new-goal --from GOAL.md
 crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 ```
 
-`new-goal` bumps `goal:vN`, closes prior open issues with the previous label, resets cycles, clears `STOPPED`, re-renders `agents/`, and queues `[OVERRIDE]` inbox notices for all roles. Required when reusing a workspace for a fresh goal — otherwise resumed sessions may follow the old goal state or old acceptance result instead of re-grounding on the new epoch.
+`new-goal` bumps `goal:vN`, closes prior open issues with the previous label, resets cycles, clears `STOPPED`, re-renders `agents/`, and queues `[OVERRIDE]` inbox notices for all configured roles. Required when reusing a workspace for a fresh goal — otherwise resumed sessions may follow the old goal state or old acceptance result instead of re-grounding on the new epoch.
 
 **Graceful shutdown**
 

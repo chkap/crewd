@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from crewd.commands import cmd_doctor
+from crewd.config import CrewConfig
 
 
 def test_doctor_runs_on_minimal_workspace(tmp_ws, capsys):
@@ -31,6 +32,24 @@ def test_doctor_zero_when_clean(tmp_ws, capsys):
     tmp_ws.goal_md.write_text("# real goal\n")
     rc = cmd_doctor(tmp_ws.root)
     assert rc == 0
+
+
+def test_doctor_zero_when_clean_without_advisory(tmp_ws, capsys):
+    from crewd.commands import _render_agent_files
+
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    del cfg.roles["advisory"]
+    cfg.save(tmp_ws.crew_yaml)
+    _render_agent_files(tmp_ws, cfg)
+    import os, time
+    time.sleep(0.01)
+    for role in cfg.roles:
+        os.utime(tmp_ws.role_cfg_dir(role) / "AGENTS.md", None)
+    tmp_ws.goal_md.write_text("# real goal\n")
+    rc = cmd_doctor(tmp_ws.root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "advisory" not in out.lower()
 
 
 def test_doctor_no_workspace(tmp_path: Path):

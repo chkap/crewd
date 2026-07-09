@@ -10,15 +10,20 @@ def test_paths_are_relative_to_root(tmp_path: Path):
     assert ws.crew_yaml == tmp_path / "ws" / "crew.yaml"
     assert ws.goal_md == tmp_path / "ws" / "GOAL.md"
     assert ws.role_cfg_dir("lead") == tmp_path / "ws" / "cfg" / "lead"
-    assert ws.log_file("verifier", 7) == tmp_path / "ws" / "state" / "logs" / "verifier" / "0007.log"
+    assert ws.log_file("verifier", 7, "goal:v3") == tmp_path / "ws" / "state" / "logs" / "goal-v3" / "verifier" / "0007.log"
 
 
 def test_ensure_skeleton_creates_dirs(tmp_path: Path):
     ws = Workspace(tmp_path / "ws")
     ws.ensure_skeleton()
     for role in ("lead", "advisory", "worker", "verifier"):
-        assert (ws.state_dir / "logs" / role).is_dir()
+        assert (ws.state_dir / "logs").is_dir()
         assert ws.role_cfg_dir(role).is_dir()
+
+
+def test_log_dir_sanitizes_goal_label(tmp_path: Path):
+    ws = Workspace(tmp_path / "ws")
+    assert ws.log_file("lead", 1, "goal:v12") == tmp_path / "ws" / "state" / "logs" / "goal-v12" / "lead" / "0001.log"
 
 
 def test_stop_resume_sentinel(tmp_path: Path):

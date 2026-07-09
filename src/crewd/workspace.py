@@ -8,12 +8,12 @@ Workspace structure:
       STOPPED              — sentinel: loop won't tick
       run.pid              — daemon PID (present only when daemon is running)
       cycle.txt            — current cycle counter
-      logs/<role>/<cycle>.log
+      logs/<goal-label>/<role>/<cycle>.log
       logs/daemon.log      — daemon stdout/stderr
     cfg/                   — per-role working directory + copilot config
       lead/
         AGENTS.md          — role instructions (Copilot auto-loads from cwd)
-        session-state/     — copilot --config-dir session data
+        session-state/     — copilot session data (COPILOT_HOME=cfg/<role>)
         worktree/          — git worktree (isolated repo copy)
       worker/
         AGENTS.md
@@ -33,6 +33,7 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
 import os
+import re
 
 
 @dataclass
@@ -67,8 +68,19 @@ class Workspace:
     def exit_reason_file(self) -> Path:
         return self.state_dir / "exit-reason"
 
-    def log_file(self, role: str, cycle: int) -> Path:
-        return self.state_dir / "logs" / role / f"{cycle:04d}.log"
+    def goal_log_dirname(self, goal_label: str) -> str:
+        """Filesystem-safe directory name for a goal label like ``goal:v3``."""
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", goal_label.strip())
+        return safe or "goal-unknown"
+
+    def logs_dir(self, goal_label: str) -> Path:
+        return self.state_dir / "logs" / self.goal_log_dirname(goal_label)
+
+    def role_logs_dir(self, role: str, goal_label: str) -> Path:
+        return self.logs_dir(goal_label) / role
+
+    def log_file(self, role: str, cycle: int, goal_label: str) -> Path:
+        return self.role_logs_dir(role, goal_label) / f"{cycle:04d}.log"
 
     @property
     def cfg_dir(self) -> Path:
@@ -88,7 +100,6 @@ class Workspace:
         for d in [self.state_dir, self.state_dir / "logs", self.cfg_dir]:
             d.mkdir(parents=True, exist_ok=True)
         for role in ("lead", "advisory", "worker", "verifier"):
-            (self.state_dir / "logs" / role).mkdir(parents=True, exist_ok=True)
             self.role_cfg_dir(role).mkdir(parents=True, exist_ok=True)
 
     def is_initialized(self) -> bool:

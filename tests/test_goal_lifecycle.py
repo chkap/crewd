@@ -139,6 +139,24 @@ def test_cmd_new_goal_increments_and_closes_issues(tmp_ws: Workspace, monkeypatc
     assert "goal:v3" in (tmp_ws.role_cfg_dir("lead") / "AGENTS.md").read_text()
 
 
+def test_cmd_new_goal_without_advisory_seeds_only_present_roles(tmp_ws: Workspace, monkeypatch):
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    del cfg.roles["advisory"]
+    cfg.save(tmp_ws.crew_yaml)
+    GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="old").save(tmp_ws.goal_json)
+    src = tmp_ws.root / "NEW_GOAL.md"
+    src.write_text("# v2\n")
+    monkeypatch.setattr(commands.subprocess, "run", _explode_subprocess)
+
+    rc = commands.cmd_new_goal(tmp_ws.root, src)
+    assert rc == 0
+    assert (tmp_ws.state_dir / "inbox" / "lead.md").exists()
+    assert (tmp_ws.state_dir / "inbox" / "worker.md").exists()
+    assert (tmp_ws.state_dir / "inbox" / "verifier.md").exists()
+    assert not (tmp_ws.state_dir / "inbox" / "advisory.md").exists()
+    assert not (tmp_ws.role_cfg_dir("advisory") / "AGENTS.md").exists()
+
+
 def test_cmd_new_goal_handles_gh_failure_gracefully(tmp_ws: Workspace, monkeypatch):
     GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="x").save(tmp_ws.goal_json)
     src = tmp_ws.root / "NEW_GOAL.md"

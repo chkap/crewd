@@ -96,6 +96,20 @@ def test_cmd_run_once_walks_all_roles(tmp_ws: Workspace, monkeypatch):
     assert [c["role"] for c in backend.calls] == ["lead", "advisory", "worker", "verifier"]
     # Cycle counter advanced
     assert tmp_ws.read_cycle() == 1
+    assert (tmp_ws.state_dir / "logs" / "goal-v1" / "lead" / "0001.log").exists()
+
+
+def test_cmd_run_once_without_advisory_skips_it(tmp_ws: Workspace, monkeypatch):
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    del cfg.roles["advisory"]
+    cfg.save(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    backend = _StubBackend(healthy=True)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+    rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
+    assert rc == 0
+    assert [c["role"] for c in backend.calls] == ["lead", "worker", "verifier"]
+    assert not (tmp_ws.role_cfg_dir("advisory") / "AGENTS.md").exists()
 
 
 def test_cmd_run_role_only_ticks_one(tmp_ws: Workspace, monkeypatch):
@@ -221,23 +235,39 @@ def test_cmd_resume_clears_sentinel(tmp_ws: Workspace):
 
 # ─── logs ───
 def test_cmd_logs_lists_recent(tmp_ws: Workspace):
+    from crewd.config import GoalState
+    GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="x").save(tmp_ws.goal_json)
     # Seed a few log files
     for cycle in (1, 2):
         for role in ("lead", "worker"):
-            p = tmp_ws.log_file(role, cycle)
+            p = tmp_ws.log_file(role, cycle, "goal:v1")
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(f"line for {role} cycle {cycle}\n")
     assert commands.cmd_logs(tmp_ws.root, role=None, cycle=None, tail=50, follow=False) == 0
 
 
 def test_cmd_logs_specific_cycle(tmp_ws: Workspace, capsys):
-    p = tmp_ws.log_file("worker", 3)
+    from crewd.config import GoalState
+    GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="x").save(tmp_ws.goal_json)
+    p = tmp_ws.log_file("worker", 3, "goal:v1")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("hello-from-worker-3\n")
     rc = commands.cmd_logs(tmp_ws.root, role="worker", cycle=3, tail=50, follow=False)
     assert rc == 0
     out = capsys.readouterr().out
     assert "hello-from-worker-3" in out
+
+
+def test_cmd_logs_specific_cycle_reads_current_goal_namespace(tmp_ws: Workspace, capsys):
+    from crewd.config import GoalState
+    GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="x").save(tmp_ws.goal_json)
+    p = tmp_ws.log_file("worker", 4, "goal:v1")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("worker-goal-v1-cycle-4\n")
+    rc = commands.cmd_logs(tmp_ws.root, role="worker", cycle=4, tail=50, follow=False)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "worker-goal-v1-cycle-4" in out
 
 
 def test_cmd_logs_unknown_log_returns_1(tmp_ws: Workspace):
