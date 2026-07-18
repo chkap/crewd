@@ -96,6 +96,26 @@ class Workspace:
     def role_worktree(self, role: str) -> Path:
         return self.cfg_dir / role / "worktree"
 
+    def resolve_extra_dirs(self, entries: list[str]) -> list[Path]:
+        """Resolve configured extra_add_dirs to existing absolute directories.
+
+        Relative entries resolve against the workspace root; absolute paths are
+        used as-is. Non-existent paths are skipped so a stale config entry can't
+        break a tick. Order is preserved and duplicates are removed.
+        """
+        out: list[Path] = []
+        seen: set[Path] = set()
+        for entry in entries:
+            p = Path(entry)
+            resolved = p if p.is_absolute() else (self.root / p)
+            resolved = resolved.resolve()
+            if resolved in seen:
+                continue
+            if resolved.is_dir():
+                seen.add(resolved)
+                out.append(resolved)
+        return out
+
     def ensure_skeleton(self) -> None:
         for d in [self.state_dir, self.state_dir / "logs", self.cfg_dir]:
             d.mkdir(parents=True, exist_ok=True)

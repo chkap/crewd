@@ -81,6 +81,14 @@ class CrewConfig(BaseModel):
     roles: dict[str, RoleConfig]
     loop: LoopConfig = Field(default_factory=LoopConfig)
     backend: Literal["copilot"] = "copilot"
+    # Extra host directories (beyond the workspace + role worktree) that every
+    # role's agent is granted file access to via the backend's --add-dir flag.
+    # Use this to expose deployment checkouts, persistent data dirs, or other
+    # paths that live outside the crew workspace. Relative entries resolve
+    # against the workspace root; absolute paths are used as-is. Only existing
+    # directories are passed through — missing entries are silently skipped so a
+    # stale path can't break a tick.
+    extra_add_dirs: list[str] = Field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "CrewConfig":

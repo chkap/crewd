@@ -164,6 +164,10 @@ loop:
   per_tick_timeout: 900       # default per-role timeout
   max_cycles: 0               # 0 = forever
 backend: copilot              # only backend currently
+extra_add_dirs:               # optional: extra host dirs every role can access
+  - /home/me/web-deploy       #   (deploy checkouts, persistent data dirs, …)
+  - ../shared-data            #   relative entries resolve against the workspace
+  # Missing paths are silently skipped; only existing dirs are passed to the agent.
 ```
 
 Edit `crew.yaml` at any time — on the next `run` / `tick`, `agents/*.agent.md` is auto re-rendered from the templates if `crew.yaml` is newer (disable with `--no-auto-render`).

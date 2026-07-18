@@ -64,3 +64,33 @@ def test_role_worktree_path(tmp_path: Path):
     ws = Workspace(tmp_path / "ws")
     assert ws.role_worktree("lead") == tmp_path / "ws" / "cfg" / "lead" / "worktree"
     assert ws.role_worktree("worker") == tmp_path / "ws" / "cfg" / "worker" / "worktree"
+
+
+def test_resolve_extra_dirs(tmp_path: Path):
+    ws = Workspace(tmp_path / "ws")
+    ws.ensure_skeleton()
+    # Relative entry resolves against workspace root
+    (ws.root / "reldir").mkdir()
+    # Absolute entry outside the workspace
+    ext = tmp_path / "deploy"
+    ext.mkdir()
+    # Non-existent entry is skipped
+    resolved = ws.resolve_extra_dirs(["reldir", str(ext), "does-not-exist"])
+    assert resolved == [(ws.root / "reldir").resolve(), ext.resolve()]
+
+
+def test_resolve_extra_dirs_dedupes_and_skips_files(tmp_path: Path):
+    ws = Workspace(tmp_path / "ws")
+    ws.ensure_skeleton()
+    (ws.root / "d").mkdir()
+    afile = ws.root / "afile.txt"
+    afile.write_text("x")
+    # Duplicate (relative + absolute pointing at same dir) collapses to one;
+    # a file path is not a dir and is dropped.
+    resolved = ws.resolve_extra_dirs(["d", str((ws.root / "d").resolve()), str(afile)])
+    assert resolved == [(ws.root / "d").resolve()]
+
+
+def test_resolve_extra_dirs_empty(tmp_path: Path):
+    ws = Workspace(tmp_path / "ws")
+    assert ws.resolve_extra_dirs([]) == []

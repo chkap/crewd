@@ -678,6 +678,8 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
     add_dirs = [ws.root]  # workspace as readable context
     if wt.exists():
         add_dirs.append(wt)
+    # Extra host dirs declared in crew.yaml (deploy checkouts, data dirs, etc.)
+    add_dirs += ws.resolve_extra_dirs(cfg.extra_add_dirs)
     console.print(f"  [magenta]{role}[/] ({role_cfg.model}) → {log_path}")
     rc = backend.run_role(
         role=role,
