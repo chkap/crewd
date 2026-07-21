@@ -215,6 +215,19 @@ def test_cmd_run_max_cycles_limit(tmp_ws: Workspace, monkeypatch):
     assert len(backend.calls) == 8
 
 
+def test_cmd_run_pauses_after_lead_without_ticking_other_roles(tmp_ws: Workspace, monkeypatch):
+    backend = _PausingBackend()
+    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+
+    rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
+
+    assert rc == 0
+    assert [call["role"] for call in backend.calls] == ["lead"]
+    assert tmp_ws.is_paused()
+    assert not tmp_ws.is_stopped()
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+
+
 # ─── status / stop / resume ───
 def test_cmd_status_runs(tmp_ws: Workspace):
     assert commands.cmd_status(tmp_ws.root) == 0
@@ -226,11 +239,20 @@ def test_cmd_stop_writes_sentinel(tmp_ws: Workspace):
     assert "test-reason" in tmp_ws.stopped_sentinel.read_text()
 
 
+def test_cmd_pause_writes_human_blocker(tmp_ws: Workspace):
+    rc = commands.cmd_pause(tmp_ws.root, "human-blocked: operator approval required")
+    assert rc == 0
+    assert tmp_ws.pause_reason() == "human-blocked: operator approval required"
+    assert not tmp_ws.is_stopped()
+
+
 def test_cmd_resume_clears_sentinel(tmp_ws: Workspace):
     tmp_ws.stop("manual")
+    tmp_ws.pause("human-blocked: approval")
     rc = commands.cmd_resume(tmp_ws.root)
     assert rc == 0
     assert not tmp_ws.is_stopped()
+    assert not tmp_ws.is_paused()
 
 
 # ─── logs ───
@@ -301,6 +323,22 @@ class _StubBackend:
         if self._create_session:
             (config_dir / "session-state").mkdir(parents=True, exist_ok=True)
         return 0
+
+
+class _PausingBackend(_StubBackend):
+    def __init__(self):
+        super().__init__(healthy=True)
+
+    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run):
+        rc = super().run_role(
+            role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run
+        )
+        if role == "lead":
+            ws_root = config_dir.parent.parent
+            (ws_root / "state" / "PAUSED").write_text(
+                "human-blocked: operator approval required\n"
+            )
+        return rc
 
 
 def _fake_gh_ok(cmd, *a, **kw):

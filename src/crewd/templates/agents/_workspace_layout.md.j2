@@ -10,6 +10,7 @@ Your current working directory is `cfg/{{ role_name }}/` inside the crewd worksp
 | `./session-state/` | Copilot session state (do not modify) |
 | `../../GOAL.md` | The current goal specification |
 | `../../state/inbox/{{ role_name }}.md` | Your inbox (operator messages) |
+| `../../state/PAUSED` | Human-blocked pause sentinel (Lead only; goal remains open) |
 | `../../repo/` | Main repo clone (shared — do **not** work here directly; use your worktree) |
 
 **Important**: Always `cd worktree/` before running git commands, editing source files, or building/testing. Your worktree is an isolated copy — you won't conflict with other roles.

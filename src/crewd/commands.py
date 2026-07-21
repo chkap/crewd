@@ -329,6 +329,7 @@ def cmd_doctor(workspace: Path) -> int:
     state_tbl = Table(title="state")
     state_tbl.add_column("field"); state_tbl.add_column("value")
     state_tbl.add_row("STOPPED", "yes" if ws.is_stopped() else "no")
+    state_tbl.add_row("PAUSED", ws.pause_reason() or "no")
     state_tbl.add_row(
         "cycle",
         f"{cycle} / {cfg.loop.max_cycles or '∞'}  (from {src})",
@@ -476,6 +477,13 @@ class _LoopController:
                 console.print(f"[yellow]STOPPED sentinel present; exiting at cycle {cycle}[/]")
                 _write_exit_reason(self.ws, "goal-complete")
                 return 0
+            if self.ws.is_paused():
+                console.print(
+                    f"[yellow]PAUSED for human input at cycle {cycle}:[/] "
+                    f"{self.ws.pause_reason()}"
+                )
+                _write_exit_reason(self.ws, "human-blocked")
+                return 0
             if self._interrupted:
                 console.print("[yellow]interrupted; exiting cleanly[/]")
                 _write_exit_reason(self.ws, "interrupted")
@@ -486,12 +494,19 @@ class _LoopController:
             for r in ROLES:
                 if r not in self.cfg.roles:
                     continue
-                if self.ws.is_stopped() or self._interrupted:
+                if self.ws.is_stopped() or self.ws.is_paused() or self._interrupted:
                     break
                 _tick_role(self.ws, self.cfg, self.backend, r, cycle)
             if self.ws.is_stopped():
                 console.print(f"[yellow]STOPPED detected after cycle {cycle}[/]")
                 _write_exit_reason(self.ws, "goal-complete")
+                return 0
+            if self.ws.is_paused():
+                console.print(
+                    f"[yellow]PAUSED detected after cycle {cycle}:[/] "
+                    f"{self.ws.pause_reason()}"
+                )
+                _write_exit_reason(self.ws, "human-blocked")
                 return 0
             if once:
                 return 0
@@ -499,9 +514,9 @@ class _LoopController:
                 console.print(f"[blue]reached max_cycles={self.cfg.loop.max_cycles}[/]")
                 _write_exit_reason(self.ws, "exhausted")
                 return 0
-            # Sleep in 1-second slices so signals/STOPPED are picked up promptly
+            # Sleep in 1-second slices so signals/sentinels are picked up promptly.
             for _ in range(self.cfg.loop.sleep_secs):
-                if self._interrupted or self.ws.is_stopped():
+                if self._interrupted or self.ws.is_stopped() or self.ws.is_paused():
                     break
                 time.sleep(1)
 
@@ -571,7 +586,7 @@ def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = T
     # Clear stale exit-reason at start
     if ws.exit_reason_file.exists():
         ws.exit_reason_file.unlink()
-    ws.resume()  # clear STOPPED if present (run is explicit intent)
+    ws.resume()  # clear STOPPED/PAUSED if present (run is explicit intent)
     ctrl = _LoopController(ws, cfg, backend, goal_state)
     # Install signal handlers (SIGINT, SIGTERM) — graceful stop
     prev_int = signal.signal(signal.SIGINT, ctrl.request_stop)
@@ -721,6 +736,17 @@ def cmd_stop(workspace: Path, reason: str, force: bool = False) -> int:
     return 0
 
 
+def cmd_pause(workspace: Path, reason: str) -> int:
+    ws = Workspace(workspace.resolve())
+    if not ws.is_initialized():
+        console.print(f"[red]no workspace at[/] {workspace}")
+        return 1
+    ws.pause(reason)
+    console.print(f"[yellow]✓[/] PAUSED ({reason})")
+    console.print("[blue]resume after resolving the blocker with `crewd resume`, then `crewd run`[/]")
+    return 0
+
+
 def cmd_status(workspace: Path) -> int:
     ws = Workspace(workspace.resolve())
     if not ws.is_initialized():
@@ -734,6 +760,7 @@ def cmd_status(workspace: Path) -> int:
     table.add_row("branch", cfg.target.branch)
     table.add_row("cycle", str(ws.read_cycle()))
     table.add_row("stopped", "yes" if ws.is_stopped() else "no")
+    table.add_row("paused", ws.pause_reason() or "no")
     # Daemon status
     pid = ws.read_pid()
     if pid is not None:
@@ -757,11 +784,11 @@ def cmd_resume(workspace: Path) -> int:
     if not ws.is_initialized():
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
-    if ws.is_stopped():
+    if ws.is_stopped() or ws.is_paused():
         ws.resume()
-        console.print("[green]✓[/] STOPPED sentinel cleared")
+        console.print("[green]✓[/] STOPPED/PAUSED sentinels cleared")
     else:
-        console.print("[blue]not stopped — nothing to do[/]")
+        console.print("[blue]not stopped or paused — nothing to do[/]")
     return 0
 
 

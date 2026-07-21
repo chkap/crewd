@@ -40,6 +40,18 @@ def test_stop_resume_sentinel(tmp_path: Path):
     assert not ws.is_stopped()
 
 
+def test_pause_resume_sentinel(tmp_path: Path):
+    ws = Workspace(tmp_path / "ws")
+    ws.ensure_skeleton()
+    ws.pause("human-blocked: choose a database")
+    assert ws.is_paused()
+    assert ws.pause_reason() == "human-blocked: choose a database"
+    assert not ws.is_stopped()
+    ws.resume()
+    assert not ws.is_paused()
+    assert ws.pause_reason() is None
+
+
 def test_cycle_counter(tmp_path: Path):
     ws = Workspace(tmp_path / "ws")
     ws.ensure_skeleton()

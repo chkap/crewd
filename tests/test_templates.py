@@ -28,6 +28,9 @@ def test_render_lead_agent_includes_workspace_and_repo():
     assert "single umbrella GOAL issue" in out
     assert "plain-language summary of the user goal" in out
     assert "Close the GOAL issue" in out
+    assert "state/PAUSED" in out
+    assert "human-blocked:" in out
+    assert "Do not run another idle/status-only cycle" in out
 
 
 def test_render_worker_warns_about_family_difference():

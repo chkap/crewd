@@ -34,6 +34,7 @@ Trigger if the user asks to:
 2. Only verifier merges PRs. Only worker writes code. Lead and advisory never touch code or merges.
 3. **Always pass `-w "$(pwd)"`** when invoking via `uv --directory ~/crewd run crewd …` from inside a workspace. `uv --directory` resolves cwd to the crewd repo, so workspace auto-discovery picks the wrong directory otherwise.
 4. Reusing an existing workspace for a brand-new goal: **always run `crewd new-goal --from GOAL.md`**. Manually editing `GOAL.md` and rerunning is rejected (`run` exits with sha-mismatch). Even if you delete `goal.json`, the resumed copilot session still remembers the old PASS — `new-goal` is the only path that closes prior issues, resets cycles, queues an `[OVERRIDE]` inbox notice, and re-renders agents.
+5. Human/operator blockers use `state/PAUSED`, never repeated idle cycles. Lead must post the exact requested action, pause in the same tick, and leave goal/task issues open.
 
 ## Standard invocation pattern
 
@@ -71,6 +72,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 ├── cfg/<role>/session-state/   ← copilot session (COPILOT_HOME=cfg/<role>; rotate on corruption, see below)
 ├── cfg/<role>/worktree/        ← git worktree from repo/ (isolated repo copy)
 ├── state/STOPPED          ← sentinel; loop exits at next check
+├── state/PAUSED           ← human/operator action required; goal remains open
 ├── state/run.pid          ← daemon PID (only when daemon is running)
 ├── state/cycle.txt        ← legacy mirror
 ├── state/goal.json        ← {version, label, goal_md_sha256, cycles}
@@ -110,7 +112,7 @@ What `new-goal` does, in order:
 
 1. Bumps `state/goal.json` to `version+1`, label `goal:v<N+1>`.
 2. Closes all open issues bearing the prior `goal:vN` label.
-3. Clears `state/STOPPED` and `state/exit-reason`; resets `cycles` to 0.
+3. Clears `state/STOPPED`, `state/PAUSED`, and `state/exit-reason`; resets `cycles` to 0.
 4. Re-renders `agents/*.agent.md` with the new label.
 5. Appends `## [OVERRIDE @ <ts>]` to `state/inbox/lead.md`.
 
@@ -122,7 +124,7 @@ Skip `new-goal` and the resumed lead session will see the old `PASS` and write `
 crewd -w "$(pwd)" doctor
 ```
 
-It prints: roles table (models / families / agent.md freshness / session-state / last-log), state table (STOPPED, cycle), inbox table (pending count + last sender per role), recent activity, and a `suggestions:` list. Anything tagged `ERROR` blocks `run` (rc=1).
+It prints: roles table (models / families / agent.md freshness / session-state / last-log), state table (STOPPED, PAUSED/reason, cycle), inbox table (pending count + last sender per role), recent activity, and a `suggestions:` list. Anything tagged `ERROR` blocks `run` (rc=1).
 
 ## Recovery cookbook
 
@@ -134,11 +136,16 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 | `target repo clone missing`                                      | `crewd attach <owner/repo> --clone`                                                                     |
 | `GOAL.md changed since goal vN started`                          | `crewd new-goal --from GOAL.md` (don't bypass — see Hard rule #4).                                      |
 | Lead writes `STOPPED` immediately after restart with new GOAL    | You forgot `new-goal`. Run it; confirm `state/inbox/lead.md` ends with `[OVERRIDE]`.                    |
+| `PAUSED` with `human-blocked:` reason                            | Resolve the stated action, then run `crewd resume` and restart the daemon.                              |
 | Want to kill the loop cleanly                                    | `crewd stop` (writes STOPPED + sends SIGINT to daemon). `crewd stop --force` sends SIGKILL.             |
 
 ## Graceful shutdown semantics
 
 `run` (foreground or `--daemon`) installs `SIGINT`/`SIGTERM` handlers that flip an interrupt flag — the current tick finishes, then `state/exit-reason` is written and the loop exits 0. `crewd stop` writes the `STOPPED` sentinel and sends `SIGINT` to the daemon PID if running; `--force` sends `SIGKILL`. The backend escalates child copilot processes `SIGINT → SIGTERM → SIGKILL` (SIGINT preferred — copilot has a dedicated handler that flushes events.jsonl cleanest, avoiding the orphan tool_use that breaks `--continue`).
+
+When Lead writes `state/PAUSED`, the loop stops before the next role and records
+`exit-reason: human-blocked`. This is resumable and deliberately distinct from
+`STOPPED`/`goal-complete`; do not poll a known human blocker with more crew cycles.
 
 ## What NOT to do
 

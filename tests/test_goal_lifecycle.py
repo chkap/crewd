@@ -178,6 +178,7 @@ def test_cmd_new_goal_handles_gh_failure_gracefully(tmp_ws: Workspace, monkeypat
 
 def test_cmd_new_goal_clears_stopped_and_exit_reason(tmp_ws: Workspace, monkeypatch):
     tmp_ws.stop("goal-complete")
+    tmp_ws.pause("human-blocked: old goal decision")
     tmp_ws.exit_reason_file.write_text("goal-complete\n")
     src = tmp_ws.root / "NEW_GOAL.md"
     src.write_text("# new\n")
@@ -185,6 +186,7 @@ def test_cmd_new_goal_clears_stopped_and_exit_reason(tmp_ws: Workspace, monkeypa
     rc = commands.cmd_new_goal(tmp_ws.root, src)
     assert rc == 0
     assert not tmp_ws.is_stopped()
+    assert not tmp_ws.is_paused()
     assert not tmp_ws.exit_reason_file.exists()
 
 

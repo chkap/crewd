@@ -5,7 +5,8 @@ Workspace structure:
     crew.yaml              — config
     GOAL.md                — current goal/spec
     state/                 — runtime state
-      STOPPED              — sentinel: loop won't tick
+      STOPPED              — sentinel: completed/manually stopped loop won't tick
+      PAUSED               — sentinel: human/operator input is required
       run.pid              — daemon PID (present only when daemon is running)
       cycle.txt            — current cycle counter
       logs/<goal-label>/<role>/<cycle>.log
@@ -55,6 +56,10 @@ class Workspace:
     @property
     def stopped_sentinel(self) -> Path:
         return self.state_dir / "STOPPED"
+
+    @property
+    def paused_sentinel(self) -> Path:
+        return self.state_dir / "PAUSED"
 
     @property
     def cycle_file(self) -> Path:
@@ -140,11 +145,25 @@ class Workspace:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.stopped_sentinel.write_text(reason + "\n")
 
+    def pause(self, reason: str) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.paused_sentinel.write_text(reason.strip() + "\n")
+
     def resume(self) -> None:
         self.stopped_sentinel.unlink(missing_ok=True)
+        self.paused_sentinel.unlink(missing_ok=True)
 
     def is_stopped(self) -> bool:
         return self.stopped_sentinel.exists()
+
+    def is_paused(self) -> bool:
+        return self.paused_sentinel.exists()
+
+    def pause_reason(self) -> str | None:
+        if not self.is_paused():
+            return None
+        reason = self.paused_sentinel.read_text(errors="replace").strip()
+        return reason or "human input required"
 
     # ── PID file (daemon mode) ──
 

@@ -104,6 +104,15 @@ def stop(
 
 
 @app.command()
+def pause(
+    reason: str = typer.Argument(..., help="Human/operator action needed before work can continue."),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+):
+    """Pause the crew until a human resolves a blocker and resumes it."""
+    raise typer.Exit(commands.cmd_pause(_ws_opt(workspace), reason))
+
+
+@app.command()
 def status(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
     """Show workspace status."""
     raise typer.Exit(commands.cmd_status(_ws_opt(workspace)))
@@ -111,7 +120,7 @@ def status(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
 
 @app.command()
 def resume(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
-    """Clear STOPPED sentinel."""
+    """Clear STOPPED and PAUSED sentinels."""
     raise typer.Exit(commands.cmd_resume(_ws_opt(workspace)))
 
 

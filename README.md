@@ -31,7 +31,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" tick lead
 # 5. Run one full cycle in foreground
 uv --directory ~/crewd run crewd -w "$(pwd)" run --once
 
-# 6. Run the loop in the background until STOPPED, max-cycles, or signal
+# 6. Run until completed, human-blocked, max-cycles, or signal
 uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon
 
 # 7. Check on it
@@ -72,6 +72,7 @@ my-crew/
 │       └── worktree/
 ├── state/
 │   ├── STOPPED               # sentinel: loop exits at next check
+│   ├── PAUSED                # human/operator action required; goal remains open
 │   ├── run.pid               # daemon PID (present only when daemon is running)
 │   ├── cycle.txt             # legacy cycle mirror
 │   ├── goal.json             # current epoch (version, label, sha, cycles)
@@ -107,6 +108,7 @@ Hard rules baked into `doctor` and `run`:
 - Two-tier verification: lightweight per-PR review + a heavy **Final Acceptance Gate** before the lead writes `STOPPED`.
 - Advisory is **proactive but non-binding**: it should surface alternatives, tradeoffs, prior art, weak test oracles, and hidden risks, but it does not become the decision-maker.
 - Ask the real user for input only in **true blocking cases**: unresolved product ambiguity, a material risk tradeoff, or strong cross-role disagreement that changes the shipped outcome. This should be rare.
+- When human input, operator-only action, credentials, approval, or a future external event is the only remaining path, Lead records the exact escalation and writes `PAUSED`. The loop exits before ticking more roles and remains resumable without pretending the goal is complete.
 
 ### Role decision norms
 
@@ -129,7 +131,8 @@ Hard rules baked into `doctor` and `run`:
 | `run [--once] [--role R] [--daemon] [--no-auto-render]` | Foreground loop (default) or background daemon (`--daemon`). `--once` / `--role` as before. |
 | `tick <role>`                            | Imperative single tick of one role (alias for `run --role`).                   |
 | `stop [--reason] [--force]`              | Write `STOPPED` + signal daemon (`SIGINT`; `--force` sends `SIGKILL`).         |
-| `resume`                                 | Clear `STOPPED`.                                                               |
+| `pause "<reason>"`                       | Write `PAUSED`; loop exits with `human-blocked` and keeps goal issues open.    |
+| `resume`                                 | Clear `STOPPED` and `PAUSED`.                                                  |
 | `status`                                 | Compact one-table status (includes daemon PID + alive check).                  |
 | `logs [--role R] [--cycle N] [-n N] [-f]` | List or tail role logs.                                                       |
 | `list [--prune]`                         | List registered workspaces (user-level registry).                              |
@@ -139,6 +142,21 @@ Hard rules baked into `doctor` and `run`:
 | `new-goal --from GOAL.md`                | Bump goal epoch: copy GOAL.md, close prior `goal:vN` issues, reset cycles, and queue inbox override notices for all roles. |
 
 `-w / --workspace <path>` is accepted by all workspace-scoped commands. Without it, `crewd` walks up from cwd looking for `crew.yaml` (git-style discovery).
+
+### Human-blocked pause
+
+`STOPPED` means completed or manually stopped. `PAUSED` means the goal is still open but
+cannot advance without a human/operator action. Lead must first exhaust autonomous work,
+post the exact blocker and requested action on the task and umbrella issues, then write a
+single-line `state/PAUSED` reason beginning with `human-blocked:`. The loop exits after
+Lead's tick, so Advisory, Worker, and Verifier are not invoked pointlessly.
+
+After resolving the blocker:
+
+```bash
+crewd resume -w /path/to/workspace
+crewd run -w /path/to/workspace --daemon
+```
 
 ---
 
