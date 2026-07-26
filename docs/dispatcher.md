@@ -113,10 +113,11 @@ The kernel opens a database created by an earlier version in place. `CREATE
 TABLE IF NOT EXISTS` creates any *missing* tables (e.g. the `solicitation` table
 and its indexes on a pre-#17 database) but never alters an existing `goal_run`,
 so `Dispatcher.__init__` runs an idempotent `_migrate()` that adds the
-`authority_seq` / `invalid_solicitations` columns (`NOT NULL DEFAULT 0`) when
+`authority_seq` / `invalid_solicitations` columns to `goal_run` and the #12
+`disagreement` / `blocker` columns to `handoff` (all `NOT NULL DEFAULT`) when
 absent, inside one transaction, and stamps `PRAGMA user_version`. The
-column-existence check is the durable oracle (safe across repeated opens);
-`user_version` is a derived marker. Existing runs/attempts/handoffs are
+per-table column-existence check is the durable oracle (safe across repeated
+opens); `user_version` is a derived marker. Existing runs/attempts/handoffs are
 preserved; the real upgrade path is covered by
 `tests/test_dispatcher.py` (`test_migration_*`).
 

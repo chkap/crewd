@@ -97,6 +97,40 @@ candidate only when `count == 1`; `count == 0` or `count > 1` resolves as an
 invalid solicitation with handoffs retained.
 
 
+## Role handoff channel (`submit_role_handoff`) (#12)
+
+Non-Lead roles return structured evidence to Lead through a second narrow SDK
+custom tool, `submit_role_handoff` (`sdk_adapter.make_role_handoff_tool`), built
+with the same official `copilot.define_tool(...)` API and reusing the shipped
+**exactly-one-submission** capture discipline (`RoleHandoffCapture`, a
+`_SingleSubmitCapture` sibling of `LeadDecisionCapture`). The handler records an
+untrusted candidate `{outcome_class, evidence, changed, remaining, reason,
+disagreement, blocker}`; it never mutates durable state. Zero, multiple, or
+malformed submissions make the payload invalid rather than silently picking one.
+
+**Transport lifecycle is authoritative.** `resolve_role_terminal` in
+`executor.py` decides the durable outcome, not the role's self-report: if the SDK
+lifecycle outcome is anything other than a clean `idle_completed`, that outcome
+classifies the terminal (`reason_returned="sdk:<value>"`) and a role can never
+upgrade a failed/cancelled/errored turn to `completed`. Only on a clean idle with
+**exactly one** well-formed *and substantiated* submission does the role's own
+`completed` / `no_progress` class stand — a `completed` claim must carry concrete
+`evidence` **and** an explicit changed/unchanged state account (`changed` may be
+`none` for a verifiable no-mutation outcome such as a Verifier approval or an
+Advisory finding), and a `no_progress` claim must carry a return `reason`. Zero,
+multiple, malformed (one counted submission that failed to parse into a handoff),
+or under-substantiated (success-shaped but empty) submissions all resolve to
+`HandoffOutcome.UNCERTAIN` (`reason_returned` prefixed `role_protocol_failure:`),
+which is unproductive and so counts toward the no-progress thrash bound. This
+closes the success-shaped-idle loophole #9/#12 targeted, and the resolver never
+dereferences a missing handoff. The
+evidence/changed/remaining/`disagreement`/`blocker` fields are threaded through
+`record_terminal` into the dispatch journal (explicit immutable columns, added to
+existing databases by an idempotent in-place migration) and rendered verbatim
+into Lead's next solicitation prompt so routing is grounded in the role's actual
+report. `disagreement` and `blocker` are carried as evidence — never as routing
+authority.
+
 ## Signals / operator controls & in-flight cancellation
 
 Each attempt runs on a short-lived **worker thread** while the main loop polls

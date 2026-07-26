@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
-from .dispatcher import LeadDecision
+from .dispatcher import HandoffOutcome, LeadDecision, classify
 from .session_backend import AttemptOutcome, AttemptResult, CancelToken
 
 # Callback the orchestrator supplies to durably journal an attempt as `started`
@@ -40,16 +40,17 @@ from .session_backend import AttemptOutcome, AttemptResult, CancelToken
 OnStarted = Callable[[str, int], None]
 
 
-class LeadDecisionCapture:
-    """Attempt-local, thread-safe capture for the ``submit_lead_decision`` tool.
+class _SingleSubmitCapture:
+    """Attempt-local, thread-safe *exactly-one* submission capture.
 
-    Enforces the accepted #17 invariant that a Lead turn submits *exactly one*
-    decision: zero **or multiple** submissions are invalid. The custom-tool
-    handler calls :meth:`submit` (which never mutates durable dispatcher state);
-    the executor reads :meth:`result` after the turn, obtaining the single
-    candidate only when exactly one submission occurred. The official SDK may
-    execute custom tools concurrently, so all access is lock-guarded and the
-    durable fact that multiple calls occurred is preserved in :attr:`count`.
+    Enforces the accepted #17 invariant that a turn submits *exactly one*
+    structured payload through its SDK custom tool: zero **or multiple**
+    submissions are invalid. The handler calls :meth:`submit` (which never
+    mutates durable dispatcher state); the executor reads :meth:`result` after
+    the turn, obtaining the single payload only when exactly one submission
+    occurred. The official SDK may execute custom tools concurrently, so all
+    access is lock-guarded and the durable fact that multiple calls occurred is
+    preserved in :attr:`count`.
     """
 
     def __init__(self) -> None:
@@ -61,8 +62,7 @@ class LeadDecisionCapture:
         """Record one submission; return ``True`` iff it is the first (accepted).
 
         Subsequent submissions are rejected (``False``) but still counted, so a
-        double-submit resolves as an invalid solicitation rather than
-        last-wins.
+        double-submit resolves as invalid rather than last-wins.
         """
         with self._lock:
             self._count += 1
@@ -82,6 +82,19 @@ class LeadDecisionCapture:
             return self._first if self._count == 1 else None
 
 
+class LeadDecisionCapture(_SingleSubmitCapture):
+    """Exactly-one capture for the ``submit_lead_decision`` (Lead turn) tool."""
+
+
+class RoleHandoffCapture(_SingleSubmitCapture):
+    """Exactly-one capture for the ``submit_role_handoff`` (non-Lead tick) tool.
+
+    A dispatched role returns its structured outcome to Lead through this single
+    channel. Semantics mirror :class:`LeadDecisionCapture`: zero or multiple
+    submissions are a protocol failure that must NOT resolve as a completion.
+    """
+
+
 @dataclass(frozen=True)
 class AttemptRequest:
     """All inputs required to execute one attempt (role tick or Lead turn)."""
@@ -98,6 +111,30 @@ class AttemptRequest:
     log_path: Path
 
 
+ROLE_CLAIMABLE_OUTCOMES = ("completed", "no_progress")
+
+
+@dataclass(frozen=True)
+class RoleHandoff:
+    """Structured outcome a non-Lead role returns to Lead for one attempt.
+
+    Captured (untrusted) from the ``submit_role_handoff`` SDK custom tool. The
+    dispatcher/orchestrator — never this payload — decide the routing class: on a
+    clean idle turn the role may *claim* only ``completed`` vs ``no_progress``
+    (:data:`ROLE_CLAIMABLE_OUTCOMES`); the transport lifecycle outcome overrides
+    any claim otherwise. ``disagreement`` and ``blocker`` are evidence for Lead's
+    routing, never routing authority.
+    """
+
+    outcome_class: str
+    evidence: str = ""
+    changed: str = ""
+    remaining: str = ""
+    reason: str = ""
+    disagreement: str = ""
+    blocker: str = ""
+
+
 @dataclass(frozen=True)
 class RoleAttemptOutcome:
     """Typed result of executing one role tick."""
@@ -106,6 +143,12 @@ class RoleAttemptOutcome:
     session_id: str
     generation: int
     mount_error: Optional[str] = None  # set iff the attempt was refused pre-execution
+    # Structured return captured from the role's ``submit_role_handoff`` tool
+    # (``None`` when the role submitted nothing) and the raw submission count, so
+    # the orchestrator can distinguish a valid single handoff from a zero/multiple
+    # protocol failure that must not resolve as a completion.
+    handoff: Optional[RoleHandoff] = None
+    handoff_submissions: int = 0
 
 
 @dataclass(frozen=True)
@@ -248,9 +291,13 @@ class SdkAttemptExecutor:
             # A raised error here aborts the attempt before transport work; it is
             # deliberately NOT swallowed so persistence failure surfaces.
             on_started(session_id, generation)
-        result = run()
+        result, handoff, submissions = run()
         return RoleAttemptOutcome(
-            result=result, session_id=session_id, generation=generation
+            result=result,
+            session_id=session_id,
+            generation=generation,
+            handoff=handoff,
+            handoff_submissions=submissions,
         )
 
     def run_lead(
@@ -339,6 +386,7 @@ class SdkAttemptExecutor:
             log_lines.append(f"[crewd] fresh session: {decision.fresh_reason}")
 
         capture = LeadDecisionCapture() if lead else None
+        role_capture = RoleHandoffCapture() if not lead else None
         if lead:
             ops = self._make_lead_ops(
                 session_id=session_id,
@@ -355,6 +403,7 @@ class SdkAttemptExecutor:
                 model=req.model,
                 config_dir=req.config_dir,
                 working_dir=working_dir,
+                role_capture=role_capture,
             )
 
         cfg = AttemptConfig(wait_timeout=float(req.timeout))
@@ -378,7 +427,7 @@ class SdkAttemptExecutor:
                     error=str(e),
                     cleanup_confirmed=False,
                 )
-                return (res, None) if lead else res
+                return (res, None) if lead else (res, None, 0)
 
             for ev in result.events:
                 log_lines.append(ev.to_line())
@@ -395,12 +444,14 @@ class SdkAttemptExecutor:
             if lead:
                 candidate = self._read_captured_decision(capture, ops)
                 return result, candidate
-            return result
+            handoff = self._read_captured_handoff(role_capture)
+            submissions = role_capture.count if role_capture is not None else 0
+            return result, handoff, submissions
 
         return session_id, decision.generation, None, runner
 
     # ── ops factories ───────────────────────────────────────────
-    def _make_ops(self, *, session_id, role, model, config_dir, working_dir):
+    def _make_ops(self, *, session_id, role, model, config_dir, working_dir, role_capture=None):
         if self._ops_factory is not None:
             return self._ops_factory(
                 session_id=session_id, role=role, model=model,
@@ -408,9 +459,15 @@ class SdkAttemptExecutor:
             )
         from .sdk_adapter import SdkRoleRuntime
 
+        # Register the submit_role_handoff custom tool so the dispatched role can
+        # return a structured outcome to Lead. The handler only records the
+        # (untrusted) payload into ``role_capture`` (attempt-local memory); it
+        # never mutates durable dispatcher state — the single consuming
+        # transaction is record_terminal.
         return SdkRoleRuntime(
             session_id=session_id, role=role, model=model,
             config_dir=config_dir, working_dir=working_dir,
+            role_handoff_capture=role_capture,
         )
 
     def _make_lead_ops(self, *, session_id, role, model, config_dir, working_dir, capture):
@@ -445,6 +502,21 @@ class SdkAttemptExecutor:
             return raw
         try:
             return parse_lead_decision(raw)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _read_captured_handoff(capture: "Optional[RoleHandoffCapture]") -> Optional[RoleHandoff]:
+        # Exactly-one submission: capture.result() is the single payload, or None
+        # when zero or multiple were submitted (both a protocol failure). The
+        # orchestrator resolves the terminal class (transport-authoritative).
+        raw = capture.result() if capture is not None else None
+        if raw is None:
+            return None
+        if isinstance(raw, RoleHandoff):
+            return raw
+        try:
+            return parse_role_handoff(raw)
         except Exception:
             return None
 
@@ -511,3 +583,153 @@ def parse_lead_decision(payload) -> LeadDecision:
     if kind is DecisionKind.FINISH:
         return LeadDecision.finish(payload["final_acceptance"], ack=ack)
     raise ValueError(f"lead decision kind {kind!r} cannot be submitted by a Lead turn")
+
+
+def parse_role_handoff(payload) -> RoleHandoff:
+    """Parse an untrusted ``submit_role_handoff`` payload into a RoleHandoff.
+
+    Shape validation only — it never trusts the payload semantically. The
+    orchestrator decides the routing class transport-authoritatively via
+    :func:`resolve_role_terminal`, so an out-of-range ``outcome_class`` here is
+    tolerated (it simply cannot claim a completion later).
+    """
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict):
+        raise ValueError(f"role handoff payload is not an object: {type(payload)!r}")
+
+    def _s(key: str) -> str:
+        v = payload.get(key)
+        return v if isinstance(v, str) else ("" if v is None else str(v))
+
+    return RoleHandoff(
+        outcome_class=_s("outcome_class"),
+        evidence=_s("evidence"),
+        changed=_s("changed"),
+        remaining=_s("remaining"),
+        reason=_s("reason"),
+        disagreement=_s("disagreement"),
+        blocker=_s("blocker"),
+    )
+
+
+@dataclass(frozen=True)
+class RoleTerminal:
+    """Resolved routing terminal for one role attempt (transport-authoritative)."""
+
+    outcome_class: HandoffOutcome
+    evidence: str
+    changed: str
+    remaining: str
+    reason_returned: str
+    disagreement: str = ""
+    blocker: str = ""
+
+
+def _role_claim_defect(handoff: Optional[RoleHandoff], submissions: int) -> Optional[str]:
+    """Return a protocol-failure detail for a clean-idle role claim, else ``None``.
+
+    A clean idle turn may claim ``completed``/``no_progress`` only through
+    *exactly one* well-formed submission that also carries a minimal semantic
+    progress account, so a success-shaped but empty payload cannot silently reset
+    the no-progress guard (a defect #9/#12 explicitly aim to remove). The account
+    is role-neutral: ``completed`` needs concrete ``evidence`` **and** an explicit
+    state statement (``changed`` — which may legitimately be ``none`` for a
+    verifiable no-mutation outcome such as a Verifier approval or Advisory
+    finding); ``no_progress`` needs a non-empty return ``reason``.
+    """
+    if submissions == 0:
+        return "no submit_role_handoff call"
+    if submissions > 1:
+        return f"{submissions} submit_role_handoff calls (exactly one required)"
+    if handoff is None:
+        return "malformed submit_role_handoff payload"
+    oc = handoff.outcome_class
+    if oc not in ROLE_CLAIMABLE_OUTCOMES:
+        return f"invalid outcome_class {oc!r}"
+    if oc == "completed":
+        if not handoff.evidence.strip():
+            return "completed claim without concrete evidence"
+        if not handoff.changed.strip():
+            return "completed claim without an explicit changed/unchanged state account"
+    else:  # no_progress
+        if not handoff.reason.strip():
+            return "no_progress claim without a return reason"
+    return None
+
+
+def resolve_role_terminal(
+    result: AttemptResult,
+    handoff: Optional[RoleHandoff],
+    submissions: int,
+) -> RoleTerminal:
+    """Decide a role attempt's routing terminal, keeping the transport authoritative.
+
+    The SDK lifecycle outcome always governs the *class* unless the turn reached
+    a clean idle (:attr:`~crewd.session_backend.AttemptOutcome.IDLE_COMPLETED`):
+
+    * Non-idle transport (error / wait-timeout / cancel / taint) overrides any
+      success-shaped role claim — the role cannot upgrade a failed turn.
+    * A clean idle turn lets the role's *single* structured handoff choose
+      ``completed`` vs ``no_progress`` (:data:`ROLE_CLAIMABLE_OUTCOMES`) *only*
+      when it carries a minimal semantic progress account (see
+      :func:`_role_claim_defect`).
+    * Zero, multiple, malformed, or under-substantiated submissions on a clean
+      idle are a protocol failure: resolved as ``uncertain`` (which counts toward
+      the no-progress bounds), never a silent completion. This path never
+      dereferences a missing handoff.
+
+    In every case the role's ``evidence``/``changed``/``disagreement``/``blocker``
+    context is carried through when present, so Lead routes on the richest
+    available information (as evidence, never as routing authority).
+    """
+    ev = handoff.evidence if handoff else ""
+    changed = handoff.changed if handoff else ""
+    remaining = handoff.remaining if handoff else ""
+    disagreement = handoff.disagreement if handoff else ""
+    blocker = handoff.blocker if handoff else ""
+
+    if result.outcome is not AttemptOutcome.IDLE_COMPLETED:
+        # Transport is authoritative: the lifecycle outcome wins the class.
+        return RoleTerminal(
+            outcome_class=classify(result.outcome),
+            evidence=ev,
+            changed=changed,
+            remaining=result.error or remaining,
+            reason_returned=f"sdk:{result.outcome.value}",
+            disagreement=disagreement,
+            blocker=blocker,
+        )
+
+    # Clean idle turn: the role's exactly-one, substantiated claim governs.
+    detail = _role_claim_defect(handoff, submissions)
+    if detail is not None:
+        return RoleTerminal(
+            outcome_class=HandoffOutcome.UNCERTAIN,
+            evidence=ev,
+            changed=changed,
+            remaining=remaining or "role returned idle without a valid structured handoff",
+            reason_returned=f"role_protocol_failure: {detail}",
+            disagreement=disagreement,
+            blocker=blocker,
+        )
+
+    claimed = (
+        HandoffOutcome.COMPLETED
+        if handoff.outcome_class == "completed"
+        else HandoffOutcome.NO_PROGRESS
+    )
+    reason = handoff.reason or f"role:{handoff.outcome_class}"
+    if disagreement:
+        reason = f"{reason} | disagreement: {disagreement}"
+    if blocker:
+        reason = f"{reason} | blocker: {blocker}"
+    return RoleTerminal(
+        outcome_class=claimed,
+        evidence=ev,
+        changed=changed,
+        remaining=remaining,
+        reason_returned=reason,
+        disagreement=disagreement,
+        blocker=blocker,
+    )

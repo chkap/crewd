@@ -23,6 +23,7 @@ from fakes import (
     dispatch_to,
     finish,
     pause,
+    role_handoff,
     wait,
 )
 
@@ -461,3 +462,151 @@ def test_restart_recovery_is_idempotent(tmp_ws: Workspace):
     # The orphan was only in `started` on the first pass, so tainted once.
     assert calls == ["orphan-2"]
     disp.close()
+
+
+# ── #12: structured role handoff survives into SQLite + next Lead prompt ──
+def _handoff_rows(tmp_ws: Workspace) -> list[dict]:
+    """Read the durable handoff rows straight from the run DB (out of band)."""
+    import sqlite3
+
+    con = sqlite3.connect(tmp_ws.state_dir / "dispatch.db")
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(
+            "SELECT role, outcome_class, evidence, changed, remaining, reason_returned, "
+            "disagreement, blocker FROM handoff ORDER BY created_at"
+        )]
+    finally:
+        con.close()
+
+
+def test_role_handoff_payload_survives_to_sqlite_and_next_lead_prompt(tmp_ws: Workspace):
+    # The strongest oracle for #12: a role's structured tool payload must be
+    # journaled verbatim in SQLite AND rendered verbatim in Lead's next
+    # solicitation prompt — rendering assertions alone are too weak.
+    hp = role_handoff(
+        "completed",
+        evidence="PR #42 green; 12 tests",
+        changed="added dispatcher kernel",
+        remaining="wire docs",
+        reason="ready for verifier",
+    )
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")], role_handoff=hp
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+
+    # 1) Durable in SQLite as a productive completion with the role's fields.
+    rows = _handoff_rows(tmp_ws)
+    worker_rows = [r for r in rows if r["role"] == "worker"]
+    assert len(worker_rows) == 1
+    wr = worker_rows[0]
+    assert wr["outcome_class"] == "completed"
+    assert wr["evidence"] == "PR #42 green; 12 tests"
+    assert wr["changed"] == "added dispatcher kernel"
+    assert wr["remaining"] == "wire docs"
+    assert wr["reason_returned"] == "ready for verifier"
+
+    # 2) Verbatim in Lead's next solicitation prompt (the finish turn).
+    assert len(fake.lead_calls) == 2
+    prompt = fake.lead_calls[1].prompt
+    assert "PR #42 green; 12 tests" in prompt
+    assert "added dispatcher kernel" in prompt
+    assert "wire docs" in prompt
+    assert "ready for verifier" in prompt
+
+
+def test_role_no_handoff_on_clean_idle_records_uncertain(tmp_ws: Workspace):
+    # A role that returns a clean idle without a structured handoff must NOT be
+    # recorded as a completion — it is an `uncertain` protocol failure.
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")], role_handoff=None
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+    worker_rows = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"]
+    assert len(worker_rows) == 1
+    assert worker_rows[0]["outcome_class"] == "uncertain"
+    assert "role_protocol_failure" in worker_rows[0]["reason_returned"]
+
+
+def test_transport_error_overrides_role_success_claim_end_to_end(tmp_ws: Workspace):
+    # Role shapes a "completed" handoff but the transport actually errored — the
+    # durable handoff must be `failed`, not `completed`.
+    hp = role_handoff("completed", evidence="I did it")
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")],
+        role_outcome=AttemptOutcome.SDK_ERROR,
+        role_handoff=hp,
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+    worker_rows = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"]
+    assert worker_rows[0]["outcome_class"] == "failed"
+    assert worker_rows[0]["reason_returned"] == "sdk:sdk_error"
+
+
+def test_malformed_single_submission_records_uncertain_without_crash(tmp_ws: Workspace):
+    # Black-box regression (Verifier PR #21): the SDK capture counted exactly one
+    # submit_role_handoff call but parsing produced no handoff. The orchestrator
+    # must not crash with AttributeError — it records an uncertain protocol
+    # failure and returns control to Lead, which then finishes.
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")],
+        role_handoff=None,
+        role_handoff_submissions=1,
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+    worker_rows = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"]
+    assert len(worker_rows) == 1
+    assert worker_rows[0]["outcome_class"] == "uncertain"
+    assert "malformed submit_role_handoff payload" in worker_rows[0]["reason_returned"]
+
+
+def test_disagreement_and_blocker_round_trip_to_sqlite_and_lead_prompt(tmp_ws: Workspace):
+    # Lead's accepted #12 contract: disagreement AND blocker must survive as
+    # explicit, first-class fields from the tool payload through immutable SQLite
+    # into Lead's next solicitation prompt — not silently folded into `remaining`.
+    hp = role_handoff(
+        "no_progress",
+        reason="cannot proceed until scope is settled",
+        remaining="await product decision",
+        disagreement="I think the scope is too broad for one PR",
+        blocker="needs a human product decision on the acceptance bar",
+    )
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")], role_handoff=hp
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+
+    wr = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"][0]
+    # Explicit columns, not overloaded into remaining.
+    assert wr["disagreement"] == "I think the scope is too broad for one PR"
+    assert wr["blocker"] == "needs a human product decision on the acceptance bar"
+    assert wr["remaining"] == "await product decision"
+
+    prompt = fake.lead_calls[1].prompt
+    assert "I think the scope is too broad for one PR" in prompt
+    assert "needs a human product decision on the acceptance bar" in prompt
+
+
+def test_repeated_empty_completion_eventually_pauses(tmp_ws: Workspace):
+    # Advisory PR #21: an all-empty `completed` payload must remain unproductive
+    # (an uncertain protocol failure) so the no-progress guard still fires —
+    # otherwise a role could evade the thrash bound with success-shaped noise.
+    empty_completed = role_handoff("completed")  # no evidence, no state account
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker")] * 30,
+        role_handoff=empty_completed,
+    )
+    orch = _orch(tmp_ws, fake, max_steps=100)
+    assert orch.run(once=False) == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+    assert _final_run(tmp_ws).status == RunStatus.PAUSED.value
+    # Every worker handoff was uncertain, never a productive completion.
+    worker_rows = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"]
+    assert worker_rows
+    assert all(r["outcome_class"] == "uncertain" for r in worker_rows)
