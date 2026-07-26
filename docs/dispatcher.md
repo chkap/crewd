@@ -75,6 +75,31 @@ the in-flight dispatch otherwise.
    run (`guard_tripped=True`) instead of recursively invoking Lead. `resume_run`
    clears the blocker and resets the thrash counters. Thresholds are configurable
    pending #12's semantic progress token.
+10. **Journaled Lead solicitation (#17).** A Lead *decision-production* SDK call is
+    real Premium work, so it is durably reserved and bounded exactly like role
+    work — never an unjournaled orchestration call. `open_lead_solicitation(run)`
+    creates a `solicit_lead` dispatch that takes routing authority and owns
+    **one** Lead attempt (consuming a `max_work` slot), and snapshots the current
+    authority nonce (`goal_run.authority_seq`) plus the *exact* set of pending
+    handoff ids Lead is asked to route. Unlike role attempts, a solicitation
+    attempt **suppresses handoff emission** (only non-Lead completions emit
+    handoffs), including on restart reconciliation. The Lead turn's decision is an
+    untrusted candidate captured in attempt-local memory (e.g. via the
+    `submit_lead_decision` SDK tool); it is consumed **exactly once** through
+    `resolve_lead_solicitation`, which in a single transaction terminalizes the
+    Lead attempt and then either **applies** the decision — only if the turn
+    completed cleanly, the authority nonce is unchanged, and the decision
+    acknowledges *exactly* the snapshot set — or **records it invalid**. Invalid /
+    missing / timed-out / errored decisions increment
+    `goal_run.invalid_solicitations` and return authority to Lead for another
+    bounded solicitation; reaching `max_invalid_solicitations` persists a
+    `paused` blocker. `continue_lead` returns authority to Lead (another budgeted
+    solicitation), never a free recursive call. The authority nonce is bumped on
+    every transition back to `lead_pending`, so a candidate produced under an
+    earlier authority window (e.g. one whose attempt a restart already reconciled
+    to `uncertain`) can never apply — `resolve_lead_solicitation` refuses a
+    solicitation attempt that is no longer in-flight. SQLite, not any
+    `decision.json` file, owns idempotent consumption.
 
 ## Crash points covered by `tests/test_dispatcher.py`
 
@@ -85,13 +110,24 @@ A "crash" discards the `Dispatcher` and reopens a fresh one on the same file:
 - in-flight (`started`, no terminal) → reconcile to uncertain;
 - after terminal — handoff durable and pending until acked;
 - before Lead ack — handoff still deliverable;
-- after Lead ack — consumed; re-ack idempotent.
+- after Lead ack — consumed; re-ack idempotent;
+- Lead solicitation in-flight (crash between the Lead turn and resolution) →
+  reconciled `uncertain` with **no** handoff emitted, authority returns to Lead
+  with a bumped nonce, and the lost in-memory candidate can never be applied.
 
 ## Open items (slice B / live-smoke)
 
-- Wire the kernel into `commands.py` in place of the round-robin loop; feed real
-  SDK attempts through `reserve → start → terminal`.
-- Reject `backend: copilot` with an actionable migration diagnostic; prove by
-  code search + test that no production `copilot -p` path remains.
+- Wire the kernel into a new `orchestrator.py` in place of the round-robin loop;
+  feed real SDK attempts through `reserve → start → terminal`, and obtain Lead
+  decisions through `open_lead_solicitation → run Lead turn → resolve_lead_solicitation`.
+- Add the typed `execute_attempt` / `AttemptExecutor` seam (+ `FakeExecutor`) and
+  the `submit_lead_decision` SDK custom tool whose handler only captures a
+  candidate in attempt-local memory.
+- Add a thread-safe `request_cancel(reason)` cancellation hook in the adapter and
+  a distinct clean-cancel terminal classification in `run_attempt`; taint an
+  orphaned session **before** finalizing its uncertain handoff on restart.
+- Reject `backend: copilot` with an actionable migration diagnostic; delete
+  `CopilotBackend`; prove by code search + per-entry-point reachability tests that
+  no production `copilot -p` path remains.
 - Finalize `max_consecutive_unproductive` / `max_edge_repeats` once #12 defines
   the progress token that distinguishes real progress from a bare completion.

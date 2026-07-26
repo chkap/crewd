@@ -41,6 +41,7 @@ production loop. Slice B integrates it with the SDK backend and the CLI.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -70,6 +71,7 @@ class DecisionKind(str, Enum):
     WAIT = "wait"                    # persist a wake condition, launch no role
     PAUSE = "pause"                  # human blocker; stop launching until resumed
     FINISH = "finish"               # final acceptance; the goal run is complete
+    SOLICIT_LEAD = "solicit_lead"   # a journaled, budgeted turn that asks Lead to decide
 
 
 class RunStatus(str, Enum):
@@ -212,6 +214,31 @@ class DecisionResult:
     dispatch: Optional[DispatchView] = None
     guard_tripped: bool = False
     guard_reason: Optional[str] = None
+    solicitation_invalid: bool = False
+    invalid_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Solicitation:
+    """A journaled, budgeted request for a Lead decision.
+
+    Opening a solicitation reserves exactly one Lead attempt (consuming work
+    budget) bound to a ``solicit_lead`` dispatch that owns routing authority.
+    The solicitation captures the authority nonce (``authority_seq``) and the
+    *exact* set of pending handoff ids Lead is being asked to route. The Lead
+    turn's decision is only ever consumed once, through
+    :meth:`Dispatcher.resolve_lead_solicitation`, which requires the nonce to be
+    unchanged and the decision to acknowledge exactly ``pending_handoff_ids``.
+    A crash after the Lead turn but before resolution loses the in-memory
+    candidate decision; restart reconciliation taints the journaled attempt and
+    the decision is never recovered from any file.
+    """
+
+    attempt_id: str
+    dispatch_id: str
+    run_id: str
+    authority_seq: int
+    pending_handoff_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -238,6 +265,8 @@ class RunView:
     last_edge_repeats: int
     wake_condition: Optional[str]
     human_blocker: Optional[str]
+    authority_seq: int = 0
+    invalid_solicitations: int = 0
 
 
 @dataclass(frozen=True)
@@ -247,6 +276,7 @@ class DispatcherLimits:
     max_work: int = 0                 # total attempt slots reservable per run
     max_consecutive_unproductive: int = 5
     max_edge_repeats: int = 3         # identical role edge repeated w/o new progress/handoff
+    max_invalid_solicitations: int = 3  # invalid/failed Lead turns before a persisted pause
 
 
 LEAD_PENDING = "lead_pending"
@@ -265,6 +295,8 @@ CREATE TABLE IF NOT EXISTS goal_run (
     last_edge_repeats INTEGER NOT NULL DEFAULT 0,
     wake_condition TEXT,
     human_blocker TEXT,
+    authority_seq INTEGER NOT NULL DEFAULT 0,
+    invalid_solicitations INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS dispatch (
@@ -306,6 +338,14 @@ CREATE INDEX IF NOT EXISTS ix_handoff_run_unconsumed
     ON handoff(run_id) WHERE consumed_by_dispatch_id IS NULL;
 CREATE INDEX IF NOT EXISTS ix_attempt_run_state ON attempt(run_id, state);
 CREATE INDEX IF NOT EXISTS ix_dispatch_run_seq ON dispatch(run_id, seq);
+CREATE TABLE IF NOT EXISTS solicitation (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempt(id),
+    dispatch_id TEXT NOT NULL UNIQUE REFERENCES dispatch(id),
+    run_id TEXT NOT NULL REFERENCES goal_run(id),
+    authority_seq INTEGER NOT NULL,
+    pending_ids TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -404,7 +444,7 @@ class Dispatcher:
             c.execute(
                 "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = NULL, "
                 "human_blocker = NULL, consecutive_unproductive = 0, last_edge = NULL, "
-                "last_edge_repeats = 0 WHERE id = ?",
+                "last_edge_repeats = 0, authority_seq = authority_seq + 1 WHERE id = ?",
                 (RunStatus.ACTIVE.value, LEAD_PENDING, run_id),
             )
             run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
@@ -550,7 +590,9 @@ class Dispatcher:
         created: list[str] = []
         with self._txn() as c:
             rows = c.execute(
-                "SELECT * FROM attempt WHERE run_id = ? AND state IN (?, ?)",
+                "SELECT a.*, d.kind AS dispatch_kind FROM attempt a "
+                "JOIN dispatch d ON a.dispatch_id = d.id "
+                "WHERE a.run_id = ? AND a.state IN (?, ?)",
                 (run_id, AttemptState.RESERVED.value, AttemptState.STARTED.value),
             ).fetchall()
             for att in rows:
@@ -558,6 +600,12 @@ class Dispatcher:
                     "UPDATE attempt SET state = ?, terminal_at = ? WHERE id = ?",
                     (AttemptState.RECONCILED_UNCERTAIN.value, _now(), att["id"]),
                 )
+                # A journaled Lead solicitation owns exactly one Lead attempt and
+                # never emits a role handoff; reconciling it must not synthesise
+                # one. Its in-memory candidate decision (if the crash happened
+                # after the Lead turn) is simply lost — never recovered from disk.
+                if att["dispatch_kind"] == DecisionKind.SOLICIT_LEAD.value:
+                    continue
                 handoff_id = self._insert_handoff(
                     c, run_id, att["id"], att["role"], HandoffOutcome.UNCERTAIN,
                     evidence="", changed="",
@@ -654,12 +702,184 @@ class Dispatcher:
                 }[decision.kind]
                 c.execute(
                     "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = ?, "
-                    "human_blocker = ? WHERE id = ?",
+                    "human_blocker = ?, authority_seq = authority_seq + 1 WHERE id = ?",
                     (status.value, LEAD_PENDING, decision.wake_condition, decision.human_blocker, run_id),
                 )
             return DecisionResult(
                 run=_run_view(c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()),
                 dispatch=dispatch,
+            )
+
+    # ── journaled Lead solicitation (issue #17) ──────────────────
+    def open_lead_solicitation(self, run_id: str) -> Solicitation:
+        """Reserve and journal a Lead decision turn *before* it is invoked.
+
+        This is the durable, budgeted replacement for calling Lead's SDK session
+        as un-journaled orchestration. It requires the run to be ``active`` with
+        routing authority held by Lead (``lead_pending``). It creates a
+        ``solicit_lead`` dispatch that takes routing authority and owns exactly
+        one Lead attempt (consuming one work slot, so runaway Lead loops are
+        bounded by ``max_work`` just like role attempts), and snapshots both the
+        current authority nonce and the *exact* set of pending handoff ids Lead
+        is being asked to route.
+
+        The returned :class:`Solicitation` binds the eventual decision to
+        ``(run_id, attempt_id, authority_seq, pending_handoff_ids)``. The Lead
+        turn's decision must be applied through
+        :meth:`resolve_lead_solicitation`, which is the single point that
+        consumes it. Raises :class:`BudgetExhausted` (marking the run
+        ``exhausted``) when no work slot remains.
+        """
+        exhausted = False
+        result: Optional[Solicitation] = None
+        with self._txn() as c:
+            run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(run_id)
+            if run["status"] != RunStatus.ACTIVE.value:
+                raise DecisionError(
+                    f"run {run_id} is {run['status']}; resume it before soliciting Lead"
+                )
+            if run["routing_authority"] != LEAD_PENDING:
+                raise DecisionError(
+                    f"routing authority is held by {run['routing_authority']}, not Lead; "
+                    "the in-flight attempt must reach a terminal outcome first"
+                )
+
+            limit = self.limits.max_work
+            if limit and run["reserved_slots"] >= limit:
+                c.execute(
+                    "UPDATE goal_run SET status = ? WHERE id = ?",
+                    (RunStatus.EXHAUSTED.value, run_id),
+                )
+                exhausted = True
+            else:
+                dispatch = self._create_dispatch(
+                    c, run_id,
+                    LeadDecision(DecisionKind.SOLICIT_LEAD, role="lead", reason="solicit_lead"),
+                )
+                attempt_id = _new_id("att")
+                c.execute(
+                    "INSERT INTO attempt (id, dispatch_id, run_id, role, state, reserved_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (attempt_id, dispatch.id, run_id, "lead", AttemptState.RESERVED.value, _now()),
+                )
+                c.execute(
+                    "UPDATE goal_run SET reserved_slots = reserved_slots + 1, "
+                    "routing_authority = ? WHERE id = ?",
+                    (dispatch.id, run_id),
+                )
+                pend = c.execute(
+                    "SELECT id FROM handoff WHERE run_id = ? AND consumed_by_dispatch_id IS NULL "
+                    "ORDER BY created_at",
+                    (run_id,),
+                ).fetchall()
+                pending_ids = tuple(r["id"] for r in pend)
+                c.execute(
+                    "INSERT INTO solicitation "
+                    "(attempt_id, dispatch_id, run_id, authority_seq, pending_ids, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (attempt_id, dispatch.id, run_id, run["authority_seq"],
+                     json.dumps(list(pending_ids)), _now()),
+                )
+                result = Solicitation(
+                    attempt_id=attempt_id,
+                    dispatch_id=dispatch.id,
+                    run_id=run_id,
+                    authority_seq=run["authority_seq"],
+                    pending_handoff_ids=pending_ids,
+                )
+        # Raise only after the EXHAUSTED status is durably committed.
+        if exhausted:
+            raise BudgetExhausted(f"max_work={self.limits.max_work} reached for run {run_id}")
+        assert result is not None
+        return result
+
+    def resolve_lead_solicitation(
+        self,
+        attempt_id: str,
+        *,
+        outcome: AttemptOutcome,
+        decision: Optional[LeadDecision],
+        configured_roles,
+    ) -> DecisionResult:
+        """Consume a solicited Lead decision exactly once, atomically.
+
+        ``decision`` is the *untrusted* candidate captured in attempt-local
+        memory from the Lead turn (e.g. via the ``submit_lead_decision`` SDK
+        tool); it is ``None`` when the turn produced no decision (timeout,
+        error, cancel). This method terminalises the journaled Lead attempt
+        (never emitting a handoff) and then either:
+
+        * **applies** the decision — but only if the Lead turn completed cleanly,
+          the authority nonce is unchanged, the decision acknowledges *exactly*
+          the snapshot's pending handoffs, and any dispatch target is configured
+          — resetting the invalid-solicitation counter; or
+        * **records it invalid** — increments the invalid-solicitation counter
+          and returns authority to Lead for another (budgeted) solicitation,
+          persisting a ``paused`` blocker once
+          ``max_invalid_solicitations`` is reached.
+
+        Raises :class:`DecisionError` if ``attempt_id`` is not an in-flight
+        solicitation (e.g. already reconciled by a restart — the stale candidate
+        must be dropped, never applied under a later authority window).
+        """
+        configured = set(configured_roles)
+        with self._txn() as c:
+            att = c.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
+            if att is None:
+                raise KeyError(attempt_id)
+            sol = c.execute(
+                "SELECT * FROM solicitation WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if sol is None:
+                raise DecisionError(f"attempt {attempt_id} is not a Lead solicitation")
+            if att["state"] not in (AttemptState.RESERVED.value, AttemptState.STARTED.value):
+                raise DecisionError(
+                    f"solicitation {attempt_id} is not in-flight ({att['state']}); "
+                    "its candidate decision is stale and must be dropped"
+                )
+            run = c.execute("SELECT * FROM goal_run WHERE id = ?", (sol["run_id"],)).fetchone()
+
+            # Terminalise the journaled Lead attempt (no handoff emitted).
+            c.execute(
+                "UPDATE attempt SET state = ?, terminal_outcome = ?, terminal_at = ? WHERE id = ?",
+                (AttemptState.TERMINAL.value, outcome.value, _now(), attempt_id),
+            )
+
+            snapshot = set(json.loads(sol["pending_ids"]))
+            ok, reason = self._solicitation_valid(
+                run, sol, outcome, decision, configured, snapshot
+            )
+            if ok:
+                assert decision is not None
+                c.execute(
+                    "UPDATE goal_run SET invalid_solicitations = 0 WHERE id = ?",
+                    (sol["run_id"],),
+                )
+                return self._apply_solicited_decision(c, sol["run_id"], decision)
+
+            new_invalid = run["invalid_solicitations"] + 1
+            cap = self.limits.max_invalid_solicitations
+            if cap and new_invalid >= cap:
+                blocker = f"{new_invalid} invalid/failed Lead solicitations (cap {cap}): {reason}"
+                c.execute(
+                    "UPDATE goal_run SET invalid_solicitations = ?, status = ?, "
+                    "routing_authority = ?, human_blocker = ?, authority_seq = authority_seq + 1 "
+                    "WHERE id = ?",
+                    (new_invalid, RunStatus.PAUSED.value, LEAD_PENDING, blocker, sol["run_id"]),
+                )
+            else:
+                c.execute(
+                    "UPDATE goal_run SET invalid_solicitations = ?, routing_authority = ?, "
+                    "authority_seq = authority_seq + 1 WHERE id = ?",
+                    (new_invalid, LEAD_PENDING, sol["run_id"]),
+                )
+            fresh = c.execute("SELECT * FROM goal_run WHERE id = ?", (sol["run_id"],)).fetchone()
+            return DecisionResult(
+                run=_run_view(fresh),
+                solicitation_invalid=True,
+                invalid_reason=reason,
             )
 
     # ── internal helpers ─────────────────────────────────────────
@@ -679,7 +899,8 @@ class Dispatcher:
         run = c.execute("SELECT consecutive_unproductive FROM goal_run WHERE id = ?", (run_id,)).fetchone()
         unproductive = (run["consecutive_unproductive"] + 1) if cls.is_unproductive else 0
         c.execute(
-            "UPDATE goal_run SET routing_authority = ?, consecutive_unproductive = ? WHERE id = ?",
+            "UPDATE goal_run SET routing_authority = ?, consecutive_unproductive = ?, "
+            "authority_seq = authority_seq + 1 WHERE id = ?",
             (LEAD_PENDING, unproductive, run_id),
         )
 
@@ -731,7 +952,8 @@ class Dispatcher:
                 evidence="", changed="", remaining=blocker, reason_returned="thrash_guard",
             )
         c.execute(
-            "UPDATE goal_run SET status = ?, routing_authority = ?, human_blocker = ? WHERE id = ?",
+            "UPDATE goal_run SET status = ?, routing_authority = ?, human_blocker = ?, "
+            "authority_seq = authority_seq + 1 WHERE id = ?",
             (RunStatus.PAUSED.value, LEAD_PENDING, blocker, run_id),
         )
 
@@ -748,6 +970,86 @@ class Dispatcher:
         )
         row = c.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
         return _dispatch_view(row)
+
+    def _solicitation_valid(
+        self, run, sol, outcome, decision, configured, snapshot,
+    ) -> tuple[bool, Optional[str]]:
+        """Whether a solicited candidate decision may be applied. Pure predicate."""
+        if outcome is not AttemptOutcome.IDLE_COMPLETED:
+            return False, f"Lead turn did not complete cleanly (outcome={outcome.value})"
+        if decision is None:
+            return False, "Lead turn submitted no decision"
+        if decision.kind is DecisionKind.SOLICIT_LEAD:
+            return False, "solicit_lead is not a valid Lead decision"
+        # Authority nonce must be unchanged since the solicitation was opened, and
+        # the solicit dispatch must still own routing authority. A restart that
+        # reconciled this attempt would have bumped the nonce and returned
+        # authority to Lead, so a late candidate can never apply.
+        if run["authority_seq"] != sol["authority_seq"]:
+            return False, "authority window changed since the solicitation was opened"
+        if run["routing_authority"] != sol["dispatch_id"]:
+            return False, "solicit dispatch no longer owns routing authority"
+        if set(decision.ack_handoff_ids) != snapshot:
+            return False, "decision must acknowledge exactly the snapshot's pending handoffs"
+        if decision.kind is DecisionKind.DISPATCH and (
+            not decision.role or decision.role not in configured
+        ):
+            return False, f"dispatch target {decision.role!r} is not a configured role"
+        return True, None
+
+    def _apply_solicited_decision(self, c, run_id: str, decision: LeadDecision) -> DecisionResult:
+        """Apply a validated solicited decision inside the open transaction.
+
+        Differs from :meth:`lead_decide` only in that ``CONTINUE_LEAD`` returns
+        authority to Lead (which drives another budgeted solicitation) rather
+        than granting a free recursive Lead turn.
+        """
+        run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+        self._validate_acks(c, run_id, decision.ack_handoff_ids)
+
+        routing = decision.kind in (DecisionKind.DISPATCH, DecisionKind.CONTINUE_LEAD)
+        if routing:
+            edge = decision.role or "lead"
+            tripped, reason = self._thrash_reason(run, edge)
+            if tripped:
+                self._synthetic_pause(c, run_id, reason)
+                fresh = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+                return DecisionResult(run=_run_view(fresh), guard_tripped=True, guard_reason=reason)
+
+        dispatch = self._create_dispatch(c, run_id, decision)
+        self._apply_acks(c, decision.ack_handoff_ids, dispatch.id)
+
+        if decision.kind is DecisionKind.DISPATCH:
+            edge = decision.role or "lead"
+            repeats = (run["last_edge_repeats"] + 1) if run["last_edge"] == edge else 1
+            c.execute(
+                "UPDATE goal_run SET routing_authority = ?, last_edge = ?, last_edge_repeats = ? "
+                "WHERE id = ?",
+                (dispatch.id, edge, repeats, run_id),
+            )
+        elif decision.kind is DecisionKind.CONTINUE_LEAD:
+            # No free recursion: authority returns to Lead so the orchestrator
+            # opens another budgeted solicitation.
+            edge = "lead"
+            repeats = (run["last_edge_repeats"] + 1) if run["last_edge"] == edge else 1
+            c.execute(
+                "UPDATE goal_run SET routing_authority = ?, last_edge = ?, last_edge_repeats = ?, "
+                "authority_seq = authority_seq + 1 WHERE id = ?",
+                (LEAD_PENDING, edge, repeats, run_id),
+            )
+        else:
+            status = {
+                DecisionKind.WAIT: RunStatus.WAITING,
+                DecisionKind.PAUSE: RunStatus.PAUSED,
+                DecisionKind.FINISH: RunStatus.FINISHED,
+            }[decision.kind]
+            c.execute(
+                "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = ?, "
+                "human_blocker = ?, authority_seq = authority_seq + 1 WHERE id = ?",
+                (status.value, LEAD_PENDING, decision.wake_condition, decision.human_blocker, run_id),
+            )
+        fresh = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+        return DecisionResult(run=_run_view(fresh), dispatch=dispatch)
 
     # ── read helpers (test/observability) ────────────────────────
     def get_attempt(self, attempt_id: str) -> AttemptView:
@@ -785,6 +1087,8 @@ def _run_view(row: sqlite3.Row) -> RunView:
         last_edge_repeats=row["last_edge_repeats"],
         wake_condition=row["wake_condition"],
         human_blocker=row["human_blocker"],
+        authority_seq=row["authority_seq"],
+        invalid_solicitations=row["invalid_solicitations"],
     )
 
 

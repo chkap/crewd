@@ -434,3 +434,248 @@ def test_reserve_on_non_routing_dispatch_is_rejected(tmp_path):
     # WAIT is recorded as a dispatch row but is not a routing decision.
     with pytest.raises(DecisionError):
         disp.reserve_attempt(r.id, d.dispatch.id, "lead")
+
+
+# ─────────────────────── journaled Lead solicitation (#17) ───────────────────────
+def _seed_pending(disp, run_id, role="worker", **ho):
+    """Dispatch a role and complete it so exactly one pending handoff exists."""
+    d = disp.lead_decide(run_id, LeadDecision.dispatch(role), configured_roles=ROLES)
+    _drive(disp, run_id, d.dispatch.id, role, AttemptOutcome.IDLE_COMPLETED, **ho)
+    return disp.pending_handoffs(run_id)[-1]
+
+
+def _last_solicit_attempt(disp, run_id):
+    row = disp._conn.execute(
+        "SELECT attempt_id FROM solicitation WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    return row["attempt_id"]
+
+
+def test_solicitation_consumes_budget_and_owns_authority(tmp_path):
+    disp = _open(tmp_path, max_work=3)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    got = disp.get_run(run.id)
+    # A journaled Lead turn reserves one work slot and takes routing authority.
+    assert got.reserved_slots == 1
+    assert got.routing_authority == sol.dispatch_id
+    assert disp.get_attempt(sol.attempt_id).role == "lead"
+    assert disp.get_attempt(sol.attempt_id).state is AttemptState.RESERVED
+
+
+def test_solicitation_budget_exhaustion(tmp_path):
+    disp = _open(tmp_path, max_work=1)
+    run = disp.start_or_resume_run("goal:v1")
+    disp.open_lead_solicitation(run.id)  # consumes the only slot
+    # Resolve it to return authority to Lead so a second open passes the authority gate.
+    disp.resolve_lead_solicitation(
+        _last_solicit_attempt(disp, run.id),
+        outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.continue_lead(),
+        configured_roles=ROLES,
+    )
+    with pytest.raises(BudgetExhausted):
+        disp.open_lead_solicitation(run.id)
+    assert disp.get_run(run.id).status is RunStatus.EXHAUSTED
+
+
+def test_solicitation_open_requires_active_lead_pending(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    # Authority is held by an in-flight role dispatch → cannot solicit.
+    d = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    with pytest.raises(DecisionError):
+        disp.open_lead_solicitation(run.id)
+    disp.record_terminal(disp.reserve_attempt(run.id, d.dispatch.id, "worker"),
+                         AttemptOutcome.IDLE_COMPLETED)
+    # Paused run cannot be solicited either.
+    disp.lead_decide(run.id, LeadDecision.pause("blocked",
+                     ack=(disp.pending_handoffs(run.id)[0].id,)), configured_roles=ROLES)
+    with pytest.raises(DecisionError):
+        disp.open_lead_solicitation(run.id)
+
+
+def test_solicitation_apply_dispatch_no_handoff_emitted(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    ho = _seed_pending(disp, run.id, evidence="did work")
+    before = len(disp.export_run(run.id)["handoffs"])
+    sol = disp.open_lead_solicitation(run.id)
+    assert set(sol.pending_handoff_ids) == {ho.id}
+    disp.mark_started(sol.attempt_id, session_id="lead-sess", generation=0)
+    res = disp.resolve_lead_solicitation(
+        sol.attempt_id,
+        outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.dispatch("verifier", ack=(ho.id,)),
+        configured_roles=ROLES,
+    )
+    assert res.dispatch.role == "verifier"
+    assert disp.get_run(run.id).routing_authority == res.dispatch.id
+    # The Lead attempt terminalised but emitted NO handoff of its own.
+    assert disp.get_attempt(sol.attempt_id).state is AttemptState.TERMINAL
+    assert len(disp.export_run(run.id)["handoffs"]) == before
+    assert disp.pending_handoffs(run.id) == []  # snapshot handoff was acked
+
+
+def test_solicitation_requires_exact_ack_snapshot(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    ho = _seed_pending(disp, run.id)
+    sol = disp.open_lead_solicitation(run.id)
+    # Ack the wrong (empty) set → invalid; handoff stays pending, authority to Lead.
+    res = disp.resolve_lead_solicitation(
+        sol.attempt_id,
+        outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.dispatch("verifier", ack=()),
+        configured_roles=ROLES,
+    )
+    assert res.solicitation_invalid
+    assert disp.get_run(run.id).routing_authority == LEAD_PENDING
+    assert [h.id for h in disp.pending_handoffs(run.id)] == [ho.id]
+    assert disp.get_run(run.id).invalid_solicitations == 1
+
+
+def test_solicitation_no_decision_is_invalid(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    res = disp.resolve_lead_solicitation(
+        sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=None, configured_roles=ROLES,
+    )
+    assert res.solicitation_invalid
+    assert disp.get_run(run.id).invalid_solicitations == 1
+    assert disp.get_run(run.id).routing_authority == LEAD_PENDING
+
+
+def test_solicitation_unclean_outcome_is_invalid(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    res = disp.resolve_lead_solicitation(
+        sol.attempt_id, outcome=AttemptOutcome.SDK_ERROR,
+        decision=LeadDecision.continue_lead(), configured_roles=ROLES,
+    )
+    assert res.solicitation_invalid
+    assert disp.get_attempt(sol.attempt_id).terminal_outcome is AttemptOutcome.SDK_ERROR
+
+
+def test_solicitation_invalid_cap_pauses(tmp_path):
+    disp = _open(tmp_path, max_invalid_solicitations=2)
+    run = disp.start_or_resume_run("goal:v1")
+    for _ in range(2):
+        sol = disp.open_lead_solicitation(run.id)
+        disp.resolve_lead_solicitation(
+            sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+            decision=None, configured_roles=ROLES,
+        )
+    got = disp.get_run(run.id)
+    assert got.status is RunStatus.PAUSED
+    assert got.invalid_solicitations == 2
+    assert got.human_blocker
+
+
+def test_valid_solicitation_resets_invalid_counter(tmp_path):
+    disp = _open(tmp_path, max_invalid_solicitations=5)
+    run = disp.start_or_resume_run("goal:v1")
+    sol1 = disp.open_lead_solicitation(run.id)
+    disp.resolve_lead_solicitation(sol1.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+                                   decision=None, configured_roles=ROLES)
+    assert disp.get_run(run.id).invalid_solicitations == 1
+    sol2 = disp.open_lead_solicitation(run.id)
+    disp.resolve_lead_solicitation(sol2.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+                                   decision=LeadDecision.dispatch("worker", ack=()),
+                                   configured_roles=ROLES)
+    assert disp.get_run(run.id).invalid_solicitations == 0
+
+
+def test_solicitation_continue_lead_returns_to_lead(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    res = disp.resolve_lead_solicitation(
+        sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.continue_lead(), configured_roles=ROLES,
+    )
+    # continue_lead grants no free recursion: authority returns to Lead for
+    # another (budgeted) solicitation.
+    assert not res.solicitation_invalid
+    assert disp.get_run(run.id).routing_authority == LEAD_PENDING
+    assert disp.get_run(run.id).status is RunStatus.ACTIVE
+
+
+def test_solicit_lead_is_not_a_valid_decision(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    bad = LeadDecision(DecisionKind.SOLICIT_LEAD)
+    res = disp.resolve_lead_solicitation(
+        sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=bad, configured_roles=ROLES,
+    )
+    assert res.solicitation_invalid
+
+
+def test_resolve_non_solicitation_attempt_raises(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    att = disp.reserve_attempt(run.id, d.dispatch.id, "worker")
+    with pytest.raises(DecisionError):
+        disp.resolve_lead_solicitation(att, outcome=AttemptOutcome.IDLE_COMPLETED,
+                                       decision=LeadDecision.continue_lead(),
+                                       configured_roles=ROLES)
+
+
+def test_restart_reconciles_solicitation_without_handoff(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    disp.mark_started(sol.attempt_id, session_id="lead-sess", generation=0)
+    nonce_before = disp.get_run(run.id).authority_seq
+    disp.close()
+
+    # Crash between the Lead turn and resolution: the in-memory candidate is lost.
+    disp2 = _open(tmp_path)
+    created = disp2.reconcile_on_restart(run.id)
+    # A solicitation reconcile emits NO handoff (Lead attempts never do)…
+    assert created == []
+    assert disp2.pending_handoffs(run.id) == []
+    assert disp2.get_attempt(sol.attempt_id).state is AttemptState.RECONCILED_UNCERTAIN
+    # …but authority returns to Lead with a bumped nonce, so any late candidate
+    # for the dead solicitation can never apply.
+    got = disp2.get_run(run.id)
+    assert got.routing_authority == LEAD_PENDING
+    assert got.authority_seq > nonce_before
+
+
+def test_stale_solicitation_resolve_is_rejected_after_restart(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    disp.mark_started(sol.attempt_id, session_id="lead-sess", generation=0)
+    disp.close()
+
+    disp2 = _open(tmp_path)
+    disp2.reconcile_on_restart(run.id)
+    # Resolving the reconciled (no longer in-flight) solicitation must be refused.
+    with pytest.raises(DecisionError):
+        disp2.resolve_lead_solicitation(
+            sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+            decision=LeadDecision.continue_lead(), configured_roles=ROLES,
+        )
+
+
+def test_solicitation_wait_sets_status(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    disp.resolve_lead_solicitation(
+        sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.wait("upstream merge"), configured_roles=ROLES,
+    )
+    got = disp.get_run(run.id)
+    assert got.status is RunStatus.WAITING
+    assert got.routing_authority == LEAD_PENDING
+    assert got.wake_condition == "upstream merge"
