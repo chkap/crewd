@@ -266,10 +266,11 @@ class SdkAttemptExecutor:
             errs.append(
                 "`github-copilot-sdk` (import `copilot`) is not importable, but it "
                 "is a required dependency of crewd for the default `backend: "
-                "copilot-sdk`. Reinstall/upgrade the crewd distribution so its "
-                "declared dependencies are present — e.g. `uv sync` (repo), "
-                "`pip install --upgrade --force-reinstall crewd`, or "
-                "`uv tool install crewd` (package) — then run `crewd doctor`."
+                "copilot-sdk`. Repair the existing install so its declared "
+                "dependencies are present — e.g. `uv sync` (repo checkout), "
+                "`pip install --upgrade --force-reinstall crewd` (pip), or "
+                "`uv tool install --reinstall crewd` (uv tool) — then run "
+                "`crewd doctor`."
             )
         return errs
 

@@ -63,6 +63,26 @@ def test_sdk_not_gated_behind_optional_extra():
             )
 
 
+def test_wheel_build_config_has_no_duplicate_template_include():
+    # The wheel packages `src/crewd`, which already contains `templates/`. A
+    # `force-include` mapping `src/crewd/templates` -> `crewd/templates` (as
+    # existed pre-#26) makes hatchling add every template file twice and fails
+    # the wheel build ("A second file is being added ... at the same path").
+    # Guard: no force-include may duplicate a path already inside a packaged dir.
+    wheel_cfg = (
+        _pyproject().get("tool", {}).get("hatch", {})
+        .get("build", {}).get("targets", {}).get("wheel", {})
+    )
+    packages = wheel_cfg.get("packages", [])
+    force_include = wheel_cfg.get("force-include", {})
+    for src in force_include:
+        for pkg in packages:
+            assert not src.startswith(pkg.rstrip("/") + "/"), (
+                f"force-include '{src}' duplicates content already packaged via "
+                f"'{pkg}' — this breaks `uv build --wheel`"
+            )
+
+
 def test_missing_sdk_diagnostic_names_correct_remediation(monkeypatch):
     """When the SDK is unimportable, doctor must name the real install path and
     must NOT recommend the retired `crewd[sdk]` extra."""
@@ -82,6 +102,13 @@ def test_missing_sdk_diagnostic_names_correct_remediation(monkeypatch):
     # Must point at reinstalling/upgrading the normal distribution.
     assert "crewd" in msg
     assert "doctor" in msg
+    # Repair commands must actually reinstall dependencies of an already-present
+    # install (a plain `uv tool install crewd` is a no-op when crewd is already
+    # installed — see #26 Advisory). Any recommended repair must use an
+    # effective flag.
+    assert "--force-reinstall" in msg or "--reinstall" in msg
+    if "uv tool install" in msg:
+        assert "uv tool install --reinstall" in msg
 
 
 def test_healthy_when_ops_factory_injected():
