@@ -34,7 +34,7 @@ def _load_harness():
 
 def test_integrated_live_smoke_passes():
     harness = _load_harness()
-    manifest = harness.integrated_smoke(out_path=None)
+    manifest = harness.full_smoke(out_path=None)
     unmet = [k for k, v in manifest["checks"].items() if not v]
     assert manifest["passed"], f"unmet checks: {unmet}"
-    assert manifest["workspace_cleaned_up"] is True
+    assert manifest["workspaces_cleaned_up"] is True

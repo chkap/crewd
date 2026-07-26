@@ -116,7 +116,7 @@ Invariants (all covered by `tests/test_session_backend.py`):
   session is still recorded `TAINTED` (fail-safe, not fail-open).
 - **Unconfirmed cleanup is not resumable.** If `disconnect()` cannot be
   confirmed — even on an otherwise successful `IDLE_COMPLETED` attempt — the
-  session id is tainted (`cleanup_confirmed=False`), so the next tick starts a
+  session id is tainted (`cleanup_confirmed=False`), so the next attempt starts a
   fresh session instead of silently resuming a half-torn-down one (R4/R5).
 - **Tainted sessions refuse resume** unless `allow_tainted_resume=True` is
   passed explicitly (operator override). The backend's automatic recovery for a
@@ -135,7 +135,7 @@ role directory (which is stable across goal epochs). `SessionRegistry` persists
 `(goal_label, role) → {active session id, generation}` as atomically-written
 JSON (`config_dir/.crewd-sdk-sessions.json`):
 
-- **Normal tick** resumes the active id for the current `(epoch, role)`.
+- **Normal resume** reuses the active id for the current `(epoch, role)`.
 - **New goal epoch** (`crewd new-goal` bumps `goal:vN`) → a new registry key →
   generation 0 → a **fresh** session, never a resume of the prior epoch's
   conversation.
@@ -278,41 +278,52 @@ disconnects cleanly. It says nothing about the crewd integration:
 uv run --active python scripts/live_smoke.py --probe-only
 ```
 
-**2. Integrated smoke (the real proof).** Drives the *production* stack — durable
-`Dispatcher` journal, the real `Orchestrator` run loop, `SdkAttemptExecutor` /
-`sdk_adapter`, goal-scoped `SessionRegistry` / `TaintStore`, and the read-only
-`diagnostics` surface — in a disposable workspace, overriding only the two prompt
-builders with trivial "call your one typed tool once" instructions:
+**2. Integrated CLI smoke (the real proof).** Drives the *user-facing* stack: it
+invokes the real Typer CLI as subprocesses — `crewd run` and `crewd status --json`
+— so config loading, preflight, the dispatcher-owned `Orchestrator` run loop,
+`SdkAttemptExecutor` / `sdk_adapter`, goal-scoped `SessionRegistry` / `TaintStore`,
+signal handling, exit behavior, and the read-only `diagnostics` status projection
+are all exercised through the same paths an operator hits. It never calls the
+private `Orchestrator` or `build_snapshot` directly for the CLI phases.
 
 ```bash
 uv run --active python scripts/live_smoke.py --out /tmp/smoke-manifest.json
 ```
 
-It emits a **sanitized** JSON manifest (crewd IDs, outcomes, counts, booleans —
-never transcripts, prompts, tool args, or credentials) and exits non-zero unless
-every required check passes. The phases and their required outcomes:
+Prompts are bounded **without** replacing the production prompt builders. A gated,
+test-only policy (`src/crewd/_smoke.py`, loaded only when `CREWD_SMOKE_POLICY`
+points at a policy file — inert in production) *appends* a short instruction
+suffix to the already-rendered production `_role_prompt` / `_lead_prompt` strings.
+Because the production handoff rendering is preserved, a regression that dropped a
+handoff field from the Lead prompt would fail the payload oracle rather than be
+masked.
+
+It emits a **sanitized** JSON manifest (crewd IDs, outcomes, counts, booleans, and
+non-secret harness-generated canary tokens — never transcripts, prompts, tool
+args, or credentials) and exits non-zero unless every required check passes. The
+phases and their required outcomes:
 
 | Phase | Proves |
 | ----- | ------ |
-| `capability_probe` | runtime start → idle → clean disconnect; SDK events observed |
-| `integrated_routing` | Lead `dispatch` → Worker exactly-one `completed` handoff → Lead `finish`; handoff round-trips into the next Lead solicitation (`consumed_by_dispatch_id`); isolated goal-scoped role sessions (gen 0); pre-send journal identity; run reaches `finished` |
-| `status_projection` | `crewd status` projection: `finished` → `NEW_GOAL`; bounded handoff redaction on the surface |
-| `session_lifecycle` | same-session resume by id; taint advances to a fresh generation + new session id |
-| `external_cancellation` | a `CancelToken` requested mid-attempt classifies as `cancelled_clean` **or** `tainted` — **never** `idle_completed` |
-| `shutdown` | no surviving daemon PID; disposable workspace removed |
+| `capability_probe` | (lower-level, isolated) runtime start → idle → clean disconnect; SDK events observed |
+| `cli_routing` | (real `crewd run` + `crewd status --json` subprocesses) Lead `dispatch` → Worker exactly-one `completed` handoff → Lead `finish`; run exits `goal-complete`, status projects `finished` → `new_goal`; isolated goal-scoped role sessions (gen 0); pre-send journal identity. **Payload-delivery oracle** (not mere acknowledgement): the worker's actually-populated handoff fields are rendered verbatim into the production Lead prompt (deterministic render check on the stored fields), and Lead echoes the handoff's `reason` back in its typed decision — proving SDK-capture → SQLite → production-prompt rendering → Lead typed decision |
+| `cli_cancellation` | (real `crewd run` child SIGINT'd mid-attempt) process-aware: child exits, no surviving PID, workspace removed; the worker attempt classifies `cancelled_clean` **or** `tainted` — **never** `idle_completed` |
+| `internal_lifecycle` | (internal integration) same-session resume by id; taint advances to a fresh generation + new session id |
 
-The three former open capability risks are resolved by this run and no longer
-open: `extra_add_dirs` fails closed with workspace-root mounting confirmed live;
-abort-confirmation polls durable history without starting a new turn and
-classifies clean-or-tainted; idle/abort event detection is exercised end to end.
-Re-run after any change to the executor, adapter, session backend, or
-orchestrator, and attach the sanitized manifest as evidence.
+A whole-smoke wall-clock watchdog bounds total runtime, and each CLI subprocess and
+SDK turn carries its own timeout. The three former open capability risks are
+resolved by this run and no longer open: `extra_add_dirs` fails closed with
+workspace-root mounting confirmed live; abort-confirmation polls durable history
+without starting a new turn and classifies clean-or-tainted; idle/abort event
+detection is exercised end to end. Re-run after any change to the executor,
+adapter, session backend, or orchestrator, and attach the sanitized manifest as
+evidence.
 
 ## Config
 
 `config.py` accepts `backend: "copilot" | "copilot-sdk"` (default `"copilot-sdk"`).
 `copilot-sdk` runs `SdkBackend.doctor()` / `SdkAttemptExecutor.doctor()` in
-preflight (verifies `import copilot` succeeds) and then drives every role tick
+preflight (verifies `import copilot` succeeds) and then drives every role attempt
 and Lead decision turn through a real SDK session — never a `copilot -p`
 subprocess.
 

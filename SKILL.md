@@ -53,8 +53,8 @@ uv --directory ~/crewd run crewd init my-crew --repo owner/target-repo
 cd my-crew
 $EDITOR GOAL.md                                                # write the spec
 uv --directory ~/crewd run crewd -w "$(pwd)" doctor            # must be 0 errors
-uv --directory ~/crewd run crewd -w "$(pwd)" tick lead         # smoke-test 1 role
-uv --directory ~/crewd run crewd -w "$(pwd)" run --once        # one full cycle
+uv --directory ~/crewd run crewd -w "$(pwd)" run --once        # one dispatcher step (Lead + ≤1 dispatched attempt)
+uv --directory ~/crewd run crewd -w "$(pwd)" tick lead         # debug/compat: force 1 named role, bypassing dispatch
 uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon     # loop in background
 uv --directory ~/crewd run crewd -w "$(pwd)" status           # check daemon + crew state
 uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (STOPPED + SIGINT)
@@ -78,14 +78,14 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 ├── state/goal.json        ← {version, label, goal_md_sha256, cycles}
 ├── state/exit-reason      ← written on graceful exit
 ├── state/inbox/<role>.md  ← operator → role messages (consumed + moved to .processed by role)
-├── state/logs/<role>/NNNN.log  ← per-tick output
+├── state/logs/<role>/NNNN.log  ← per-attempt output
 └── repo/              ← target repo clone (main branch; per-role worktrees in cfg/)
 ```
 
 ## Operator nudges
 
 ```bash
-# free-form (always shows up in role's next tick prompt):
+# free-form (always shows up the next time the role is run/dispatched):
 crewd talk worker "small PRs only — split #42 into 3"
 
 # prioritised (preferred for machine-readable directives):
@@ -94,7 +94,7 @@ crewd inbox advisory ADVICE "investigate https://example.com/postmortem"
 crewd inbox verifier INFO "expect a doc-only PR shortly"
 ```
 
-Priorities: `OVERRIDE > ADVICE > INFO`. The role consumes the inbox at the start of its next tick and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (audit trail), so messages don't pile up.
+Priorities: `OVERRIDE > ADVICE > INFO`. The role consumes the inbox at the start of its next run (when it is next dispatched) and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (audit trail), so messages don't pile up.
 
 ## Goal lifecycle (epochs)
 

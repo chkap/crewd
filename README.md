@@ -25,11 +25,13 @@ uv --directory ~/crewd run crewd -w "$(pwd)" goal --edit
 # 3. Sanity check (config, families, target repo clone, agents/, inbox)
 uv --directory ~/crewd run crewd -w "$(pwd)" doctor
 
-# 4. Smoke test: one tick of one role
-uv --directory ~/crewd run crewd -w "$(pwd)" tick lead
-
-# 5. Run one full cycle in foreground
+# 4. Smoke test: one dispatcher step in the foreground (Lead is solicited,
+#    then at most one role it dispatches runs one attempt)
 uv --directory ~/crewd run crewd -w "$(pwd)" run --once
+
+# 5. (debug/compat escape hatch) Force a single tick of ONE named role,
+#    bypassing the Lead dispatcher — handy for isolating one role
+uv --directory ~/crewd run crewd -w "$(pwd)" tick lead
 
 # 6. Run until completed, human-blocked, max-cycles, or signal
 uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon
@@ -128,8 +130,8 @@ Hard rules baked into `doctor` and `run`:
 | `doctor`                                 | Status dashboard with diagnostics (roles, state, inbox, recent logs, issues). |
 | `refresh`                                | Re-render agents/ + AGENTS.md; migrate old workspace layout if needed.         |
 | `goal [--edit] [--from FILE]`            | Print, `$EDITOR`-edit, or install `GOAL.md` from a file.                       |
-| `run [--once] [--role R] [--daemon] [--no-auto-render]` | Foreground loop (default) or background daemon (`--daemon`). `--once` / `--role` as before. |
-| `tick <role>`                            | Imperative single tick of one role (alias for `run --role`).                   |
+| `run [--once] [--role R] [--daemon] [--no-auto-render]` | Foreground loop (default) or background daemon (`--daemon`). `--once` runs a single dispatcher step (Lead solicited + at most one dispatched attempt), not a full round of every role. `--role R` bypasses the dispatcher to force one named role. |
+| `tick <role>`                            | Debug/compat escape hatch: one tick of a single named role, bypassing the Lead dispatcher (alias for `run --role`). |
 | `stop [--reason] [--force]`              | Write `STOPPED` + signal daemon (`SIGINT`; `--force` sends `SIGKILL`).         |
 | `pause "<reason>"`                       | Write `PAUSED`; loop exits with `human-blocked` and keeps goal issues open.    |
 | `resume`                                 | Clear `STOPPED` and `PAUSED`.                                                  |
@@ -149,7 +151,7 @@ Hard rules baked into `doctor` and `run`:
 cannot advance without a human/operator action. Lead must first exhaust autonomous work,
 post the exact blocker and requested action on the task and umbrella issues, then write a
 single-line `state/PAUSED` reason beginning with `human-blocked:`. The loop exits after
-Lead's tick, so Advisory, Worker, and Verifier are not invoked pointlessly.
+Lead's decision, so Advisory, Worker, and Verifier are not invoked pointlessly.
 
 After resolving the blocker:
 
@@ -201,7 +203,7 @@ crewd talk worker "small PRs only — split #42 into 3 PRs"
 crewd inbox lead OVERRIDE "drop feature X, focus on auth bug"
 ```
 
-The role consumes its inbox file at the start of its next tick and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (preserving an audit trail). `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
+The role consumes its inbox file at the start of its next run (when it is next dispatched) and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (preserving an audit trail). `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
 
 **Start a new goal on the same workspace**
 
@@ -283,7 +285,8 @@ scripts/
   and recovery requirements that the SDK-native, Lead-directed refactor is built against.
 - [`docs/sdk-backend.md`](docs/sdk-backend.md) — SDK-native role backend (`backend: copilot-sdk`):
   transport decision (per-role stdio), the one-attempt lifecycle state machine, offline-verified
-  `github-copilot-sdk` capability facts, open capability risks, and the bounded live-smoke procedure.
+  `github-copilot-sdk` capability facts, the (now resolved) capability risks, and the bounded
+  live-smoke procedure.
 - [`docs/dispatcher.md`](docs/dispatcher.md) — durable dispatch kernel: journal schema, exclusive
   Lead authority, at-least-once idempotent handoffs, restart reconciliation, and schema migration.
 - [`docs/orchestrator.md`](docs/orchestrator.md) — Lead-directed run loop: exit reasons, pre-send

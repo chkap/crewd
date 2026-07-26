@@ -528,7 +528,16 @@ def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
     from .orchestrator import Orchestrator
 
     executor = build_executor(cfg)
-    return Orchestrator(ws, cfg, executor, goal_state)
+    # Gated, test-only live-smoke seam: default absent → production is untouched.
+    # When CREWD_SMOKE_POLICY points at a policy file, a bounded instruction
+    # suffix is appended to the production-rendered prompts (the handoff payload
+    # rendering itself is never replaced). See crewd._smoke / scripts/live_smoke.py.
+    prompt_policy = None
+    if os.environ.get("CREWD_SMOKE_POLICY"):
+        from ._smoke import SmokePromptPolicy
+
+        prompt_policy = SmokePromptPolicy.from_env()
+    return Orchestrator(ws, cfg, executor, goal_state, prompt_policy=prompt_policy)
 
 
 def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:

@@ -97,11 +97,18 @@ class Orchestrator:
         max_steps: int = 10000,
         poll_interval: float = 0.05,
         taint_orphan: Optional[Callable[[str, int, str], None]] = None,
+        prompt_policy: object | None = None,
     ):
         self.ws = ws
         self.cfg = cfg
         self.executor = executor
         self.goal_state = goal_state
+        # Gated, test-only seam (default None → fully inert in production). When a
+        # live-smoke policy is injected it may append a bounded instruction suffix
+        # to the *production-rendered* role/Lead prompts and observe (not replace)
+        # them. It never alters the production handoff rendering, so the payload a
+        # real Lead turn receives is exactly the production one. See crewd._smoke.
+        self._prompt_policy = prompt_policy
         self.goal_label = goal_state.label or "goal:v1"
         self._owns_dispatcher = dispatcher is None
         self.disp = dispatcher or Dispatcher(
@@ -245,6 +252,8 @@ class Orchestrator:
             decision=turn.decision,
             configured_roles=self.configured_roles,
         )
+        if self._prompt_policy is not None:
+            self._prompt_policy.record_lead_decision(turn.decision)
         self._persist_cycle()
 
     def _dispatch_step(self, run_id: str, dispatch_id: str) -> None:
@@ -401,7 +410,7 @@ class Orchestrator:
             log_path=self.ws.log_file(role, self._cycle, self.goal_label),
         )
 
-    def _role_prompt(self, role: str, dsp) -> str:
+    def _role_prompt_production(self, role: str, dsp) -> str:
         """Per-attempt instruction for one dispatched non-Lead role.
 
         This is a *single dispatched attempt*, not a fixed round-robin tick: Lead
@@ -438,7 +447,19 @@ class Orchestrator:
             f"next role — routing is Lead's alone."
         )
 
+    def _role_prompt(self, role: str, dsp) -> str:
+        prompt = self._role_prompt_production(role, dsp)
+        if self._prompt_policy is not None:
+            return self._prompt_policy.decorate_role(role, prompt)
+        return prompt
+
     def _lead_prompt(self, pending: list[HandoffView]) -> str:
+        prompt = self._lead_prompt_production(pending)
+        if self._prompt_policy is not None:
+            return self._prompt_policy.decorate_lead(pending, prompt)
+        return prompt
+
+    def _lead_prompt_production(self, pending: list[HandoffView]) -> str:
         ids = [h.id for h in pending]
         if pending:
             blocks = []
