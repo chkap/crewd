@@ -67,13 +67,18 @@ def _check_watchdog(phase: str) -> None:
 
 
 def _canaries(nonce: str) -> dict:
+    # Semantically NEUTRAL, mutually-distinct tokens. Deliberately no field-name
+    # words (no "reason"/"disagree"/"blocker"): earlier runs showed a real worker
+    # model conflating the semantically-named disagreement/blocker tokens into the
+    # `reason` narrative. Neutral opaque tokens give the model no cue to merge
+    # them. Each ends in the shared 8-char nonce so Lead can echo it back.
     return {
-        "evidence": f"CANARY-EVID-{nonce}",
-        "changed": f"CANARY-CHANGED-{nonce}",
-        "remaining": f"CANARY-REMAIN-{nonce}",
-        "reason": f"CANARY-REASON-{nonce}",
-        "disagreement": f"CANARY-DISAGREE-{nonce}",
-        "blocker": f"CANARY-BLOCKER-{nonce}",
+        "evidence": f"MARKERA-QK7-{nonce}",
+        "changed": f"MARKERB-VT2-{nonce}",
+        "remaining": f"MARKERC-HZ9-{nonce}",
+        "reason": f"MARKERD-LM4-{nonce}",
+        "disagreement": f"MARKERE-PW6-{nonce}",
+        "blocker": f"MARKERF-XB8-{nonce}",
     }
 
 
@@ -119,9 +124,12 @@ def _make_cli_workspace(root: Path, *, max_work: int = 8):
 
 
 def _write_policy(path: Path, *, evidence_file: Path, nonce: str, slow_worker: bool) -> None:
+    # ``nonce`` is the bare 8-char code shared as the final-hyphen suffix of every
+    # canary (see ``_canaries``), so the Lead can derive it from the rendered
+    # payload and echo it back.
     path.write_text(json.dumps({
         "evidence_file": str(evidence_file),
-        "nonce": f"FINISH-NONCE-{nonce}",
+        "nonce": nonce,
         "canaries": _canaries(nonce),
         "slow_worker": slow_worker,
     }, indent=2))
@@ -191,6 +199,11 @@ def _cli_routing(root: Path) -> dict:
         ev = json.loads(evidence_file.read_text())
 
     sessions = {a["role"]: a["session_id"] for a in attempts if a["session_id"]}
+    # Durable-row oracle: every one of the six canaries must be reproduced exactly
+    # in the persisted handoff row (proves SDK-capture → SQLite for all six).
+    from crewd._smoke import CANARY_FIELDS, durable_row_matches
+    durable_matches = durable_row_matches(worker_h, canaries) if worker_h else {
+        f: False for f in CANARY_FIELDS}
     return {
         "run_rc": run["rc"],
         "run_elapsed_s": run["elapsed_s"],
@@ -203,17 +216,18 @@ def _cli_routing(root: Path) -> dict:
         "worker_turns": sum(1 for a in attempts if a["role"] == "worker"),
         "worker_handoff_outcome": worker_h["outcome_class"] if worker_h else None,
         "worker_handoff_consumed_by_lead": bool(worker_h and worker_h["consumed_by_dispatch_id"]),
-        "durable_reason_canary_exact": bool(worker_h) and worker_h["reason_returned"] == canaries["reason"],
-        "worker_populated_field_count": sum(
-            1 for col in ("evidence", "changed", "remaining", "reason_returned")
-            if worker_h and (worker_h[col] or "").strip()) if worker_h else 0,
-        # request-seam oracle (SQLite → production Lead prompt → typed decision),
-        # robust to model paraphrasing (checks the ACTUAL stored fields render):
-        "lead_prompt_populated_field_count": ev.get("lead_prompt_populated_field_count"),
-        "lead_prompt_all_populated_rendered": ev.get("lead_prompt_all_populated_rendered"),
-        "lead_prompt_canary_field_hits": ev.get("lead_prompt_canary_field_hits"),
+        # durable-row oracle: all six fields present + exact canary match
+        "durable_field_match_count": sum(1 for f in CANARY_FIELDS if durable_matches[f]),
+        "durable_all_six_canaries_exact": all(durable_matches[f] for f in CANARY_FIELDS),
+        "durable_field_matches": {f: durable_matches[f] for f in CANARY_FIELDS},
+        # request-seam oracle (SQLite → production Lead prompt): each of the six
+        # canaries rendered EXACTLY ONCE in the finalized production Lead prompt.
+        "lead_prompt_field_presence_count": ev.get("lead_prompt_field_presence_count"),
+        "lead_prompt_exact_once": ev.get("lead_prompt_exact_once"),
+        "lead_prompt_render_counts": ev.get("lead_prompt_render_counts"),
+        # typed Lead decision: echoes the one-time nonce derived from the payload.
         "lead_decision_kind": ev.get("lead_decision_kind"),
-        "lead_decision_echo_match": ev.get("lead_decision_echo_match"),
+        "lead_decision_nonce_match": ev.get("lead_decision_nonce_match"),
         "isolated_sessions": (sessions.get("worker") is not None
                               and sessions.get("lead") is not None
                               and sessions.get("worker") != sessions.get("lead")),
@@ -349,6 +363,29 @@ def _internal_lifecycle(root: Path) -> dict:
 
 
 # ─────────────────────────── orchestration ───────────────────────────
+def payload_checks(rt: dict) -> dict:
+    """Pure pass-predicate for the all-six-field payload-delivery oracle.
+
+    Kept side-effect free and importable so a deterministic test can assert it
+    fails whenever any of the six handoff fields (notably disagreement/blocker)
+    is dropped from the durable row, the rendered production prompt, or the echo.
+    Pass only on: all six canaries exact in the durable row; each of the six
+    rendered EXACTLY ONCE in the finalized production Lead prompt; and the typed
+    Lead decision both echoes the one-time nonce and consumes the exact handoff.
+    """
+    return {
+        "payload_worker_all_six_fields": (
+            rt.get("durable_field_match_count") == 6
+            and rt.get("durable_all_six_canaries_exact") is True),
+        "payload_six_fields_rendered_exactly_once": (
+            rt.get("lead_prompt_field_presence_count") == 6
+            and rt.get("lead_prompt_exact_once") is True),
+        "payload_lead_echoed_nonce_and_consumed": (
+            rt.get("lead_decision_nonce_match") is True
+            and rt.get("worker_handoff_consumed_by_lead") is True),
+    }
+
+
 def full_smoke(out_path: Path | None) -> dict:
     global _DEADLINE
     _DEADLINE = time.time() + WHOLE_SMOKE_BUDGET_S
@@ -400,15 +437,10 @@ def full_smoke(out_path: Path | None) -> dict:
         checks["cli_exactly_one_worker_completed"] = (
             (rt.get("worker_turns") or 0) >= 1 and rt.get("worker_handoff_outcome") == "completed")
         checks["cli_handoff_consumed_by_lead"] = rt.get("worker_handoff_consumed_by_lead") is True
-        # payload delivery oracle (robust — not mere acknowledgement).
-        # The render check is deterministic (uses the ACTUAL stored handoff
-        # fields, so a regression dropping fields from `_lead_prompt` fails it);
-        # the echo check proves the real Lead SDK turn read the payload back.
-        checks["payload_worker_fields_populated"] = (rt.get("worker_populated_field_count") or 0) >= 3
-        checks["payload_fields_rendered_into_lead_prompt"] = (
-            rt.get("lead_prompt_all_populated_rendered") is True
-            and (rt.get("lead_prompt_populated_field_count") or 0) >= 3)
-        checks["payload_lead_echoed_handoff_reason"] = rt.get("lead_decision_echo_match") is True
+        # payload delivery oracle (all six handoff fields — Lead/Advisory
+        # requirement). Factored into a pure predicate so a deterministic test can
+        # prove it fails when disagreement/blocker are dropped anywhere.
+        checks.update(payload_checks(rt))
         # CLI cancellation (process-aware)
         checks["cli_cancel_child_exited"] = cx.get("child_exited") is True and cx.get("no_surviving_pid") is True
         checks["cli_cancel_clean_or_tainted"] = cx.get("classified_clean_or_tainted") is True
