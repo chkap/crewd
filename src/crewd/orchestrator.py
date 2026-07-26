@@ -13,6 +13,17 @@ status — Lead finishes, waits, or pauses; the work budget exhausts; or an
 operator control / signal halts it — mapping each terminal condition to a
 distinct persisted exit reason. ``--once`` advances exactly one step.
 
+Structured role handoffs (issue #12): a dispatched non-Lead role returns its
+outcome to Lead through the ``submit_role_handoff`` SDK tool (parallel to Lead's
+``submit_lead_decision``). The transport lifecycle stays authoritative — an
+error, wait-timeout, cancel, or taint overrides any success-shaped claim, and
+only a clean idle turn lets the role claim ``completed`` vs ``no_progress``; a
+zero/multiple/malformed submission becomes an ``uncertain`` protocol failure
+(counting toward the no-progress bounds), never a silent completion. The
+resolved evidence/changed/remaining then flow verbatim into Lead's next
+solicitation, so Lead routes on the role's own structured context rather than a
+bare SDK code. See :func:`crewd.executor.resolve_role_terminal`.
+
 Cancellation & recovery (issue #17): an interrupt or operator STOP cancels the
 in-flight attempt promptly — the attempt runs on a worker thread while the main
 loop polls controls and *requests* a non-blocking SDK abort through a single
@@ -45,7 +56,7 @@ from .dispatcher import (
     HandoffView,
     RunStatus,
 )
-from .executor import AttemptExecutor, AttemptRequest
+from .executor import AttemptExecutor, AttemptRequest, resolve_role_terminal
 from .session_backend import CancelToken
 from .workspace import Workspace
 
@@ -249,7 +260,7 @@ class Orchestrator:
         except BudgetExhausted:
             return
         self._cycle += 1
-        req = self._request(role, self._role_prompt(role))
+        req = self._request(role, self._role_prompt(role, dsp))
         console.print(f"  [magenta]{role}[/] ({self.cfg.roles[role].model}) → {req.log_path}")
         # Journal session identity BEFORE the SDK send (see _lead_step). This is
         # what makes the deferred taint/orphan-recovery follow-up safe: an attempt
@@ -260,13 +271,24 @@ class Orchestrator:
             )
         )
         result = outcome.result
+        # Resolve the routing terminal transport-authoritatively: the SDK
+        # lifecycle outcome governs unless the turn reached a clean idle, in which
+        # case the role's exactly-one structured `submit_role_handoff` claim
+        # (completed vs no_progress) governs; a zero/multiple/malformed submission
+        # is a protocol failure recorded as `uncertain`, never a silent
+        # completion. Evidence/changed/remaining flow through to Lead's next
+        # solicitation so it routes on the richest available information.
+        terminal = resolve_role_terminal(
+            result, outcome.handoff, outcome.handoff_submissions
+        )
         self.disp.record_terminal(
             attempt_id,
             result.outcome,
-            evidence="",
-            changed="",
-            remaining=result.error or "",
-            reason_returned=f"sdk:{result.outcome.value}",
+            outcome_class=terminal.outcome_class,
+            evidence=terminal.evidence,
+            changed=terminal.changed,
+            remaining=terminal.remaining,
+            reason_returned=terminal.reason_returned,
         )
         self._persist_cycle()
 
@@ -377,37 +399,72 @@ class Orchestrator:
             log_path=self.ws.log_file(role, self._cycle, self.goal_label),
         )
 
-    def _role_prompt(self, role: str) -> str:
+    def _role_prompt(self, role: str, dsp) -> str:
+        """Per-attempt instruction for one dispatched non-Lead role.
+
+        This is a *single dispatched attempt*, not a fixed round-robin tick: Lead
+        chose this role, and the role returns control to Lead by submitting
+        exactly one structured handoff (there is no automatic next role). The
+        triggering dispatch reason is supplied so the role does **delta
+        discovery** first — live GitHub/repo state stays authoritative, but a full
+        re-census is the fallback when the handoff context is stale or
+        insufficient, not a mandatory step every attempt.
+        """
+        reason = (getattr(dsp, "reason", None) or "").strip()
+        delta = (
+            f"Lead dispatched you with this context: {reason}\n"
+            if reason
+            else "Lead dispatched you without extra context; discover the current delta.\n"
+        )
         return (
-            f"This is dispatch step {self._cycle}. Read the latest GitHub issues + "
-            f"comments in `{self.cfg.target.remote}` and execute your role's "
-            f"responsibilities. GOAL.md is at `{self.ws.goal_md}`. "
+            f"You are the `{role}` role, dispatched by Lead for ONE attempt on "
+            f"`{self.cfg.target.remote}`. GOAL.md is at `{self.ws.goal_md}`.\n"
+            f"{delta}"
             f"If `{self.ws.state_dir / 'inbox' / (role + '.md')}` exists, read its "
-            f"messages from the human operator FIRST, then truncate that file to "
-            f"empty. Do one tick and stop."
+            f"messages from the human operator FIRST, then move it aside per the "
+            f"inbox protocol. Use the dispatch context to check only what changed "
+            f"since the triggering handoff (delta discovery); fall back to a full "
+            f"review only if that context is stale or insufficient. Do your role's "
+            f"work for this one attempt, then return control to Lead by calling "
+            f"the `submit_role_handoff` tool EXACTLY ONCE with your structured "
+            f"outcome (outcome_class=completed|no_progress, plus evidence, "
+            f"changed, remaining, reason, and any disagreement). Do not assume a "
+            f"next role — routing is Lead's alone."
         )
 
     def _lead_prompt(self, pending: list[HandoffView]) -> str:
         ids = [h.id for h in pending]
         if pending:
-            lines = "\n".join(
-                f"  - {h.id}: role={h.role} outcome={h.outcome_class.value} "
-                f"reason={h.reason_returned}"
-                for h in pending
+            blocks = []
+            for h in pending:
+                lines = [
+                    f"  - {h.id}: role={h.role} outcome={h.outcome_class.value}",
+                    f"      reason: {h.reason_returned or '(none)'}",
+                    f"      evidence: {h.evidence or '(none)'}",
+                    f"      changed: {h.changed or '(none)'}",
+                    f"      remaining: {h.remaining or '(none)'}",
+                ]
+                blocks.append("\n".join(lines))
+            pending_block = (
+                "Pending handoffs awaiting your routing decision (each is the "
+                "structured outcome the role returned):\n"
+                + "\n".join(blocks)
+                + "\n"
             )
-            pending_block = f"Pending handoffs awaiting your routing decision:\n{lines}\n"
         else:
             pending_block = "There are no pending handoffs (this is the run's first decision).\n"
         return (
-            f"This is Lead decision step {self._cycle} for `{self.cfg.target.remote}`. "
-            f"GOAL.md is at `{self.ws.goal_md}`.\n"
+            f"You are Lead for `{self.cfg.target.remote}`. GOAL.md is at "
+            f"`{self.ws.goal_md}`.\n"
             f"{pending_block}"
-            f"Decide what happens next and submit exactly one decision via the "
-            f"`submit_lead_decision` tool. Your decision MUST acknowledge exactly "
-            f"these handoff ids: {ids}. Valid kinds: dispatch (with a configured "
-            f"role: {list(self.configured_roles)}), continue_lead, wait (with "
-            f"wake_condition), pause (with human_blocker), finish (with "
-            f"final_acceptance)."
+            f"Ground your decision in these handoffs plus any live facts you "
+            f"actually check. Decide what happens next and submit exactly one "
+            f"decision via the `submit_lead_decision` tool. Your decision MUST "
+            f"acknowledge exactly these handoff ids: {ids}. Valid kinds: dispatch "
+            f"(with a configured role: {list(self.configured_roles)}), "
+            f"continue_lead, wait (with an observable wake_condition), pause (with "
+            f"a human-only human_blocker), finish (with final_acceptance "
+            f"evidence)."
         )
 
     # ── bookkeeping ──

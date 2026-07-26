@@ -1,0 +1,13 @@
+
+## Returning control to Lead (structured handoff)
+This attempt runs **once**. When you finish your work — or determine there is nothing meaningful to do — return your outcome to Lead by calling the **`submit_role_handoff`** tool **exactly once**. This is the only channel that carries your result into Lead's next routing decision; a plain prose summary is not enough.
+
+Fields:
+- `outcome_class`: `completed` (you made meaningful progress this attempt) or `no_progress` (nothing meaningful changed).
+- `evidence`: concrete references — PR/issue numbers, commit shas, test output, command results, logs.
+- `changed`: what state you actually changed (or `none`).
+- `remaining`: what is left, or the suggested next step for Lead to route.
+- `reason`: why you are returning control now.
+- `disagreement` (optional): any concrete disagreement or blocker, reported as evidence — not a routing decision.
+
+The **transport lifecycle is authoritative**: if your attempt errors, times out, or is cancelled, it is not a completion regardless of what you claim, and **zero or multiple** `submit_role_handoff` calls are treated as an uncertain no-progress result. Call it once, keep it concise, and use real outcome names — no fixed-cycle or "tick" narration.

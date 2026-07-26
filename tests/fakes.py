@@ -12,7 +12,12 @@ import re
 from typing import Callable, Optional
 
 from crewd.dispatcher import LeadDecision
-from crewd.executor import AttemptRequest, LeadTurnOutcome, RoleAttemptOutcome
+from crewd.executor import (
+    AttemptRequest,
+    LeadTurnOutcome,
+    RoleAttemptOutcome,
+    RoleHandoff,
+)
 from crewd.session_backend import AttemptOutcome, AttemptResult
 
 _IDS_RE = re.compile(r"these handoff ids: (\[[^\]]*\])")
@@ -62,10 +67,17 @@ class FakeExecutor:
         role_outcome=AttemptOutcome.IDLE_COMPLETED,
         lead_outcome: Optional[AttemptOutcome] = None,
         block_until_cancel: bool = False,
+        role_handoff=None,
     ):
         self._lead_script = list(lead_script or [])
         self._role_outcome = role_outcome
         self._lead_outcome = lead_outcome
+        # Optional structured role handoff (models the submit_role_handoff tool):
+        # a :class:`RoleHandoff`, a dict mapping role -> RoleHandoff, or a callable
+        # ``fn(role, req) -> RoleHandoff | None``. When it yields a RoleHandoff the
+        # role tick reports exactly one submission; None models a role that
+        # submitted nothing (a protocol failure on a clean idle).
+        self._role_handoff = role_handoff
         # When set, a *role* attempt blocks until the orchestrator trips the
         # CancelToken, then returns CANCELLED_CLEAN — deterministically modelling
         # an in-flight role tick cancelled by an interrupt/operator stop. Lead
@@ -100,8 +112,13 @@ class FakeExecutor:
                 generation=0,
             )
         outcome = self._resolve_role_outcome(req)
+        handoff = self._resolve_role_handoff(req)
         return RoleAttemptOutcome(
-            result=_result(req.role, sid, outcome), session_id=sid, generation=0
+            result=_result(req.role, sid, outcome),
+            session_id=sid,
+            generation=0,
+            handoff=handoff,
+            handoff_submissions=1 if handoff is not None else 0,
         )
 
     def run_lead(self, req: AttemptRequest, *, on_started=None, cancel=None) -> LeadTurnOutcome:
@@ -137,6 +154,19 @@ class FakeExecutor:
             return ro.get(req.role, AttemptOutcome.IDLE_COMPLETED)
         return ro
 
+    def _resolve_role_handoff(self, req: AttemptRequest):
+        rh = self._role_handoff
+        if rh is None:
+            return None
+        if callable(rh):
+            try:
+                return rh(req.role, req)
+            except TypeError:
+                return rh(req.role)
+        if isinstance(rh, dict):
+            return rh.get(req.role)
+        return rh
+
 
 # ── decision-builder helpers for scripts ──
 def dispatch_to(role: str):
@@ -158,3 +188,23 @@ def pause(blocker: str = "human-blocked: need input"):
 
 def continue_lead():
     return lambda ids: LeadDecision.continue_lead(ack=tuple(ids))
+
+
+def role_handoff(
+    outcome_class: str = "completed",
+    *,
+    evidence: str = "",
+    changed: str = "",
+    remaining: str = "",
+    reason: str = "",
+    disagreement: str = "",
+) -> RoleHandoff:
+    """Build a structured role handoff for FakeExecutor's ``role_handoff``."""
+    return RoleHandoff(
+        outcome_class=outcome_class,
+        evidence=evidence,
+        changed=changed,
+        remaining=remaining,
+        reason=reason,
+        disagreement=disagreement,
+    )

@@ -30,7 +30,11 @@ def test_render_lead_agent_includes_workspace_and_repo():
     assert "Close the GOAL issue" in out
     assert "state/PAUSED" in out
     assert "human-blocked:" in out
-    assert "Do not run another idle/status-only cycle" in out
+    # Dispatcher model: Lead routes via a single typed decision, not files/ticks.
+    assert "submit_lead_decision" in out
+    assert "Lead-directed dispatcher" in out
+    assert "finish" in out and "final_acceptance" in out
+    assert "operator" in out  # operator stop distinct from finish
 
 
 def test_render_worker_warns_about_family_difference():
@@ -207,3 +211,63 @@ def test_render_goal_template():
 def test_render_unknown_template_raises():
     with pytest.raises(Exception):
         render("agents/nope.j2", workspace_name="x")
+
+
+# ── #12: dispatcher-model + structured-handoff contract in every role prompt ──
+_BASE_CTX = dict(
+    workspace_name="demo",
+    target_repo="acme/widget",
+    worker_model="gpt-5.4",
+    verifier_model="claude-opus-4.7",
+    advisory_model="gpt-5.2",
+    advisory_enabled=True,
+    worker_family="gpt",
+    verifier_family="claude",
+)
+
+
+@pytest.mark.parametrize("role", ["worker", "verifier", "advisory"])
+def test_non_lead_roles_carry_dispatch_model_and_handoff_contract(role):
+    out = render(
+        f"agents/{role}.agent.md.j2", role_name=role, role_model="m", **_BASE_CTX
+    )
+    # No fixed-cycle / round-robin language; dispatched one attempt at a time.
+    assert "Lead-directed dispatcher" in out
+    assert "one dispatched attempt" in out
+    assert "routing control returns to Lead" in out
+    assert "Do one tick and stop" not in out
+    # Structured handoff channel with the real outcome names + fields.
+    assert "submit_role_handoff" in out
+    assert "outcome_class" in out
+    assert "completed" in out and "no_progress" in out
+    assert "evidence" in out and "remaining" in out and "disagreement" in out
+    # Transport authority is stated so a role can't upgrade a failed turn.
+    assert "transport lifecycle is authoritative" in out
+    # Routing stays with Lead only.
+    assert "only Lead routes" in out
+
+
+def test_lead_prompt_describes_all_decision_kinds_and_operator_distinction():
+    out = render("agents/lead.agent.md.j2", role_name="lead", role_model="m", **_BASE_CTX)
+    for kind in ("dispatch", "continue_lead", "wait", "pause", "finish"):
+        assert kind in out
+    assert "submit_lead_decision" in out
+    assert "wake_condition" in out
+    assert "human_blocker" in out
+    assert "final_acceptance" in out
+    # Structured handoffs feed Lead's routing.
+    assert "structured handoff" in out
+    # Operator stop is distinct from Lead's finish/pause.
+    assert "operator" in out
+    assert "crewd stop" in out
+    # Lead no longer hand-writes sentinel files to pause/finish.
+    assert "you do not write" in out
+
+
+def test_no_role_prompt_uses_legacy_tick_loop_language():
+    for role in ("lead", "worker", "verifier", "advisory"):
+        out = render(
+            f"agents/{role}.agent.md.j2", role_name=role, role_model="m", **_BASE_CTX
+        )
+        assert "Do one tick and stop" not in out
+        assert "round-robin" not in out or "not a fixed round-robin" in out

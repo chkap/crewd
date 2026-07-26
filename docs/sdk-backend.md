@@ -201,6 +201,25 @@ silently fail the first permissioned op). A fail-closed handler
 (`allow_all_tools=False`) returns the typed `PermissionDecisionUserNotAvailable`
 — the same decision the SDK falls back to when no handler can satisfy a request.
 
+## Custom decision/handoff tools (`define_tool`)
+
+Two narrow custom tools carry the crew's structured control signals over the SDK,
+both registered through the **official** `copilot.define_tool(...)` API and passed
+to `create_session(tools=[...])`:
+
+- `submit_lead_decision` — Lead's single typed routing decision (#17).
+- `submit_role_handoff` — a non-Lead role's structured result to Lead: an
+  `outcome_class` (`completed` / `no_progress`) plus `evidence`, `changed`,
+  `remaining`, `reason`, and `disagreement` (#12).
+
+Both share the `_SingleSubmitCapture` **exactly-one-submission** discipline in
+`executor.py` (first well-formed submission wins; a second — sequential or
+concurrent — invalidates rather than overwrites) and both surface registration
+failure as an `SdkError` failing the turn, so a signature drift can't silently
+drop the only structured channel. The role handoff is advisory input to routing
+only: `resolve_role_terminal` keeps the SDK transport lifecycle authoritative, so
+a role cannot upgrade a failed/cancelled turn (see `docs/orchestrator.md`).
+
 ## Offline-verified SDK capability facts (`github-copilot-sdk` 1.0.8)
 
 Verified by importing the package and inspecting signatures (module name is

@@ -82,6 +82,7 @@ class SdkRoleRuntime(SdkOps):
         reasoning_effort: str | None = None,
         allow_all_tools: bool = True,
         lead_decision_capture: dict | None = None,
+        role_handoff_capture: dict | None = None,
     ) -> None:
         self.session_id = session_id
         self.role = role
@@ -98,6 +99,12 @@ class SdkRoleRuntime(SdkOps):
         # must NOT mutate any durable dispatcher state; the one consuming
         # transaction is resolve_lead_solicitation.
         self._lead_capture = lead_decision_capture
+        # When set (a non-Lead dispatched tick), the ``submit_role_handoff``
+        # custom tool records its single structured outcome into this
+        # attempt-local :class:`~crewd.executor.RoleHandoffCapture` — memory
+        # only. Same rule as the Lead capture: the handler never mutates durable
+        # dispatcher state; the one consuming transaction is record_terminal.
+        self._role_handoff_capture = role_handoff_capture
         self._loop: _LoopThread | None = None
         self._client = None  # copilot.CopilotClient
         self._session = None  # copilot.CopilotSession
@@ -134,6 +141,8 @@ class SdkRoleRuntime(SdkOps):
                 kwargs["reasoning_effort"] = self.reasoning_effort
             if self._lead_capture is not None:
                 self._add_lead_decision_tool(copilot, kwargs)
+            if self._role_handoff_capture is not None:
+                self._add_role_handoff_tool(copilot, kwargs)
             if resume:
                 self._session = self._loop.run(
                     self._client.resume_session(self.session_id, **_drop(kwargs, "session_id"))
@@ -267,6 +276,24 @@ class SdkRoleRuntime(SdkOps):
         if self._lead_capture is None:
             return
         tool = make_lead_decision_tool(copilot_mod, self._lead_capture)
+        kwargs.setdefault("tools", []).append(tool)
+
+    def _add_role_handoff_tool(self, copilot_mod, kwargs: dict) -> None:
+        """Register the ``submit_role_handoff`` custom tool for a dispatched role.
+
+        Parallel to :meth:`_add_lead_decision_tool`: built through the official
+        ``define_tool`` API and passed via ``tools=[...]``. The handler ONLY
+        records the (untrusted) structured outcome into the attempt-local capture
+        — it never touches durable dispatcher state; the single consuming
+        transaction is :meth:`crewd.dispatcher.Dispatcher.record_terminal`.
+
+        Registration failure is **not** swallowed: it propagates to :meth:`open`
+        as an :class:`SdkError`, so a signature drift can never silently drop the
+        role's only structured-return channel and let a hollow completion pass.
+        """
+        if self._role_handoff_capture is None:
+            return
+        tool = make_role_handoff_tool(copilot_mod, self._role_handoff_capture)
         kwargs.setdefault("tools", []).append(tool)
 
     def _teardown_loop(self) -> None:
@@ -424,6 +451,99 @@ def make_lead_decision_tool(copilot_mod, capture):
     return copilot_mod.define_tool(
         "submit_lead_decision",
         description=_LEAD_TOOL_DESCRIPTION,
+        handler=handler,
+        params_type=params_type,
+    )
+
+
+# ── submit_role_handoff custom tool (official define_tool API) ──
+_ROLE_HANDOFF_DESCRIPTION = (
+    "Return your structured outcome to Lead for THIS dispatched attempt. Call "
+    "this tool EXACTLY ONCE before you finish. Fields: outcome_class (one of "
+    "'completed' = you made meaningful progress, or 'no_progress' = nothing "
+    "meaningful changed this attempt); evidence (concrete references — PR/issue "
+    "numbers, commit shas, test output, logs); changed (what state you changed, "
+    "or 'none'); remaining (what is left / the suggested next step); reason (why "
+    "you are returning control to Lead now); disagreement (optional — any "
+    "concrete disagreement or blocker, reported as evidence, not a routing "
+    "decision). Routing stays with Lead; the transport lifecycle overrides any "
+    "success claim if the turn errored, timed out, or was cancelled."
+)
+
+
+def _role_handoff_params_model():
+    """Build the Pydantic params model for the submit_role_handoff tool."""
+    from typing import Optional
+
+    from pydantic import BaseModel, Field
+
+    class SubmitRoleHandoffParams(BaseModel):
+        outcome_class: str = Field(
+            description="one of: completed, no_progress"
+        )
+        evidence: Optional[str] = Field(
+            default=None, description="concrete references (PRs, commits, test output)"
+        )
+        changed: Optional[str] = Field(
+            default=None, description="what state changed, or 'none'"
+        )
+        remaining: Optional[str] = Field(
+            default=None, description="remaining work / suggested next step"
+        )
+        reason: Optional[str] = Field(
+            default=None, description="why control is returning to Lead now"
+        )
+        disagreement: Optional[str] = Field(
+            default=None, description="optional concrete disagreement/blocker (evidence, not routing)"
+        )
+
+    return SubmitRoleHandoffParams
+
+
+def make_role_handoff_handler(capture):
+    """Return the inner ``(params, invocation) -> result`` handler.
+
+    Records the structured outcome into ``capture`` (a
+    :class:`~crewd.executor.RoleHandoffCapture`) enforcing exactly-one
+    submission; never mutates durable dispatcher state. A second call is rejected
+    with a typed error while the capture still records that multiple calls
+    occurred, so a double-submit resolves as a protocol failure (uncertain).
+    """
+
+    def _handler(params, invocation=None):
+        if hasattr(params, "model_dump"):
+            payload = params.model_dump()
+        elif isinstance(params, dict):
+            payload = dict(params)
+        else:  # pragma: no cover - defensive; SDK passes a pydantic model
+            payload = {
+                k: getattr(params, k)
+                for k in dir(params)
+                if not k.startswith("_") and not callable(getattr(params, k))
+            }
+        accepted = capture.submit(payload)
+        if not accepted:
+            return {
+                "accepted": False,
+                "error": "exactly one submit_role_handoff call is allowed per attempt",
+            }
+        return {"accepted": True}
+
+    return _handler
+
+
+def make_role_handoff_tool(copilot_mod, capture):
+    """Build the ``submit_role_handoff`` ``Tool`` via the official SDK API.
+
+    Uses ``copilot.define_tool(...)`` — the same documented surface as
+    ``submit_lead_decision`` — so an SDK signature drift fails loudly here
+    instead of silently dropping the role's structured-return channel.
+    """
+    handler = make_role_handoff_handler(capture)
+    params_type = _role_handoff_params_model()
+    return copilot_mod.define_tool(
+        "submit_role_handoff",
+        description=_ROLE_HANDOFF_DESCRIPTION,
         handler=handler,
         params_type=params_type,
     )

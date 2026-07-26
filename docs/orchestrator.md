@@ -97,6 +97,32 @@ candidate only when `count == 1`; `count == 0` or `count > 1` resolves as an
 invalid solicitation with handoffs retained.
 
 
+## Role handoff channel (`submit_role_handoff`) (#12)
+
+Non-Lead roles return structured evidence to Lead through a second narrow SDK
+custom tool, `submit_role_handoff` (`sdk_adapter.make_role_handoff_tool`), built
+with the same official `copilot.define_tool(...)` API and reusing the shipped
+**exactly-one-submission** capture discipline (`RoleHandoffCapture`, a
+`_SingleSubmitCapture` sibling of `LeadDecisionCapture`). The handler records an
+untrusted candidate `{outcome_class, evidence, changed, remaining, reason,
+disagreement}`; it never mutates durable state. Zero, multiple, or malformed
+submissions make the payload invalid rather than silently picking one.
+
+**Transport lifecycle is authoritative.** `resolve_role_terminal` in
+`executor.py` decides the durable outcome, not the role's self-report: if the SDK
+lifecycle outcome is anything other than a clean `idle_completed`, that outcome
+classifies the terminal (`reason_returned="sdk:<value>"`) and a role can never
+upgrade a failed/cancelled/errored turn to `completed`. Only on a clean idle with
+**exactly one** well-formed submission does the role's own `completed` /
+`no_progress` class stand. Zero/multiple/malformed on a clean idle resolves to
+`HandoffOutcome.UNCERTAIN` (`reason_returned` prefixed
+`role_protocol_failure:`), which is unproductive and so counts toward the
+no-progress thrash bound. The evidence/changed/remaining fields are threaded
+through `record_terminal` into the dispatch journal regardless, and rendered
+verbatim into Lead's next solicitation prompt so routing is grounded in the
+role's actual report. `disagreement` is carried as evidence inside the reason —
+never as routing authority.
+
 ## Signals / operator controls & in-flight cancellation
 
 Each attempt runs on a short-lived **worker thread** while the main loop polls

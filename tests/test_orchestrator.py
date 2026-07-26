@@ -23,6 +23,7 @@ from fakes import (
     dispatch_to,
     finish,
     pause,
+    role_handoff,
     wait,
 )
 
@@ -461,3 +462,86 @@ def test_restart_recovery_is_idempotent(tmp_ws: Workspace):
     # The orphan was only in `started` on the first pass, so tainted once.
     assert calls == ["orphan-2"]
     disp.close()
+
+
+# ── #12: structured role handoff survives into SQLite + next Lead prompt ──
+def _handoff_rows(tmp_ws: Workspace) -> list[dict]:
+    """Read the durable handoff rows straight from the run DB (out of band)."""
+    import sqlite3
+
+    con = sqlite3.connect(tmp_ws.state_dir / "dispatch.db")
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(
+            "SELECT role, outcome_class, evidence, changed, remaining, reason_returned "
+            "FROM handoff ORDER BY created_at"
+        )]
+    finally:
+        con.close()
+
+
+def test_role_handoff_payload_survives_to_sqlite_and_next_lead_prompt(tmp_ws: Workspace):
+    # The strongest oracle for #12: a role's structured tool payload must be
+    # journaled verbatim in SQLite AND rendered verbatim in Lead's next
+    # solicitation prompt — rendering assertions alone are too weak.
+    hp = role_handoff(
+        "completed",
+        evidence="PR #42 green; 12 tests",
+        changed="added dispatcher kernel",
+        remaining="wire docs",
+        reason="ready for verifier",
+    )
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")], role_handoff=hp
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+
+    # 1) Durable in SQLite as a productive completion with the role's fields.
+    rows = _handoff_rows(tmp_ws)
+    worker_rows = [r for r in rows if r["role"] == "worker"]
+    assert len(worker_rows) == 1
+    wr = worker_rows[0]
+    assert wr["outcome_class"] == "completed"
+    assert wr["evidence"] == "PR #42 green; 12 tests"
+    assert wr["changed"] == "added dispatcher kernel"
+    assert wr["remaining"] == "wire docs"
+    assert wr["reason_returned"] == "ready for verifier"
+
+    # 2) Verbatim in Lead's next solicitation prompt (the finish turn).
+    assert len(fake.lead_calls) == 2
+    prompt = fake.lead_calls[1].prompt
+    assert "PR #42 green; 12 tests" in prompt
+    assert "added dispatcher kernel" in prompt
+    assert "wire docs" in prompt
+    assert "ready for verifier" in prompt
+
+
+def test_role_no_handoff_on_clean_idle_records_uncertain(tmp_ws: Workspace):
+    # A role that returns a clean idle without a structured handoff must NOT be
+    # recorded as a completion — it is an `uncertain` protocol failure.
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")], role_handoff=None
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+    worker_rows = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"]
+    assert len(worker_rows) == 1
+    assert worker_rows[0]["outcome_class"] == "uncertain"
+    assert "role_protocol_failure" in worker_rows[0]["reason_returned"]
+
+
+def test_transport_error_overrides_role_success_claim_end_to_end(tmp_ws: Workspace):
+    # Role shapes a "completed" handoff but the transport actually errored — the
+    # durable handoff must be `failed`, not `completed`.
+    hp = role_handoff("completed", evidence="I did it")
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), finish("accepted")],
+        role_outcome=AttemptOutcome.SDK_ERROR,
+        role_handoff=hp,
+    )
+    orch = _orch(tmp_ws, fake)
+    assert orch.run(once=False) == 0
+    worker_rows = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"]
+    assert worker_rows[0]["outcome_class"] == "failed"
+    assert worker_rows[0]["reason_returned"] == "sdk:sdk_error"
