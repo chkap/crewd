@@ -261,6 +261,7 @@ src/crewd/
 SKILL.md                — instructions for AI agents operating crewd
 docs/
   retrospective-orchestration.md — evidence baseline for the SDK-native, Lead-directed refactor
+  sdk-backend.md                 — SDK-native role backend: transport decision, lifecycle SM, capability facts
 ```
 
 ---
@@ -270,5 +271,8 @@ docs/
 - [`docs/retrospective-orchestration.md`](docs/retrospective-orchestration.md) — evidence-led
   retrospective of prior crew histories. Establishes the orchestration, prompt, observability,
   and recovery requirements that the SDK-native, Lead-directed refactor is built against.
+- [`docs/sdk-backend.md`](docs/sdk-backend.md) — SDK-native role backend (`backend: copilot-sdk`):
+  transport decision (per-role stdio), the one-attempt lifecycle state machine, offline-verified
+  `github-copilot-sdk` capability facts, open capability risks, and the bounded live-smoke procedure.
 
 License: internal / unreleased.

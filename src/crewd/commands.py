@@ -706,6 +706,8 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
         timeout=role_cfg.per_tick_timeout or cfg.loop.per_tick_timeout,
         cwd=cwd,
         first_run=first_run,
+        goal_label=goal_label,
+        workspace_root=ws.root,
     )
     if rc != 0:
         console.print(f"    [yellow]{role} exited rc={rc}[/]")

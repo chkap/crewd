@@ -94,6 +94,9 @@ def test_cmd_run_once_walks_all_roles(tmp_ws: Workspace, monkeypatch):
     assert rc == 0
     # All four roles ticked exactly once in round-table order
     assert [c["role"] for c in backend.calls] == ["lead", "advisory", "worker", "verifier"]
+    # goal_label + workspace_root are threaded to the backend boundary.
+    assert all(c["goal_label"] == "goal:v1" for c in backend.calls)
+    assert all(c["workspace_root"] == tmp_ws.root for c in backend.calls)
     # Cycle counter advanced
     assert tmp_ws.read_cycle() == 1
     assert (tmp_ws.state_dir / "logs" / "goal-v1" / "lead" / "0001.log").exists()
@@ -309,7 +312,7 @@ class _StubBackend:
     def doctor(self) -> list[str]:
         return [] if self._healthy else ["stub backend forced unhealthy"]
 
-    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run):
+    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs):
         self.calls.append({
             "role": role,
             "model": model,
@@ -317,6 +320,8 @@ class _StubBackend:
             "first_run": first_run,
             "prompt_len": len(prompt),
             "cycle_arg": log_path.stem,
+            "goal_label": kwargs.get("goal_label"),
+            "workspace_root": kwargs.get("workspace_root"),
         })
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(f"stub run for {role}\n")
@@ -329,9 +334,9 @@ class _PausingBackend(_StubBackend):
     def __init__(self):
         super().__init__(healthy=True)
 
-    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run):
+    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs):
         rc = super().run_role(
-            role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run
+            role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs
         )
         if role == "lead":
             ws_root = config_dir.parent.parent
