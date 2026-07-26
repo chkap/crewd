@@ -16,6 +16,13 @@ dependencies = [
 [project.scripts]
 crewd = "crewd.cli:app"
 
+[project.optional-dependencies]
+# Official Copilot SDK backend (backend: copilot-sdk). Optional so the default
+# `copilot` CLI backend keeps working without pulling the SDK. See docs/sdk-backend.md.
+sdk = [
+    "github-copilot-sdk>=1.0.8",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

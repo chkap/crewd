@@ -80,7 +80,7 @@ class CrewConfig(BaseModel):
     goal_file: str = "./GOAL.md"
     roles: dict[str, RoleConfig]
     loop: LoopConfig = Field(default_factory=LoopConfig)
-    backend: Literal["copilot"] = "copilot"
+    backend: Literal["copilot", "copilot-sdk"] = "copilot"
     # Extra host directories (beyond the workspace + role worktree) that every
     # role's agent is granted file access to via the backend's --add-dir flag.
     # Use this to expose deployment checkouts, persistent data dirs, or other

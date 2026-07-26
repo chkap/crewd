@@ -121,7 +121,45 @@ class CopilotBackend:
                 return 124
 
 
+class SdkBackend:
+    """SDK-native execution boundary (official ``github-copilot-sdk``).
+
+    This is the new backend introduced by #10. It exposes the same ``doctor`` /
+    ``run_role`` shape as :class:`CopilotBackend` so config loading, preflight,
+    and the CLI keep working when ``backend: copilot-sdk`` is selected.
+
+    Per Lead's direction on #10, this PR establishes the SDK capability facts,
+    the transport decision, and the fakeable adapter/state-machine seam
+    (:mod:`crewd.session_backend`, :mod:`crewd.sdk_adapter`) *before* coupling
+    the round-table tick loop to it. Wiring ``run_role`` onto the persisted
+    Lead-directed dispatcher is the subject of #11, so calling it here raises a
+    clear, actionable error rather than silently driving `copilot -p`.
+    """
+
+    name = "copilot-sdk"
+
+    def doctor(self) -> list[str]:
+        from .sdk_adapter import sdk_available
+
+        errs = []
+        if not sdk_available():
+            errs.append(
+                "`github-copilot-sdk` (import `copilot`) not installed. "
+                "Add it to the environment to use backend: copilot-sdk."
+            )
+        return errs
+
+    def run_role(self, *args, **kwargs) -> int:  # pragma: no cover - intentional guard
+        raise NotImplementedError(
+            "backend 'copilot-sdk' is not yet wired into the tick loop; the "
+            "persisted Lead-directed dispatcher that consumes the SDK session "
+            "boundary is tracked in #11. Use backend: copilot until then."
+        )
+
+
 def get_backend(name: str) -> Backend:
     if name == "copilot":
         return CopilotBackend()
+    if name == "copilot-sdk":
+        return SdkBackend()
     raise ValueError(f"unknown backend: {name}")

@@ -45,3 +45,35 @@ def test_save_load_roundtrip(tmp_path: Path):
     assert loaded.target.repo == "./repo"
     assert loaded.loop.sleep_secs == 30
     assert loaded.roles["worker"].family == "gpt"
+
+
+def test_backend_accepts_copilot_sdk_literal(tmp_path: Path):
+    cfg = default_config("demo")
+    cfg.backend = "copilot-sdk"
+    p = tmp_path / "crew.yaml"
+    cfg.save(p)
+    assert CrewConfig.load(p).backend == "copilot-sdk"
+
+
+def test_get_backend_returns_sdk_backend():
+    from crewd.backends import SdkBackend, get_backend
+
+    b = get_backend("copilot-sdk")
+    assert isinstance(b, SdkBackend)
+    assert b.name == "copilot-sdk"
+    # doctor() must run without importing/launching a runtime.
+    assert isinstance(b.doctor(), list)
+
+
+def test_sdk_backend_run_role_defers_to_issue_11():
+    from crewd.backends import get_backend
+
+    with pytest.raises(NotImplementedError):
+        get_backend("copilot-sdk").run_role()
+
+
+def test_get_backend_unknown_still_raises():
+    from crewd.backends import get_backend
+
+    with pytest.raises(ValueError):
+        get_backend("nope")
