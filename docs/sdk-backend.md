@@ -1,13 +1,14 @@
 # SDK-native role backend (`backend: copilot-sdk`)
 
-Status: **operational for a single-role tick (#10)**. Selecting
-`backend: copilot-sdk` runs a role through a real Copilot **session** via the
-adapter + attempt state machine and maps the typed outcome back to the legacy
-exit code. Replacing fixed round-table scheduling and consuming the richer
-persisted handoffs is #11 (which reads the `<log>.attempt.json` sidecar this
-backend writes, rather than reconstructing lifecycle meaning from exit codes).
+Status: **shipped and default.** Selecting `backend: copilot-sdk` (the default)
+runs every role through a real Copilot **session** via the adapter + attempt
+state machine, and the Lead-directed dispatcher (#11) and orchestrator loop
+(#17) consume the richer persisted handoffs — reading the `<log>.attempt.json`
+sidecar this backend writes rather than reconstructing lifecycle meaning from
+exit codes. The fixed round-table scheduler has been removed; see
+`docs/orchestrator.md` and `docs/dispatcher.md`.
 
-It is the design baseline for replacing the `copilot -p` subprocess backend
+It replaces the retired `copilot -p` subprocess backend
 (`crewd.backends.CopilotBackend`) with the official
 [`github-copilot-sdk`](https://pypi.org/project/github-copilot-sdk/) programmatic
 session API, per requirements **R4–R6** in
@@ -180,14 +181,13 @@ Any requested `add_dir` (e.g. a configured `extra_add_dirs` entry) that is **not
 under the workspace root** genuinely cannot be mounted. Rather than log a warning
 and run the role without required context, `run_role` **refuses to start the
 attempt** (`PRE-EXECUTION ERROR`, exit code 1) and names the offending paths.
-Fix: move the path under the workspace, or keep `backend: copilot` for cross-dir
-roles.
+Fix: move the path under the workspace root. (There is no `backend: copilot`
+fallback for cross-dir roles — that backend is retired.)
 
-> Open verification (live-smoke): confirm that `working_directory = workspace
-> root` + `config_directory = role config dir` still auto-loads only the
-> intended role `AGENTS.md`/instructions and does not weaken role write
-> isolation. Until verified live, we do **not** substitute symlinks or a
-> narrower working dir.
+> Verified live (see live-smoke below): `working_directory = workspace root` +
+> `config_directory = role config dir` auto-loads only the intended role
+> `AGENTS.md`/instructions and preserves role write isolation. We do **not**
+> substitute symlinks or a narrower working dir.
 
 ### Tool-permission compatibility policy
 
@@ -240,7 +240,11 @@ Verified by importing the package and inspecting signatures (module name is
   `session.disconnect()`.
 - Default transport = SDK-owned child stdio (`StdioRuntimeConnection`).
 
-## Open capability risks (need the live experiment)
+## Capability risks (resolved by the live smoke)
+
+These were the open risks before a real runtime was available; the integrated
+live smoke (below) now exercises each one. They are retained here as the
+rationale for the current implementation.
 
 1. **No `--add-dir` equivalent** (see mounting policy above). Required workspace
    paths are covered by mounting the workspace root; genuinely out-of-workspace
@@ -258,32 +262,51 @@ Verified by importing the package and inspecting signatures (module name is
    "turn idle" / "aborted" vs. "still working" must be pinned against a real
    runtime; `_is_abort_or_idle_event` currently matches tolerantly by type name.
 
-## Live-smoke procedure (bounded, run manually with auth)
+## Live-smoke procedure (bounded, integrated + capability probe)
 
-The SDK downloads and launches a runtime binary that needs network, a writable
-home, and Copilot auth. That is **sandbox-blocked** in CI/agent environments, so
-this is a manual, bounded checklist — not an automated test:
+`scripts/live_smoke.py` is the bounded, self-cleaning harness that proves this
+backend against a **real** Copilot runtime. It needs network, a writable home,
+and Copilot auth, so it is **not** part of the default deterministic suite; it is
+gated behind `CREWD_LIVE_SMOKE=1` in `tests/test_live_smoke.py` (skipped
+otherwise) and can be run directly. Two distinct levels:
 
-1. Install the extra: `uv pip install -e '.[sdk]'` in an environment with
-   Copilot auth configured.
-2. Smoke a trivial turn:
-   ```python
-   import asyncio
-   from copilot import CopilotClient
-   async def main():
-       c = CopilotClient(working_directory=".")
-       await c.start()
-       s = await c.create_session(model="claude-sonnet-4.6")
-       ev = await s.send_and_wait("Reply with the single word: ok", timeout=60)
-       print("idle (no exception) events:", len(await s.get_events()))
-       await s.disconnect(); await c.stop()
-   asyncio.run(main())
-   ```
-3. Resolve each open risk above and record findings back into this file:
-   - the concrete idle/working/abort `SessionEvent` types (then tighten
-     `_is_abort_or_idle_event` and consider the pre-registered idle latch),
-   - whether `abort()` needs an idle poll or exposes a waitable,
-   - the `extra_add_dirs` answer.
+**1. Capability probe (lower-level, isolated).** A single `send_and_wait` turn
+against a fresh session — proves only that the runtime starts, reaches idle, and
+disconnects cleanly. It says nothing about the crewd integration:
+
+```bash
+uv run --active python scripts/live_smoke.py --probe-only
+```
+
+**2. Integrated smoke (the real proof).** Drives the *production* stack — durable
+`Dispatcher` journal, the real `Orchestrator` run loop, `SdkAttemptExecutor` /
+`sdk_adapter`, goal-scoped `SessionRegistry` / `TaintStore`, and the read-only
+`diagnostics` surface — in a disposable workspace, overriding only the two prompt
+builders with trivial "call your one typed tool once" instructions:
+
+```bash
+uv run --active python scripts/live_smoke.py --out /tmp/smoke-manifest.json
+```
+
+It emits a **sanitized** JSON manifest (crewd IDs, outcomes, counts, booleans —
+never transcripts, prompts, tool args, or credentials) and exits non-zero unless
+every required check passes. The phases and their required outcomes:
+
+| Phase | Proves |
+| ----- | ------ |
+| `capability_probe` | runtime start → idle → clean disconnect; SDK events observed |
+| `integrated_routing` | Lead `dispatch` → Worker exactly-one `completed` handoff → Lead `finish`; handoff round-trips into the next Lead solicitation (`consumed_by_dispatch_id`); isolated goal-scoped role sessions (gen 0); pre-send journal identity; run reaches `finished` |
+| `status_projection` | `crewd status` projection: `finished` → `NEW_GOAL`; bounded handoff redaction on the surface |
+| `session_lifecycle` | same-session resume by id; taint advances to a fresh generation + new session id |
+| `external_cancellation` | a `CancelToken` requested mid-attempt classifies as `cancelled_clean` **or** `tainted` — **never** `idle_completed` |
+| `shutdown` | no surviving daemon PID; disposable workspace removed |
+
+The three former open capability risks are resolved by this run and no longer
+open: `extra_add_dirs` fails closed with workspace-root mounting confirmed live;
+abort-confirmation polls durable history without starting a new turn and
+classifies clean-or-tainted; idle/abort event detection is exercised end to end.
+Re-run after any change to the executor, adapter, session backend, or
+orchestrator, and attach the sanitized manifest as evidence.
 
 ## Config
 

@@ -2,7 +2,7 @@
 
 > Multi-agent coding crew CLI — **Lead / Worker / Verifier / Advisory** running as separate Copilot CLI sessions, with GitHub Issues as the message bus.
 
-`crewd` packages a multi-role autonomous coding crew into a reusable CLI. The core loop is **Lead / Worker / Verifier**, with **Advisory as an optional fourth role** when you want proactive research and tradeoff analysis. Each role is a `gh copilot` session with its own `COPILOT_HOME` (pointed at `cfg/<role>/`, so its config + conversation are independent and resumable), a per-role `agent.md` describing responsibilities, and a fixed-order round-table loop that ticks each configured role once per cycle in this order: **Lead → Advisory → Worker → Verifier**.
+`crewd` packages a multi-role autonomous coding crew into a reusable CLI. The roles are **Lead / Worker / Verifier**, with **Advisory as an optional fourth role** when you want proactive research and tradeoff analysis. Each role runs as an official **GitHub Copilot SDK session** (`backend: copilot-sdk`) with its own `config_directory` (pointed at `cfg/<role>/`, so its config + conversation are independent and resumable) and a per-role `agent.md` describing responsibilities. There is **no fixed round-robin**: the **Lead dynamically directs the crew** via a durable dispatcher. Each cycle the Lead is solicited and returns exactly one typed decision (`dispatch` a role, `continue_lead`, `wait`, `pause`, or `finish`); a dispatched role runs one attempt and returns exactly one typed handoff (`completed` / `no_progress`) that feeds the Lead's next decision. All dispatches, attempts, and handoffs are journaled to a SQLite run log for restart-safe, at-least-once, idempotent recovery.
 
 The roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
 
@@ -181,7 +181,7 @@ loop:
   sleep_secs: 60
   per_tick_timeout: 900       # default per-role timeout
   max_cycles: 0               # 0 = forever
-backend: copilot              # only backend currently
+backend: copilot-sdk          # official GitHub Copilot SDK sessions (default; legacy `copilot` is retired)
 extra_add_dirs:               # optional: extra host dirs every role can access
   - /home/me/web-deploy       #   (deploy checkouts, persistent data dirs, …)
   - ../shared-data            #   relative entries resolve against the workspace
@@ -215,7 +215,7 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 
 **Graceful shutdown**
 
-`run` installs `SIGINT` / `SIGTERM` handlers that finish the current tick and then write `state/exit-reason`. Send a second signal to abort hard. Backend itself escalates `SIGINT → SIGTERM → SIGKILL` to copilot subprocesses.
+`run` installs `SIGINT` / `SIGTERM` handlers that finish the current attempt and then write `state/exit-reason`. Send a second signal to abort hard. Mid-attempt, the orchestrator requests a single non-blocking `CancelToken` abort of the in-flight SDK session; if the abort cannot be confirmed idle, that session is tainted and force-stopped so the next run starts a fresh generation rather than resuming a dirty session.
 
 ---
 
@@ -224,7 +224,7 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 | Symptom                                                       | Fix                                                                                |
 | ------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `STOPPED` present at cycle 0 (doctor flags it)                | `crewd resume && crewd run`                                                        |
-| Copilot `--continue` fails with `CAPIError 400`               | `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-run (fresh session). |
+| Copilot session resume fails (`CAPIError 400` / broken session-state)         | Rare — a tainted session auto-advances to a fresh generation on the next run. To force it, `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-run. |
 | `family check: worker.family == verifier.family`              | Edit `crew.yaml` so they differ; rerun.                                            |
 | `target repo clone missing`                                   | `crewd attach <owner/repo> --clone`                                                |
 | `GOAL.md changed since goal vN started`                       | `crewd new-goal --from GOAL.md` to start a new epoch.                              |
@@ -234,7 +234,7 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 
 ## Status
 
-- Backend: **GitHub Copilot CLI only** (`gh copilot`).
+- Backend: **official GitHub Copilot SDK** (`backend: copilot-sdk`, default). The legacy `gh copilot` subprocess backend is retired — selecting `backend: copilot` fails with a migration error.
 - Tested on Linux (Azure VM). Templates live in `src/crewd/templates/agents/*.j2`.
 - See `tests/` for unit coverage; integration testing is via dogfooding on real repos.
 
@@ -248,7 +248,13 @@ src/crewd/
   commands.py           — command implementations
   config.py             — pydantic schema for crew.yaml + GoalState
   workspace.py          — path layout + sentinels
-  backends.py           — copilot subprocess + signal escalation
+  orchestrator.py       — Lead-directed run loop (replaces round-robin); pre-send journal identity + cancellable attempts
+  dispatcher.py         — durable SQLite run journal (dispatch/attempt/handoff/solicitation), restart-safe reconcile
+  executor.py           — SdkAttemptExecutor: runs one role/lead attempt → typed handoff/decision + durable log
+  sdk_adapter.py        — official Copilot SDK runtime + typed tools (submit_lead_decision / submit_role_handoff)
+  session_backend.py    — session registry, goal-scoped ids + generations, CancelToken, taint store, outcomes
+  diagnostics.py        — read-only operator status surface (snapshot + safe next action, bounded redaction)
+  backends.py           — thin SdkBackend exit-code adapter (retires legacy `copilot` with a migration error)
   registry.py           — user-level workspace registry (~/.crewd/registry.json)
   templates_render.py   — jinja2 helpers
   templates/
@@ -262,6 +268,10 @@ SKILL.md                — instructions for AI agents operating crewd
 docs/
   retrospective-orchestration.md — evidence baseline for the SDK-native, Lead-directed refactor
   sdk-backend.md                 — SDK-native role backend: transport decision, lifecycle SM, capability facts
+  dispatcher.md                  — durable dispatch journal: schema, invariants, restart reconciliation
+  orchestrator.md                — Lead-directed run loop, cancellation, operator diagnostics
+scripts/
+  live_smoke.py                  — bounded integrated live SDK smoke (see docs/sdk-backend.md)
 ```
 
 ---
@@ -274,5 +284,9 @@ docs/
 - [`docs/sdk-backend.md`](docs/sdk-backend.md) — SDK-native role backend (`backend: copilot-sdk`):
   transport decision (per-role stdio), the one-attempt lifecycle state machine, offline-verified
   `github-copilot-sdk` capability facts, open capability risks, and the bounded live-smoke procedure.
+- [`docs/dispatcher.md`](docs/dispatcher.md) — durable dispatch kernel: journal schema, exclusive
+  Lead authority, at-least-once idempotent handoffs, restart reconciliation, and schema migration.
+- [`docs/orchestrator.md`](docs/orchestrator.md) — Lead-directed run loop: exit reasons, pre-send
+  journal identity, the exactly-one typed channel, mid-attempt cancellation, and operator diagnostics.
 
 License: internal / unreleased.
