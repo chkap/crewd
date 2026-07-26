@@ -679,3 +679,177 @@ def test_solicitation_wait_sets_status(tmp_path):
     assert got.status is RunStatus.WAITING
     assert got.routing_authority == LEAD_PENDING
     assert got.wake_condition == "upstream merge"
+
+
+# ────────── solicitation handoff-suppression audit (#18 review) ──────────
+def test_record_terminal_rejects_solicitation_attempt(tmp_path):
+    """record_terminal must never terminalize a Lead solicitation (would emit a
+    role='lead' handoff and bypass candidate validation/nonce/invalid-counter)."""
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    with pytest.raises(DecisionError):
+        disp.record_terminal(sol.attempt_id, AttemptOutcome.IDLE_COMPLETED, evidence="x")
+    # No handoff created, attempt still in-flight (untouched), resolvable normally.
+    assert disp.pending_handoffs(run.id) == []
+    assert disp.get_attempt(sol.attempt_id).state is AttemptState.RESERVED
+    disp.resolve_lead_solicitation(sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+                                   decision=LeadDecision.continue_lead(), configured_roles=ROLES)
+
+
+def _lead_handoffs(disp, run_id):
+    return [h for h in disp.export_run(run_id)["handoffs"] if h["role"] == "lead"]
+
+
+def test_solicited_decision_guard_trip_emits_no_lead_handoff(tmp_path):
+    """A thrash guard reached while applying a solicited continue_lead must pause
+    without a synthetic role='lead' handoff for the solicitation attempt."""
+    disp = _open(tmp_path, max_edge_repeats=1, max_consecutive_unproductive=0)
+    run = disp.start_or_resume_run("goal:v1")
+    s1 = disp.open_lead_solicitation(run.id)
+    disp.resolve_lead_solicitation(s1.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+                                   decision=LeadDecision.continue_lead(), configured_roles=ROLES)
+    s2 = disp.open_lead_solicitation(run.id)
+    res = disp.resolve_lead_solicitation(s2.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+                                         decision=LeadDecision.continue_lead(), configured_roles=ROLES)
+    assert res.guard_tripped
+    assert disp.get_run(run.id).status is RunStatus.PAUSED
+    assert _lead_handoffs(disp, run.id) == []
+    assert disp.pending_handoffs(run.id) == []
+
+
+def test_solicited_dispatch_guard_trip_attaches_to_role_attempt_not_lead(tmp_path):
+    """When a real role attempt exists, the thrash synthetic handoff attaches to
+    it (non-Lead evidence) — never to the Lead solicitation attempt."""
+    disp = _open(tmp_path, max_edge_repeats=2)
+    run = disp.start_or_resume_run("goal:v1")
+    # Two worker completions build the 'worker' edge repeat count to the cap.
+    d1 = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    _drive(disp, run.id, d1.dispatch.id, "worker", AttemptOutcome.IDLE_COMPLETED)
+    d2 = disp.lead_decide(run.id, LeadDecision.dispatch(
+        "worker", ack=(disp.pending_handoffs(run.id)[0].id,)), configured_roles=ROLES)
+    _drive(disp, run.id, d2.dispatch.id, "worker", AttemptOutcome.IDLE_COMPLETED)
+    # Now solicit and have Lead route to 'worker' again → edge repeat guard trips.
+    sol = disp.open_lead_solicitation(run.id)
+    res = disp.resolve_lead_solicitation(
+        sol.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.dispatch("worker", ack=(disp.pending_handoffs(run.id)[0].id,)),
+        configured_roles=ROLES)
+    assert res.guard_tripped
+    assert _lead_handoffs(disp, run.id) == []  # no Lead handoff ever
+    thrash = [h for h in disp.export_run(run.id)["handoffs"]
+              if h["reason_returned"] == "thrash_guard"]
+    assert thrash and all(h["role"] == "worker" for h in thrash)
+
+
+@pytest.mark.parametrize("outcome,decision", [
+    (AttemptOutcome.IDLE_COMPLETED, "clean"),
+    (AttemptOutcome.IDLE_COMPLETED, None),          # invalid: no decision
+    (AttemptOutcome.ABORTED_CLEAN, "clean"),        # timed-out turn
+    (AttemptOutcome.SDK_ERROR, "clean"),            # errored turn
+    (AttemptOutcome.TAINTED, "clean"),              # tainted turn
+])
+def test_no_lead_handoff_across_solicitation_outcomes(tmp_path, outcome, decision):
+    disp = _open(tmp_path, max_invalid_solicitations=0)  # never auto-pause; isolate handoff check
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    dec = LeadDecision.continue_lead() if decision == "clean" else None
+    disp.resolve_lead_solicitation(sol.attempt_id, outcome=outcome, decision=dec,
+                                   configured_roles=ROLES)
+    assert _lead_handoffs(disp, run.id) == []
+
+
+def test_no_lead_handoff_on_restart_reconciled_solicitation(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    disp.mark_started(sol.attempt_id, session_id="s", generation=0)
+    disp.close()
+    disp2 = _open(tmp_path)
+    disp2.reconcile_on_restart(run.id)
+    assert [h for h in disp2.export_run(run.id)["handoffs"] if h["role"] == "lead"] == []
+
+
+# ────────── in-place migration of a merged-#11 database (#18 review) ──────────
+_OLD_GOAL_RUN = """
+CREATE TABLE goal_run (
+    id TEXT PRIMARY KEY, goal_label TEXT NOT NULL, status TEXT NOT NULL,
+    routing_authority TEXT NOT NULL, reserved_slots INTEGER NOT NULL DEFAULT 0,
+    consecutive_unproductive INTEGER NOT NULL DEFAULT 0, last_edge TEXT,
+    last_edge_repeats INTEGER NOT NULL DEFAULT 0, wake_condition TEXT, human_blocker TEXT,
+    created_at TEXT NOT NULL);
+CREATE TABLE dispatch (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,
+    kind TEXT NOT NULL, role TEXT, reason TEXT, created_at TEXT NOT NULL);
+CREATE TABLE attempt (id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL,
+    role TEXT NOT NULL, session_id TEXT, generation INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
+    terminal_outcome TEXT, reserved_at TEXT NOT NULL, started_at TEXT, terminal_at TEXT);
+CREATE TABLE handoff (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, run_id TEXT NOT NULL,
+    role TEXT NOT NULL, outcome_class TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '',
+    changed TEXT NOT NULL DEFAULT '', remaining TEXT NOT NULL DEFAULT '',
+    reason_returned TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+    consumed_by_dispatch_id TEXT);
+"""
+
+
+def _make_old_db(path):
+    import sqlite3
+    c = sqlite3.connect(str(path))
+    c.executescript(_OLD_GOAL_RUN)
+    c.execute("INSERT INTO goal_run (id, goal_label, status, routing_authority, created_at) "
+              "VALUES ('run-1', 'goal:v1', 'active', 'lead_pending', 't0')")
+    c.commit()
+    c.close()
+
+
+def test_migration_upgrades_pre17_database(tmp_path):
+    db = tmp_path / "dispatch.sqlite3"
+    _make_old_db(db)
+    disp = Dispatcher(db)
+    got = disp.start_or_resume_run("goal:v1")  # would IndexError before migration
+    assert got.id == "run-1"
+    assert got.status is RunStatus.ACTIVE
+    assert got.authority_seq == 0
+    assert got.invalid_solicitations == 0
+    # New solicitation machinery works on the migrated DB.
+    sol = disp.open_lead_solicitation("run-1")
+    assert sol.attempt_id
+    assert disp._conn.execute("PRAGMA user_version").fetchone()[0] == Dispatcher._SCHEMA_VERSION
+
+
+def test_migration_preserves_existing_rows(tmp_path):
+    db = tmp_path / "dispatch.sqlite3"
+    _make_old_db(db)
+    # Seed an attempt + handoff via the OLD table shapes before upgrading.
+    import sqlite3
+    c = sqlite3.connect(str(db))
+    c.execute("INSERT INTO dispatch (id, run_id, seq, kind, role, created_at) "
+              "VALUES ('dsp-1','run-1',1,'dispatch','worker','t1')")
+    c.execute("INSERT INTO attempt (id, dispatch_id, run_id, role, state, reserved_at) "
+              "VALUES ('att-1','dsp-1','run-1','worker','terminal','t1')")
+    c.execute("INSERT INTO handoff (id, attempt_id, run_id, role, outcome_class, created_at) "
+              "VALUES ('ho-1','att-1','run-1','worker','completed','t2')")
+    c.commit(); c.close()
+
+    disp = Dispatcher(db)
+    assert disp.get_run("run-1").status is RunStatus.ACTIVE
+    assert disp.get_attempt("att-1").role == "worker"
+    assert [h.id for h in disp.pending_handoffs("run-1")] == ["ho-1"]
+
+
+def test_migration_is_idempotent(tmp_path):
+    db = tmp_path / "dispatch.sqlite3"
+    _make_old_db(db)
+    Dispatcher(db).close()          # first upgrade
+    disp = Dispatcher(db)           # reopen migrated DB — must not error/duplicate
+    disp.close()
+    disp2 = Dispatcher(db)          # third open still fine
+    assert disp2.get_run("run-1").status is RunStatus.ACTIVE
+    # Exactly the expected new columns, added once.
+    cols = [r["name"] for r in disp2._conn.execute("PRAGMA table_info(goal_run)").fetchall()]
+    assert cols.count("authority_seq") == 1
+    assert cols.count("invalid_solicitations") == 1
+
+
+def test_fresh_db_has_schema_version(tmp_path):
+    disp = _open(tmp_path)
+    assert disp._conn.execute("PRAGMA user_version").fetchone()[0] == Dispatcher._SCHEMA_VERSION

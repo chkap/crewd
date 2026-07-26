@@ -370,6 +370,40 @@ class Dispatcher:
         self._conn.execute("PRAGMA foreign_keys = ON;")
         self._conn.execute("PRAGMA synchronous = FULL;")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    # Bump when a schema change needs an in-place migration of existing DBs.
+    _SCHEMA_VERSION = 1
+
+    def _migrate(self) -> None:
+        """Idempotently upgrade a database created by an earlier kernel version.
+
+        ``CREATE TABLE IF NOT EXISTS`` in :data:`_SCHEMA` creates any *missing*
+        tables (e.g. ``solicitation`` and its indexes on a pre-#17 database) but
+        never alters an *existing* ``goal_run`` — so a database created by the
+        merged #11 kernel lacks the ``authority_seq`` / ``invalid_solicitations``
+        columns and would fail to decode. Add them in place with safe
+        ``NOT NULL DEFAULT 0`` semantics. The column-existence check is the
+        durable oracle (idempotent across repeated opens); ``user_version`` is a
+        derived marker only. Runs as one transaction so a crash mid-upgrade
+        leaves the database wholly upgraded or wholly not.
+        """
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(goal_run)").fetchall()}
+        additions = [
+            ("authority_seq", "ALTER TABLE goal_run ADD COLUMN authority_seq INTEGER NOT NULL DEFAULT 0"),
+            ("invalid_solicitations",
+             "ALTER TABLE goal_run ADD COLUMN invalid_solicitations INTEGER NOT NULL DEFAULT 0"),
+        ]
+        pending = [sql for name, sql in additions if name not in cols]
+        self._conn.execute("BEGIN IMMEDIATE;")
+        try:
+            for sql in pending:
+                self._conn.execute(sql)
+            self._conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION};")
+            self._conn.execute("COMMIT;")
+        except BaseException:
+            self._conn.execute("ROLLBACK;")
+            raise
 
     def close(self) -> None:
         self._conn.close()
@@ -564,6 +598,18 @@ class Dispatcher:
             att = c.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
             if att is None:
                 raise KeyError(attempt_id)
+            sol = c.execute(
+                "SELECT 1 FROM solicitation WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if sol is not None:
+                # A Lead solicitation attempt must never emit a handoff. Its
+                # lifecycle is owned exclusively by resolve_lead_solicitation, so
+                # candidate validation, invalid counters, nonce transitions, and
+                # handoff suppression cannot be bypassed through this path.
+                raise DecisionError(
+                    f"attempt {attempt_id} is a Lead solicitation; terminalize it via "
+                    "resolve_lead_solicitation, not record_terminal"
+                )
             if att["state"] == AttemptState.TERMINAL.value:
                 raise DecisionError(f"attempt {attempt_id} already terminal")
             if att["state"] not in (AttemptState.RESERVED.value, AttemptState.STARTED.value):
@@ -941,9 +987,20 @@ class Dispatcher:
         return False, None
 
     def _synthetic_pause(self, c, run_id: str, blocker: str) -> None:
-        """Emit one synthetic handoff and pause, rather than looping into Lead forever."""
+        """Emit one synthetic handoff and pause, rather than looping into Lead forever.
+
+        The synthetic handoff represents non-Lead work/control evidence, so it is
+        attached to the most recent *non-solicitation* attempt. A ``SOLICIT_LEAD``
+        attempt must never produce a handoff through any kernel path, so if the
+        only recent attempt is a Lead solicitation (e.g. the guard trips while
+        applying a solicited ``continue_lead``/``dispatch`` decision), the run
+        pauses without inserting a synthetic ``role='lead'`` handoff.
+        """
         att = c.execute(
-            "SELECT id, role FROM attempt WHERE run_id = ? ORDER BY reserved_at DESC LIMIT 1",
+            "SELECT a.id, a.role FROM attempt a "
+            "WHERE a.run_id = ? "
+            "AND NOT EXISTS (SELECT 1 FROM solicitation s WHERE s.attempt_id = a.id) "
+            "ORDER BY a.reserved_at DESC LIMIT 1",
             (run_id,),
         ).fetchone()
         if att is not None:

@@ -99,7 +99,26 @@ the in-flight dispatch otherwise.
     earlier authority window (e.g. one whose attempt a restart already reconciled
     to `uncertain`) can never apply — `resolve_lead_solicitation` refuses a
     solicitation attempt that is no longer in-flight. SQLite, not any
-    `decision.json` file, owns idempotent consumption.
+    `decision.json` file, owns idempotent consumption. A solicitation attempt is
+    terminalized **only** through `resolve_lead_solicitation`: `record_terminal`
+    rejects it, and the thrash/no-progress guard reached while applying a
+    solicited decision pauses **without** synthesising a `role='lead'` handoff
+    (the synthetic handoff attaches only to the most recent non-solicitation
+    attempt, i.e. real role work/control evidence). So no kernel path — public or
+    internal — can ever create a Lead handoff.
+
+## Schema migration
+
+The kernel opens a database created by an earlier version in place. `CREATE
+TABLE IF NOT EXISTS` creates any *missing* tables (e.g. the `solicitation` table
+and its indexes on a pre-#17 database) but never alters an existing `goal_run`,
+so `Dispatcher.__init__` runs an idempotent `_migrate()` that adds the
+`authority_seq` / `invalid_solicitations` columns (`NOT NULL DEFAULT 0`) when
+absent, inside one transaction, and stamps `PRAGMA user_version`. The
+column-existence check is the durable oracle (safe across repeated opens);
+`user_version` is a derived marker. Existing runs/attempts/handoffs are
+preserved; the real upgrade path is covered by
+`tests/test_dispatcher.py` (`test_migration_*`).
 
 ## Crash points covered by `tests/test_dispatcher.py`
 
