@@ -193,10 +193,11 @@ liveness + orphan + taint + contradictions (`crewd.diagnostics.NextAction`):
 
 | Situation | Action |
 |---|---|
-| No dispatch journal yet | `no_journal` (run `crewd run`) |
+| No dispatch journal yet, no live daemon | `no_journal` (run `crewd run`; flags a stale dead PID for `doctor` cleanup) |
+| No journal but a **live** daemon PID | `doctor` — contradiction; never advise a second run over a live process |
 | Active, in-flight attempt, live daemon | `running` (monitor) |
 | Active, idle / Lead authority, no daemon | `continue` (`crewd run`) |
-| Active, orphaned `started` attempt, dead daemon | `resume_orphan` (`crewd resume`; taints-before-finalize; notes fresh generation if the orphan session is already tainted) |
+| Active, orphaned `started` attempt, dead daemon | `resume_orphan` (`crewd run` — startup reconciliation taints-before-finalizes the orphan, then continues with a fresh generation; notes when the orphan session is already tainted) |
 | Waiting | `wait` |
 | Paused (human blocker) | `resolve_blocker` |
 | Interrupted / stopped run | `resume` |
@@ -214,11 +215,12 @@ Role-supplied handoff free-text (`evidence`/`changed`/`remaining`/`disagreement`
 system-derived `reason` is always redacted + bounded. `crewd doctor` remains the
 maintenance command that reports and clears a stale daemon PID.
 
-> **Deferred (Lead-owned follow-up):** a *bounded integrated live-CLI smoke* that
-> exercises `crewd run`/`status`/`resume` against the real Copilot SDK end-to-end
-> was intentionally left out of this observability slice (it needs network+auth
-> and is expensive/non-deterministic). This slice delivers the deterministic
-> diagnostic core validated from persisted fixtures.
+> **Tracked separately (#23):** the operator-documentation modernization (README /
+> architecture / configuration removing stale fixed-cycle wording) and the
+> **required** bounded integrated live SDK smoke — real `crewd run`/`status`/`resume`
+> against the Copilot SDK end-to-end — are a distinct, required goal outcome owned
+> by **#23**, split out from this issue by Lead. This slice (#13) delivers the
+> deterministic diagnostic/status *core*, validated from persisted fixtures.
 
 ## Tests
 

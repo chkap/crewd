@@ -59,6 +59,35 @@ def test_no_journal_recommends_run(tmp_ws):
     assert snap.next_action is NextAction.NO_JOURNAL
 
 
+def test_no_journal_with_live_daemon_is_contradiction(tmp_ws):
+    # A live daemon PID but no journal must NOT advise starting another run
+    # (it would spawn a second run over a live process). Route to doctor.
+    _label(tmp_ws)
+    tmp_ws.write_pid(os.getpid())  # alive
+    try:
+        snap = _snap(tmp_ws)
+        assert snap.run_id is None
+        assert snap.daemon_alive is True
+        assert snap.contradictions
+        assert snap.next_action is NextAction.DOCTOR
+        assert "crewd run" not in snap.next_action_detail
+    finally:
+        tmp_ws.clear_pid()
+
+
+def test_no_journal_with_stale_pid_still_recommends_run(tmp_ws):
+    # A dead PID file is a stale control artifact, not a live run: starting is
+    # still safe, but the snapshot flags the leftover for `doctor` cleanup.
+    _label(tmp_ws)
+    tmp_ws.write_pid(999999)  # almost certainly not alive
+    assert tmp_ws.is_daemon_alive() is False
+    snap = _snap(tmp_ws)
+    assert snap.next_action is NextAction.NO_JOURNAL
+    assert "stale daemon PID" in snap.next_action_detail
+    # read-only: the stale PID must survive the projection
+    assert tmp_ws.read_pid() == 999999
+
+
 def test_no_goal_label_is_no_journal(tmp_ws):
     # dispatch.db exists but there's no goal.json → no label → nothing to read.
     disp = _disp(tmp_ws)
@@ -132,7 +161,11 @@ def test_orphaned_started_attempt_dead_daemon_is_resume_orphan(tmp_ws):
     assert snap.current_attempt is not None
     assert snap.current_attempt["session_id"] == "sess-orphan"
     assert snap.next_action is NextAction.RESUME_ORPHAN
-    assert "resume" in snap.next_action_detail.lower()
+    # The recommended recovery command must be `crewd run` (whose startup
+    # reconciliation taints-before-finalizes the orphan) — NOT `crewd resume`,
+    # which is a no-op for an already-active run.
+    assert "crewd run" in snap.next_action_detail
+    assert "crewd resume" not in snap.next_action_detail
 
 
 def test_orphan_with_tainted_session_flags_fresh_generation(tmp_ws):
@@ -150,6 +183,52 @@ def test_orphan_with_tainted_session_flags_fresh_generation(tmp_ws):
     assert snap.current_attempt["tainted"] is True
     assert snap.next_action is NextAction.RESUME_ORPHAN
     assert "fresh generation" in snap.next_action_detail
+
+
+def test_orphan_recovery_command_path_taints_and_finalizes(tmp_ws):
+    """Black-box: the recommended recovery command (`crewd run`) must actually
+    recover the orphan — taint its session and finalize the attempt. This guards
+    against recommending a no-op (e.g. `crewd resume`, which does nothing for an
+    already-active run). We assert recoverability, not prose.
+    """
+    import sys
+
+    sys.path.insert(0, "tests")
+    from fakes import FakeExecutor, pause
+
+    from crewd.dispatcher import AttemptState
+    from crewd.orchestrator import Orchestrator
+
+    _label(tmp_ws)
+    disp = _disp(tmp_ws)
+    run = disp.start_or_resume_run(GOAL)
+    d = _dispatch(disp, run.id)
+    att = disp.reserve_attempt(run.id, d.dispatch.id, "worker")
+    disp.mark_started(att, session_id="sess-orphan", generation=0)
+    disp.close()  # crash: started orphan, no terminal
+
+    # Precondition: the snapshot names `crewd run` as the recovery command.
+    snap = _snap(tmp_ws)
+    assert snap.next_action is NextAction.RESUME_ORPHAN
+    assert "crewd run" in snap.next_action_detail
+
+    # Execute that path: Orchestrator.run() (what `crewd run` invokes) reconciles
+    # on startup before any new work. Lead then pauses so the run halts cleanly.
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    orch = Orchestrator(
+        tmp_ws, cfg, FakeExecutor(lead_script=[pause("human-blocked: after crash")]),
+        GoalState(version=1, label=GOAL, cycles=0, goal_md_sha256="x"),
+    )
+    assert orch.run(once=False) == 0
+
+    # The orphan attempt is finalized (uncertain, never replayed) and its session
+    # generation is durably tainted so recovery advances to a fresh one.
+    disp2 = _disp(tmp_ws)
+    assert disp2.get_attempt(att).state is AttemptState.RECONCILED_UNCERTAIN
+    disp2.close()
+    assert TaintStore(
+        tmp_ws.role_cfg_dir("worker") / ".crewd-sdk-taint"
+    ).is_tainted("sess-orphan")
 
 
 # ─────────────────────────── non-active durable states ───────────────────────────

@@ -231,8 +231,9 @@ def _derive_next_action(diag: RunDiagnostics, *, daemon_alive: bool, tainted: bo
             return (
                 NextAction.RESUME_ORPHAN,
                 f"An orphaned {role} attempt is still marked in-flight after the "
-                f"runner stopped — run `crewd resume` (restart reconciliation "
-                f"taints-before-finalize the orphan) or `crewd run`." + taint_note,
+                f"runner stopped — run `crewd run`; startup reconciliation "
+                f"taints-before-finalizes the orphan, then continues with a fresh "
+                f"generation." + taint_note,
             )
         if daemon_alive:
             return (
@@ -295,14 +296,37 @@ def build_snapshot(ws: Workspace, *, crew_name: str, backend: str,
 
     diag = _read_run_diagnostics(ws, goal_label)
     if diag is None:
-        # No durable run for this label yet: the only durable-truth-grounded
-        # action is to start one. Controls are still reported for context.
+        # No durable run for this label yet. Controls still carry authority-0
+        # signal, and must not be silently ignored (#13 precedence): a *live*
+        # daemon with no journal is a genuine contradiction — never advise
+        # starting a second run over a running process.
+        if daemon_alive:
+            contradiction = (
+                f"a daemon process (PID {pid}) is alive but no dispatch journal "
+                "exists for this goal — it may be mid-startup, or the PID is "
+                "stale/foreign; do not start another run until this is diagnosed."
+            )
+            return DiagnosticSnapshot(
+                **base,
+                contradictions=[contradiction],
+                next_action=NextAction.DOCTOR,
+                next_action_detail=(
+                    "A daemon PID is alive but nothing has been journaled — inspect "
+                    "with `crewd doctor` / `crewd logs` before starting another run."
+                ),
+            )
+        detail = "No dispatch journal for this goal yet — run `crewd run` to start."
+        if pid is not None:
+            # A dead PID file is a stale control artifact, not a run. Starting is
+            # still the safe action; point at `doctor` to clear the leftover.
+            detail += (
+                f" (A stale daemon PID file is present, PID {pid} not alive; "
+                "`crewd doctor` clears it.)"
+            )
         return DiagnosticSnapshot(
             **base,
             next_action=NextAction.NO_JOURNAL,
-            next_action_detail=(
-                "No dispatch journal for this goal yet — run `crewd run` to start."
-            ),
+            next_action_detail=detail,
         )
 
     tainted = _current_session_tainted(ws, diag)
