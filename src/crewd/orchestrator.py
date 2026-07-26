@@ -19,7 +19,11 @@ taint-before-finalize orphan-session recovery are a separate, independent
 race handled in a follow-up slice. Here a signal halts the loop *between*
 steps; the reserved/started attempt of an interrupted step is reconciled as
 ``uncertain`` on the next start (never replayed), and the orphaned SDK session
-is left resumable rather than force-tainted.
+is left resumable rather than force-tainted. To keep that follow-up *safe*,
+this orchestrator already journals each attempt as ``started`` with its selected
+session identity **before** any SDK send (via the executor's pre-send
+``on_started`` hook), so an attempt that reaches the transport always has a
+durable session to taint/recover.
 """
 from __future__ import annotations
 
@@ -45,9 +49,11 @@ console = Console()
 
 
 # Run status → durable exit reason for a single `crewd run` invocation.
+# Operator STOP is deliberately distinct from goal completion: a stop halts the
+# run without any final acceptance, so it must never masquerade as `goal-complete`.
 _STATUS_EXIT = {
     RunStatus.FINISHED: "goal-complete",
-    RunStatus.STOPPED: "goal-complete",
+    RunStatus.STOPPED: "stopped",
     RunStatus.PAUSED: "human-blocked",
     RunStatus.WAITING: "waiting",
     RunStatus.EXHAUSTED: "exhausted",
@@ -111,14 +117,22 @@ class Orchestrator:
         self._interrupted = True
 
     # ── main loop ──
-    def run(self, once: bool) -> int:
+    def run(self, once: bool, resume: bool = False) -> int:
         run = self.disp.start_or_resume_run(self.goal_label)
-        # An explicit `crewd run` is intent to make progress: revive a resumable
-        # (paused/waiting/interrupted/stopped) run, mirroring the workspace
-        # sentinel clear the command layer already performed. Terminal
-        # finished/exhausted runs are left as-is and reported below.
-        if RunStatus(run.status) in _RESUMABLE:
-            run = self.disp.resume_run(run.id)
+        status = RunStatus(run.status)
+        # A non-active run holds a durable state — a paused human blocker, a wait
+        # condition, an interrupt, an operator stop, or a terminal
+        # finished/exhausted. A plain `crewd run` MUST NOT erase it: reviving a
+        # paused/waiting/interrupted/stopped run is the *explicit* resume
+        # workflow's job only (mirroring the dispatcher's own contract that
+        # start_or_resume_run never auto-revives). Terminal finished/exhausted are
+        # never resumable. This closes the durable-pause bypass (PR #16): a plain
+        # run can no longer silently clear a Lead human blocker.
+        if status is not RunStatus.ACTIVE:
+            if resume and status in _RESUMABLE:
+                run = self.disp.resume_run(run.id)
+            else:
+                return self._exit(_STATUS_EXIT.get(status, "goal-complete"))
 
         # Reconcile any in-flight attempt orphaned by a crash BEFORE new work.
         self.disp.reconcile_on_restart(run.id)
@@ -157,7 +171,7 @@ class Orchestrator:
         if self.ws.is_stopped():
             self._safe_mark(run_id, RunStatus.STOPPED)
             console.print("[yellow]STOPPED sentinel present; exiting[/]")
-            return "goal-complete"
+            return "stopped"
         if self.ws.is_paused():
             self._safe_mark(run_id, RunStatus.PAUSED, self.ws.pause_reason())
             console.print(f"[yellow]PAUSED for human input:[/] {self.ws.pause_reason()}")
@@ -190,14 +204,11 @@ class Orchestrator:
         self._cycle += 1
         req = self._request("lead", self._lead_prompt(pending))
         console.print(f"  [magenta]lead[/] ({self.cfg.roles.get('lead', _NoModel()).model}) solicitation → {req.log_path}")
-        turn = self.executor.run_lead(req)
-        # Persist the Lead session identity before consuming the candidate.
-        try:
-            self.disp.mark_started(
-                sol.attempt_id, session_id=turn.session_id, generation=turn.generation
-            )
-        except Exception:
-            pass
+        # Journal the Lead session identity durably BEFORE any SDK send, via the
+        # executor's on_started hook. Persistence failure is NOT swallowed: it
+        # propagates and aborts the run rather than continuing with an unjournaled
+        # in-flight attempt (restart reconciliation then handles the solicitation).
+        turn = self.executor.run_lead(req, on_started=self._on_started(sol.attempt_id))
         self.disp.resolve_lead_solicitation(
             sol.attempt_id,
             outcome=turn.result.outcome,
@@ -221,13 +232,10 @@ class Orchestrator:
         self._cycle += 1
         req = self._request(role, self._role_prompt(role))
         console.print(f"  [magenta]{role}[/] ({self.cfg.roles[role].model}) → {req.log_path}")
-        outcome = self.executor.execute_role(req)
-        try:
-            self.disp.mark_started(
-                attempt_id, session_id=outcome.session_id, generation=outcome.generation
-            )
-        except Exception:
-            pass
+        # Journal session identity BEFORE the SDK send (see _lead_step). This is
+        # what makes the deferred taint/orphan-recovery follow-up safe: an attempt
+        # that reaches the transport is always durably `started` with its session.
+        outcome = self.executor.execute_role(req, on_started=self._on_started(attempt_id))
         result = outcome.result
         self.disp.record_terminal(
             attempt_id,
@@ -238,6 +246,20 @@ class Orchestrator:
             reason_returned=f"sdk:{result.outcome.value}",
         )
         self._persist_cycle()
+
+    def _on_started(self, attempt_id: str):
+        """Return the pre-send journaling callback for an in-flight attempt.
+
+        Invoked by the executor after session selection and before any SDK send.
+        A raised :class:`~crewd.dispatcher.DecisionError` propagates (not
+        swallowed) so persistence failure surfaces instead of silently launching
+        an unjournaled attempt.
+        """
+
+        def _cb(session_id: str, generation: int) -> None:
+            self.disp.mark_started(attempt_id, session_id=session_id, generation=generation)
+
+        return _cb
 
     # ── request/prompt construction ──
     def _request(self, role: str, prompt: str) -> AttemptRequest:
@@ -299,12 +321,11 @@ class Orchestrator:
 
     # ── bookkeeping ──
     def _persist_cycle(self) -> None:
+        # Cycle/state writes surface on failure rather than being swallowed, so a
+        # broken durable write halts the run instead of continuing silently.
         self.goal_state.cycles = self._cycle
-        try:
-            self.goal_state.save(self.ws.goal_json)
-            self.ws.write_cycle(self._cycle)
-        except Exception:
-            pass
+        self.goal_state.save(self.ws.goal_json)
+        self.ws.write_cycle(self._cycle)
 
     def _exit(self, reason: str) -> int:
         self.ws.state_dir.mkdir(parents=True, exist_ok=True)

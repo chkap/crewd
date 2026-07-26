@@ -144,7 +144,12 @@ The kernel is now wired into production via `orchestrator.py` and the typed
   `reserve → start → record_terminal` through the executor seam.
 - Typed `AttemptExecutor` / `SdkAttemptExecutor` / `FakeExecutor` seam
   (`executor.py`, `tests/fakes.py`) plus the `submit_lead_decision` custom tool
-  whose handler only captures a candidate in attempt-local memory.
+  (built with the official `copilot.define_tool` API) whose handler only captures
+  a candidate in an attempt-local, thread-safe `LeadDecisionCapture`. The capture
+  enforces exactly-one submission: a sequential or concurrent second call makes
+  the solicitation invalid rather than overwriting into an apparently valid
+  candidate. Session identity is journaled (`mark_started`) **before** any SDK
+  send.
 - `backend: copilot` rejected with a migration diagnostic; `CopilotBackend`
   deleted.
 - Full fake-SDK routing/restart matrix (`tests/test_orchestrator.py`).

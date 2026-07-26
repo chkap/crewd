@@ -36,11 +36,22 @@ reached one.
 
 | RunStatus | exit reason |
 |-----------|-------------|
-| FINISHED / STOPPED | `goal-complete` |
+| FINISHED | `goal-complete` |
+| STOPPED | `stopped` |
 | PAUSED | `human-blocked` |
 | WAITING | `waiting` |
 | EXHAUSTED | `exhausted` |
 | INTERRUPTED | `interrupted` |
+
+Operator **stop** is deliberately distinct from goal completion: a stop halts a
+run with no final acceptance, so it must never report `goal-complete`.
+
+A non-active run holds a durable state (a Lead human blocker, a wait condition,
+an interrupt, an operator stop, or a terminal finished/exhausted). A plain
+`crewd run` **must not** erase it — reviving a paused/waiting/interrupted/stopped
+run is the explicit `crewd resume` workflow's job only (`Orchestrator.run(...,
+resume=True)` + `Dispatcher.resume_run`). This closes the durable-pause bypass
+fixed in PR #16: a plain run can no longer silently clear a human blocker.
 
 ## A step
 
@@ -49,16 +60,42 @@ reached one.
 - **Lead pending** → `_lead_step`: `open_lead_solicitation` (reserves one
   budgeted Lead attempt that takes authority; `BudgetExhausted` → the run is
   marked exhausted and the loop exits) → build the Lead prompt embedding the
-  exact pending-handoff ids → `run_lead` → `mark_started` (persist Lead session
-  identity) → `resolve_lead_solicitation` (the *single* transaction that decides
-  whether to apply the candidate, under all semantic guards).
+  exact pending-handoff ids → `run_lead` (journaling `mark_started` **before** any
+  SDK send, via the executor's `on_started` hook) → `resolve_lead_solicitation`
+  (the *single* transaction that decides whether to apply the candidate, under
+  all semantic guards).
 - **Dispatched to a role** → `_dispatch_step`: `get_dispatch` → role →
-  `reserve_attempt` → `execute_role` → `mark_started` → `record_terminal`
-  (`reason_returned="sdk:<outcome>"`).
+  `reserve_attempt` → `execute_role` (journaling `mark_started` **before** the SDK
+  send) → `record_terminal` (`reason_returned="sdk:<outcome>"`).
+
+**Pre-send journaling.** The executor's `on_started(session_id, generation)` hook
+is invoked after session selection but before any SDK send, so an attempt that
+reaches the transport is always durably `started` with its session identity. This
+is what makes the deferred taint/orphan-recovery follow-up *safe*. Journaling
+failure is **not** swallowed — it propagates and aborts the run rather than
+continuing with an unjournaled in-flight attempt.
 
 The orchestrator consumes `AttemptResult.outcome` directly — it never
 reconstructs lifecycle meaning from a process exit code. That reversal of the
 #10 exit-code mapping is the point of the executor seam.
+
+## Lead decision channel (`submit_lead_decision`)
+
+Lead delivers its routing decision through a narrow SDK custom tool built with
+the **official** `copilot.define_tool(...)` API and passed via the
+`tools=[...]` `create_session` parameter (`sdk_adapter.make_lead_decision_tool`).
+Registration failure is surfaced (an `SdkError` failing the Lead turn), never
+swallowed — a signature drift can't silently drop the only decision channel.
+
+The tool handler only records the untrusted candidate into an attempt-local,
+thread-safe `LeadDecisionCapture` (`executor.py`); it never mutates durable
+state. The capture enforces the accepted **exactly-one-submission** invariant:
+it retains a submission count + the first payload, so a sequential *or* concurrent
+second call makes the solicitation invalid (`result()` → `None`) rather than
+overwriting into an apparently valid single candidate. `run_lead` returns a
+candidate only when `count == 1`; `count == 0` or `count > 1` resolves as an
+invalid solicitation with handoffs retained.
+
 
 ## Signals / operator controls
 

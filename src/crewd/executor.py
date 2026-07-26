@@ -25,12 +25,61 @@ of the #10 exit-code mapping is the point of this seam.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from .dispatcher import LeadDecision
 from .session_backend import AttemptOutcome, AttemptResult
+
+# Callback the orchestrator supplies to durably journal an attempt as `started`
+# with its selected session identity BEFORE any SDK send. Called at most once,
+# after session selection and before the transport runs. Raising aborts the
+# attempt before any SDK work (the reservation is later reconciled on restart).
+OnStarted = Callable[[str, int], None]
+
+
+class LeadDecisionCapture:
+    """Attempt-local, thread-safe capture for the ``submit_lead_decision`` tool.
+
+    Enforces the accepted #17 invariant that a Lead turn submits *exactly one*
+    decision: zero **or multiple** submissions are invalid. The custom-tool
+    handler calls :meth:`submit` (which never mutates durable dispatcher state);
+    the executor reads :meth:`result` after the turn, obtaining the single
+    candidate only when exactly one submission occurred. The official SDK may
+    execute custom tools concurrently, so all access is lock-guarded and the
+    durable fact that multiple calls occurred is preserved in :attr:`count`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count = 0
+        self._first = None
+
+    def submit(self, candidate) -> bool:
+        """Record one submission; return ``True`` iff it is the first (accepted).
+
+        Subsequent submissions are rejected (``False``) but still counted, so a
+        double-submit resolves as an invalid solicitation rather than
+        last-wins.
+        """
+        with self._lock:
+            self._count += 1
+            if self._count == 1:
+                self._first = candidate
+                return True
+            return False
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+    def result(self):
+        """The single candidate iff exactly one submission occurred, else None."""
+        with self._lock:
+            return self._first if self._count == 1 else None
 
 
 @dataclass(frozen=True)
@@ -84,13 +133,24 @@ class AttemptExecutor(Protocol):
         """Return a list of health-check error strings; empty means healthy."""
         ...
 
-    def execute_role(self, req: AttemptRequest) -> RoleAttemptOutcome:
+    def execute_role(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> RoleAttemptOutcome:
         """Run one role tick, returning its typed outcome (never raises for a
-        normal SDK failure — that is encoded in ``result.outcome``)."""
+        normal SDK failure — that is encoded in ``result.outcome``).
+
+        ``on_started`` is invoked with the selected ``(session_id, generation)``
+        after session selection but BEFORE any SDK send, so the attempt's session
+        identity is durably journaled before transport work begins. It is not
+        called when the attempt is refused pre-execution (a mounting error): no
+        session is opened and no send occurs.
+        """
         ...
 
-    def run_lead(self, req: AttemptRequest) -> LeadTurnOutcome:
-        """Run one Lead decision turn, returning its typed outcome + candidate."""
+    def run_lead(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> LeadTurnOutcome:
+        """Run one Lead decision turn, returning its typed outcome + candidate.
+
+        ``on_started`` has the same pre-send journaling contract as
+        :meth:`execute_role`.
+        """
         ...
 
 
@@ -149,21 +209,27 @@ class SdkAttemptExecutor:
         return errs
 
     # ── public seam ─────────────────────────────────────────────
-    def execute_role(self, req: AttemptRequest) -> RoleAttemptOutcome:
+    def execute_role(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> RoleAttemptOutcome:
         session_id, generation, mount_err, run = self._run(req, lead=False)
         if mount_err is not None:
+            # No session opened and no SDK send — nothing to journal as started.
             return RoleAttemptOutcome(
                 result=_error_result(req, session_id, mount_err),
                 session_id=session_id,
                 generation=generation,
                 mount_error=mount_err,
             )
+        if on_started is not None:
+            # Durably persist the selected session identity BEFORE any SDK send.
+            # A raised error here aborts the attempt before transport work; it is
+            # deliberately NOT swallowed so persistence failure surfaces.
+            on_started(session_id, generation)
         result = run()
         return RoleAttemptOutcome(
             result=result, session_id=session_id, generation=generation
         )
 
-    def run_lead(self, req: AttemptRequest) -> LeadTurnOutcome:
+    def run_lead(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> LeadTurnOutcome:
         session_id, generation, mount_err, run = self._run(req, lead=True)
         if mount_err is not None:
             return LeadTurnOutcome(
@@ -173,6 +239,8 @@ class SdkAttemptExecutor:
                 decision=None,
                 mount_error=mount_err,
             )
+        if on_started is not None:
+            on_started(session_id, generation)
         result, decision = run()
         return LeadTurnOutcome(
             result=result,
@@ -240,7 +308,7 @@ class SdkAttemptExecutor:
         if decision.fresh_reason:
             log_lines.append(f"[crewd] fresh session: {decision.fresh_reason}")
 
-        capture: dict = {}
+        capture = LeadDecisionCapture() if lead else None
         if lead:
             ops = self._make_lead_ops(
                 session_id=session_id,
@@ -335,10 +403,11 @@ class SdkAttemptExecutor:
         )
 
     @staticmethod
-    def _read_captured_decision(capture: dict, ops) -> Optional[LeadDecision]:
-        raw = capture.get("decision")
-        if raw is None:
-            raw = getattr(ops, "captured_lead_decision", None)
+    def _read_captured_decision(capture: "LeadDecisionCapture", ops) -> Optional[LeadDecision]:
+        # Exactly-one submission: capture.result() is the single candidate, or
+        # None when zero or multiple decisions were submitted (both invalid). The
+        # dispatcher still applies its own semantic guards on top of this.
+        raw = capture.result() if capture is not None else None
         if raw is None:
             return None
         if isinstance(raw, LeadDecision):

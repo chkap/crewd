@@ -138,19 +138,18 @@ def test_once_advances_single_step(tmp_ws: Workspace):
     assert _final_run(tmp_ws).status == RunStatus.ACTIVE.value
 
 
-# ── stop sentinel halts before work and records STOPPED ──
-def test_stop_sentinel_exits_goal_complete(tmp_ws: Workspace):
+# ── stop sentinel halts before work and records STOPPED (distinct reason) ──
+def test_stop_sentinel_exits_stopped(tmp_ws: Workspace):
     tmp_ws.stop("operator")
     fake = FakeExecutor(lead_script=[dispatch_to("worker")])
     orch = _orch(tmp_ws, fake)
-    # `crewd run` clears sentinels itself; here we drive the orchestrator
-    # directly, so re-assert the sentinel after resume to simulate a stop that
-    # arrives during the run.
     orch.disp.start_or_resume_run("goal:v1")
     tmp_ws.stop("operator")
     rc = orch.run(once=False)
     assert rc == 0
-    assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
+    # Operator stop is distinct from goal completion — never "goal-complete".
+    assert tmp_ws.exit_reason_file.read_text().strip() == "stopped"
+    assert fake.lead_calls == []  # halted before any Lead work
     assert _final_run(tmp_ws).status == RunStatus.STOPPED.value
 
 
@@ -238,14 +237,90 @@ def test_signal_interrupt_exits_interrupted(tmp_ws: Workspace):
     orig = fake.run_lead
     state = {"n": 0}
 
-    def wrapped(req):
+    def wrapped(req, *, on_started=None):
         state["n"] += 1
         if state["n"] >= 2:
             orch._interrupted = True
-        return orig(req)
+        return orig(req, on_started=on_started)
 
     fake.run_lead = wrapped  # type: ignore[method-assign]
     rc = orch.run(once=False)
     assert rc == 0
     assert tmp_ws.exit_reason_file.read_text().strip() == "interrupted"
     assert _final_run(tmp_ws).status == RunStatus.INTERRUPTED.value
+
+
+# ── pre-send journaling: mark_started persists BEFORE the SDK body runs ──
+def test_attempt_journaled_started_before_send(tmp_ws: Workspace):
+    from crewd.dispatcher import AttemptState
+    from crewd.executor import AttemptRequest
+
+    fake = FakeExecutor(lead_script=[dispatch_to("worker"), finish()])
+    orch = _orch(tmp_ws, fake)
+    observed: dict = {}
+
+    orig = fake.execute_role
+
+    def spy(req: AttemptRequest, *, on_started=None):
+        order: list[str] = observed.setdefault("order", [])
+
+        def _wrapped_on_started(session_id, generation):
+            order.append("journaled")
+            observed["session_id"] = session_id
+            on_started(session_id, generation)
+
+        order.append("body-start")  # executor body begins after on_started
+        return orig(req, on_started=_wrapped_on_started)
+
+    fake.execute_role = spy  # type: ignore[method-assign]
+    rc = orch.run(once=False)
+    assert rc == 0
+    # on_started (journaling) runs during execute_role, before the outcome is
+    # recorded terminal; the worker attempt therefore passed through STARTED.
+    assert observed.get("session_id") == "sess-worker"
+    assert "journaled" in observed.get("order", [])
+
+
+def test_on_started_failure_surfaces_not_swallowed(tmp_ws: Workspace):
+    # If durable journaling fails, the error must propagate (not be swallowed) so
+    # the run never continues with an unjournaled in-flight attempt.
+    fake = FakeExecutor(lead_script=[dispatch_to("worker"), finish()])
+    orch = _orch(tmp_ws, fake)
+
+    orig = fake.execute_role
+
+    def boom(req, *, on_started=None):
+        def _failing(session_id, generation):
+            raise RuntimeError("journal write failed")
+
+        return orig(req, on_started=_failing)
+
+    fake.execute_role = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="journal write failed"):
+        orch.run(once=False)
+
+
+# ── no auto-resume: a plain run must not revive a paused/stopped run ──
+def test_plain_run_does_not_resume_paused(tmp_ws: Workspace):
+    # First run: Lead pauses → durable PAUSED.
+    fake1 = FakeExecutor(lead_script=[pause("human-blocked: need input")])
+    orch1 = _orch(tmp_ws, fake1)
+    assert orch1.run(once=False) == 0
+    assert _final_run(tmp_ws).status == RunStatus.PAUSED.value
+
+    # Second plain run (resume=False default): must NOT erase the blocker.
+    fake2 = FakeExecutor(lead_script=[finish("sneaky")])
+    orch2 = _orch(tmp_ws, fake2)
+    rc = orch2.run(once=False)
+    assert rc == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+    assert fake2.lead_calls == []  # no work; blocker preserved
+    assert _final_run(tmp_ws).status == RunStatus.PAUSED.value
+
+    # Explicit resume=True revives it and work proceeds to finish.
+    fake3 = FakeExecutor(lead_script=[finish("accepted")])
+    orch3 = _orch(tmp_ws, fake3)
+    rc = orch3.run(once=False, resume=True)
+    assert rc == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
+    assert _final_run(tmp_ws).status == RunStatus.FINISHED.value

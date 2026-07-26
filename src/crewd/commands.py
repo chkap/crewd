@@ -538,10 +538,13 @@ def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = T
         cycle = goal_state.cycles
         return _tick_role(ws, cfg, backend, role, cycle)
 
-    # Clear stale exit-reason at start
+    # Clear stale exit-reason at start (a report artifact, not a durable blocker)
     if ws.exit_reason_file.exists():
         ws.exit_reason_file.unlink()
-    ws.resume()  # clear STOPPED/PAUSED if present (run is explicit intent)
+    # NOTE: a plain `crewd run` deliberately does NOT clear STOPPED/PAUSED
+    # sentinels or auto-resume a paused/stopped dispatcher run — that would erase
+    # a durable human blocker (the bypass fixed in PR #16). Reactivating a
+    # halted run is the explicit `crewd resume` workflow's job.
     orch = _build_orchestrator(ws, cfg, goal_state)
     # Install signal handlers (SIGINT, SIGTERM) — graceful stop
     prev_int = signal.signal(signal.SIGINT, orch.request_stop)
@@ -603,10 +606,11 @@ def cmd_run_daemon(workspace: Path, once: bool, auto_render: bool = True) -> int
 
     ws.write_pid(_os.getpid())
 
-    # Clear stale state
+    # Clear stale state (exit-reason is a report artifact; do NOT clear the
+    # STOPPED/PAUSED sentinels — a plain daemon start must not erase a durable
+    # human blocker. Use `crewd resume` to reactivate a halted run.)
     if ws.exit_reason_file.exists():
         ws.exit_reason_file.unlink()
-    ws.resume()
 
     orch = _build_orchestrator(ws, cfg, goal_state)
     signal.signal(signal.SIGINT, orch.request_stop)
@@ -741,12 +745,51 @@ def cmd_resume(workspace: Path) -> int:
     if not ws.is_initialized():
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
+    cleared = False
     if ws.is_stopped() or ws.is_paused():
         ws.resume()
+        cleared = True
         console.print("[green]✓[/] STOPPED/PAUSED sentinels cleared")
-    else:
+    # The explicit resume workflow is the ONLY path allowed to reactivate a
+    # durable paused/waiting/interrupted/stopped dispatcher run (a plain `crewd
+    # run` must not, so a human blocker is never silently erased).
+    resumed = _resume_dispatch_run(ws)
+    if resumed:
+        console.print("[green]✓[/] dispatcher run resumed → active")
+    if not cleared and not resumed:
         console.print("[blue]not stopped or paused — nothing to do[/]")
     return 0
+
+
+def _resume_dispatch_run(ws: Workspace) -> bool:
+    """Transition a durable paused/waiting/interrupted/stopped run back to active.
+
+    Returns True iff a run was actually resumed. No-op (returns False) when there
+    is no dispatch journal yet or the run is active/terminal.
+    """
+    from .dispatcher import DecisionError, Dispatcher, RunStatus
+
+    db = ws.state_dir / "dispatch.db"
+    if not db.exists():
+        return False
+    label = _goal_label_for_logs(ws) or "goal:v1"
+    disp = Dispatcher(db)
+    try:
+        run = disp.start_or_resume_run(label)
+        resumable = {
+            RunStatus.PAUSED.value,
+            RunStatus.WAITING.value,
+            RunStatus.INTERRUPTED.value,
+            RunStatus.STOPPED.value,
+        }
+        if run.status in resumable:
+            disp.resume_run(run.id)
+            return True
+        return False
+    except (DecisionError, KeyError):
+        return False
+    finally:
+        disp.close()
 
 
 def cmd_logs(workspace: Path, role: str | None, cycle: int | None, tail: int, follow: bool) -> int:

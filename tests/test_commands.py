@@ -164,17 +164,59 @@ def test_cmd_run_aborts_when_checkout_missing(tmp_ws: Workspace, monkeypatch):
     assert rc == 2
 
 
-def test_cmd_run_resume_clears_stopped_then_runs(tmp_ws: Workspace, monkeypatch):
+def test_cmd_run_stopped_persists_until_explicit_resume(tmp_ws: Workspace, monkeypatch):
+    """A plain `crewd run` must NOT clear a STOPPED sentinel (durable operator
+    stop); only `crewd resume` reactivates, after which run proceeds."""
     from fakes import FakeExecutor, finish
 
     tmp_ws.stop("from-test")
     assert tmp_ws.is_stopped()
     fake = FakeExecutor(lead_script=[finish("done")])
     _use_fake(monkeypatch, fake)
+
+    # Plain run: halts with the distinct stopped reason, does no Lead work, and
+    # leaves the sentinel in place.
     rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
     assert rc == 0
-    assert not tmp_ws.is_stopped()  # run cleared the sentinel (explicit intent)
+    assert tmp_ws.exit_reason_file.read_text().strip() == "stopped"
+    assert tmp_ws.is_stopped()  # NOT erased by a plain run
+    assert fake.lead_calls == []
+
+    # Explicit resume clears the sentinel + reactivates the dispatcher run.
+    assert commands.cmd_resume(tmp_ws.root) == 0
+    assert not tmp_ws.is_stopped()
+
+    # Now a run proceeds to finish.
+    rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
+    assert rc == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
     assert len(fake.lead_calls) == 1
+
+
+def test_cmd_run_does_not_bypass_lead_pause(tmp_ws: Workspace, monkeypatch):
+    """Regression: a plain run after a Lead human-block must not erase it."""
+    from fakes import FakeExecutor, finish, pause
+
+    # First run: Lead pauses → durable human blocker.
+    fake1 = FakeExecutor(lead_script=[pause("human-blocked: approval needed")])
+    _use_fake(monkeypatch, fake1)
+    assert commands.cmd_run(tmp_ws.root, once=False, role=None) == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+
+    # Second plain run: must report the blocker and do NO work (no bypass).
+    fake2 = FakeExecutor(lead_script=[finish("sneaky")])
+    _use_fake(monkeypatch, fake2)
+    assert commands.cmd_run(tmp_ws.root, once=False, role=None) == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+    assert fake2.lead_calls == []
+
+    # Explicit resume, then run proceeds.
+    assert commands.cmd_resume(tmp_ws.root) == 0
+    fake3 = FakeExecutor(lead_script=[finish("accepted")])
+    _use_fake(monkeypatch, fake3)
+    assert commands.cmd_run(tmp_ws.root, once=False, role=None) == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
+    assert len(fake3.lead_calls) == 1
 
 
 def test_cmd_run_signal_request_stop_breaks_loop(tmp_ws: Workspace, monkeypatch):
@@ -187,10 +229,10 @@ def test_cmd_run_signal_request_stop_breaks_loop(tmp_ws: Workspace, monkeypatch)
 
     orig = fake.run_lead
 
-    def kicker(req):
+    def kicker(req, *, on_started=None):
         if len(fake.lead_calls) >= 1:
             signal.raise_signal(signal.SIGINT)
-        return orig(req)
+        return orig(req, on_started=on_started)
 
     fake.run_lead = kicker  # type: ignore[method-assign]
     rc = commands.cmd_run(tmp_ws.root, once=False, role=None)

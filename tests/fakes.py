@@ -71,15 +71,17 @@ class FakeExecutor:
     def doctor(self) -> list[str]:
         return []
 
-    def execute_role(self, req: AttemptRequest) -> RoleAttemptOutcome:
+    def execute_role(self, req: AttemptRequest, *, on_started=None) -> RoleAttemptOutcome:
         self.role_calls.append(req)
         outcome = self._resolve_role_outcome(req)
         sid = f"sess-{req.role}"
+        if on_started is not None:
+            on_started(sid, 0)
         return RoleAttemptOutcome(
             result=_result(req.role, sid, outcome), session_id=sid, generation=0
         )
 
-    def run_lead(self, req: AttemptRequest) -> LeadTurnOutcome:
+    def run_lead(self, req: AttemptRequest, *, on_started=None) -> LeadTurnOutcome:
         self.lead_calls.append(req)
         pending_ids = _pending_ids_from_prompt(req.prompt)
         item = self._lead_script.pop(0) if self._lead_script else None
@@ -92,6 +94,8 @@ class FakeExecutor:
                 if decision is not None
                 else AttemptOutcome.SDK_ERROR
             )
+        if on_started is not None:
+            on_started("sess-lead", 0)
         return LeadTurnOutcome(
             result=_result("lead", "sess-lead", outcome),
             session_id="sess-lead",
