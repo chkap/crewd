@@ -275,6 +275,22 @@ class RunView:
 
 
 @dataclass(frozen=True)
+class RunDiagnostics:
+    """Read-only, single-transaction projection of a run's durable state.
+
+    Produced by :meth:`Dispatcher.read_run_diagnostics`. Pure durable truth from
+    the dispatch journal — control/liveness/session facts are layered on top at
+    explicitly lower authority by :mod:`crewd.diagnostics`.
+    """
+
+    run: "RunView"
+    current_attempt: "Optional[AttemptView]"
+    latest_handoff: "Optional[HandoffView]"
+    pending_handoff_count: int
+    latest_dispatch: "Optional[DispatchView]"
+
+
+@dataclass(frozen=True)
 class DispatcherLimits:
     """Deterministic bounds. ``0`` means unbounded."""
 
@@ -1212,6 +1228,70 @@ class Dispatcher:
         if row is None:
             raise KeyError(dispatch_id)
         return _dispatch_view(row)
+
+    def read_run_diagnostics(self, goal_label: str) -> "Optional[RunDiagnostics]":
+        """Read-only, point-in-time projection of the latest run for a goal label.
+
+        Performed in a **single deferred read transaction** so the run, its
+        in-flight attempt, latest handoff and latest Lead decision are all
+        observed at one consistent snapshot (they cannot shift mid-read while a
+        turn terminalises). Returns ``None`` when the label has no run yet.
+
+        This never mutates — unlike :meth:`start_or_resume_run`, it does **not**
+        create a run for an unseen label. It is the durable-truth source for the
+        operator diagnostic surface; control/liveness/session facts are layered
+        on top (at explicitly lower authority) by :mod:`crewd.diagnostics`.
+
+        ``current_attempt`` is the attempt currently holding routing authority
+        (``routing_authority`` is a dispatch id, not ``lead_pending``); after a
+        crash this is exactly the orphaned ``started`` attempt awaiting
+        restart reconciliation.
+        """
+        with self._txn() as c:
+            run_row = c.execute(
+                "SELECT * FROM goal_run WHERE goal_label = ? ORDER BY created_at DESC LIMIT 1",
+                (goal_label,),
+            ).fetchone()
+            if run_row is None:
+                return None
+            run = _run_view(run_row)
+
+            current_attempt: Optional[AttemptView] = None
+            if run.routing_authority != LEAD_PENDING:
+                att_row = c.execute(
+                    "SELECT * FROM attempt WHERE dispatch_id = ? AND run_id = ? "
+                    "AND state IN (?, ?)",
+                    (run.routing_authority, run.id,
+                     AttemptState.RESERVED.value, AttemptState.STARTED.value),
+                ).fetchone()
+                if att_row is not None:
+                    current_attempt = _attempt_view(att_row)
+
+            ho_row = c.execute(
+                "SELECT * FROM handoff WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (run.id,),
+            ).fetchone()
+            latest_handoff = _handoff_view(ho_row) if ho_row is not None else None
+
+            pending = c.execute(
+                "SELECT COUNT(*) AS n FROM handoff WHERE run_id = ? "
+                "AND consumed_by_dispatch_id IS NULL",
+                (run.id,),
+            ).fetchone()["n"]
+
+            dsp_row = c.execute(
+                "SELECT * FROM dispatch WHERE run_id = ? ORDER BY seq DESC LIMIT 1",
+                (run.id,),
+            ).fetchone()
+            latest_dispatch = _dispatch_view(dsp_row) if dsp_row is not None else None
+
+        return RunDiagnostics(
+            run=run,
+            current_attempt=current_attempt,
+            latest_handoff=latest_handoff,
+            pending_handoff_count=int(pending),
+            latest_dispatch=latest_dispatch,
+        )
 
     def export_run(self, run_id: str) -> dict:
         """A derived, human-readable snapshot (never the source of truth)."""

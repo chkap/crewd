@@ -162,6 +162,66 @@ atomic step, a crash *during* recovery is safe: re-running re-taints (a no-op)
 and then finalizes, so recovery is itself durable and retryable. A hard second
 signal or restart therefore cannot resume the orphan generation.
 
+## Operator diagnostics (`crewd status`) (#13)
+
+`crewd status` is a **read-only** projection for answering "what is this crew
+doing, and what is the safe next action?" — it never mutates workspace or journal
+state (in particular it does **not** clear a stale daemon PID; that repair belongs
+to `crewd doctor`). `crewd status --json` emits the same projection as a stable
+machine-readable object.
+
+The projection (`crewd.diagnostics.build_snapshot` → `DiagnosticSnapshot`) has one
+authoritative source layered by authority:
+
+1. **Durable truth** — the dispatch journal (`state/dispatch.db`), read in a
+   *single* transaction by `Dispatcher.read_run_diagnostics`: goal epoch → latest
+   run → routing authority / in-flight attempt → latest handoff + Lead decision.
+   `read_run_diagnostics` never creates a run for an unseen label.
+2. **Lower-authority annotations** — daemon PID liveness, `STOPPED`/`PAUSED`
+   sentinels, the `exit-reason` report artifact, and SDK session taint. These
+   *annotate* the journal status; they never substitute for it.
+
+Because a transition can briefly leave controls and journal disagreeing, the
+snapshot **detects contradictions** rather than silently picking a side, and
+routes the operator to `crewd doctor`. Detected contradictions include a `STOPPED`
+sentinel with a live daemon, a live daemon on a terminal (`finished`/`exhausted`)
+run, and a stale `goal-complete`/`exhausted` exit-reason while the run is still
+`active`.
+
+The recommended `safe_next_action` is a **finite** function of run status +
+liveness + orphan + taint + contradictions (`crewd.diagnostics.NextAction`):
+
+| Situation | Action |
+|---|---|
+| No dispatch journal yet, no live daemon | `no_journal` (run `crewd run`; flags a stale dead PID for `doctor` cleanup) |
+| No journal but a **live** daemon PID | `doctor` — contradiction; never advise a second run over a live process |
+| Active, in-flight attempt, live daemon | `running` (monitor) |
+| Active, idle / Lead authority, no daemon | `continue` (`crewd run`) |
+| Active, orphaned `started` attempt, dead daemon | `resume_orphan` (`crewd run` — startup reconciliation taints-before-finalizes the orphan, then continues with a fresh generation; notes when the orphan session is already tainted) |
+| Waiting | `wait` |
+| Paused (human blocker) | `resolve_blocker` |
+| Interrupted / stopped run | `resume` |
+| Finished / exhausted | `new_goal` |
+| Contradiction detected | `doctor` |
+
+The orphan case is exactly the crash signature: `routing_authority` equals a
+dispatch id (not `lead_pending`) while its attempt is still `started` — the
+in-flight attempt returned by `read_run_diagnostics` **is** the orphan awaiting
+restart reconciliation.
+
+Role-supplied handoff free-text (`evidence`/`changed`/`remaining`/`disagreement`/
+`blocker`) is **redacted and length-bounded** before display, and shown as field
+*presence + length* by default (raw SDK payloads are never surfaced). The
+system-derived `reason` is always redacted + bounded. `crewd doctor` remains the
+maintenance command that reports and clears a stale daemon PID.
+
+> **Tracked separately (#23):** the operator-documentation modernization (README /
+> architecture / configuration removing stale fixed-cycle wording) and the
+> **required** bounded integrated live SDK smoke — real `crewd run`/`status`/`resume`
+> against the Copilot SDK end-to-end — are a distinct, required goal outcome owned
+> by **#23**, split out from this issue by Lead. This slice (#13) delivers the
+> deterministic diagnostic/status *core*, validated from persisted fixtures.
+
 ## Tests
 
 `tests/test_orchestrator.py` is the end-to-end fake-SDK matrix (`tests/fakes.py`
@@ -171,4 +231,7 @@ sentinel, advisory dispatch, `continue_lead`, restart reconciliation, thrash
 guard, and signal interrupt. The command-layer loop tests
 (`tests/test_commands.py`, `tests/test_goal_lifecycle.py`) drive `cmd_run` with a
 monkeypatched `build_executor` returning a `FakeExecutor`, so no test touches the
-real SDK.
+real SDK. `tests/test_diagnostics.py` drives a real `Dispatcher` into each durable
+run state, persists it, and asserts the projected `safe_next_action`, contradiction
+detection, bounded redaction, `--json` stability, and the read-only guarantee
+(a stale PID survives a status projection).
