@@ -901,3 +901,51 @@ def test_migration_adds_handoff_disagreement_and_blocker(tmp_path):
     assert ho.disagreement == ""
     assert ho.blocker == ""
     assert disp._conn.execute("PRAGMA user_version").fetchone()[0] == Dispatcher._SCHEMA_VERSION
+
+
+# ─────────────────── read_run_diagnostics (observability, #13) ───────────────────
+def test_read_run_diagnostics_none_for_unknown_label(tmp_path):
+    disp = _open(tmp_path)
+    assert disp.read_run_diagnostics("goal:v1") is None
+    # Reading must not create a run.
+    disp.start_or_resume_run("goal:v1")
+    assert disp.read_run_diagnostics("goal:v2") is None
+
+
+def test_read_run_diagnostics_projects_inflight_orphan(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    att = disp.reserve_attempt(run.id, d.dispatch.id, "worker")
+    disp.mark_started(att, session_id="sess-1", generation=2)
+    diag = disp.read_run_diagnostics("goal:v1")
+    assert diag is not None
+    assert diag.run.status is RunStatus.ACTIVE
+    # authority is on the dispatch → the started attempt is the in-flight/orphan one
+    assert diag.current_attempt is not None
+    assert diag.current_attempt.state is AttemptState.STARTED
+    assert diag.current_attempt.session_id == "sess-1"
+    assert diag.current_attempt.generation == 2
+    assert diag.latest_dispatch.id == d.dispatch.id
+
+
+def test_read_run_diagnostics_no_current_attempt_when_lead_pending(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    _drive(disp, run.id, d.dispatch.id, "worker", AttemptOutcome.IDLE_COMPLETED,
+           evidence="PR #1", changed="src/x.py")
+    # terminal returned authority to lead_pending → no in-flight attempt
+    diag = disp.read_run_diagnostics("goal:v1")
+    assert diag.run.routing_authority == LEAD_PENDING
+    assert diag.current_attempt is None
+    assert diag.pending_handoff_count == 1
+    assert diag.latest_handoff.outcome_class is HandoffOutcome.COMPLETED
+
+
+def test_read_run_diagnostics_reads_latest_epoch_run(tmp_path):
+    disp = _open(tmp_path)
+    disp.start_or_resume_run("goal:v1")
+    r2 = disp.start_or_resume_run("goal:v2")
+    diag = disp.read_run_diagnostics("goal:v2")
+    assert diag.run.id == r2.id

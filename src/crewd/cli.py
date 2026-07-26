@@ -113,9 +113,12 @@ def pause(
 
 
 @app.command()
-def status(workspace: Optional[Path] = typer.Option(None, "--workspace", "-w")):
-    """Show workspace status."""
-    raise typer.Exit(commands.cmd_status(_ws_opt(workspace)))
+def status(
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w"),
+    json_output: bool = typer.Option(False, "--json", help="Emit a stable machine-readable snapshot."),
+):
+    """Show workspace status (read-only diagnostic snapshot)."""
+    raise typer.Exit(commands.cmd_status(_ws_opt(workspace), as_json=json_output))
 
 
 @app.command()

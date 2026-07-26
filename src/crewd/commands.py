@@ -330,6 +330,18 @@ def cmd_doctor(workspace: Path) -> int:
     state_tbl.add_column("field"); state_tbl.add_column("value")
     state_tbl.add_row("STOPPED", "yes" if ws.is_stopped() else "no")
     state_tbl.add_row("PAUSED", ws.pause_reason() or "no")
+    # Daemon liveness + stale-PID repair. `status` is read-only, so `doctor` is
+    # the maintenance command that actually clears a stale PID file.
+    pid = ws.read_pid()
+    if pid is not None:
+        if ws.is_daemon_alive():
+            state_tbl.add_row("daemon", f"PID {pid} (running)")
+        else:
+            state_tbl.add_row("daemon", f"PID {pid} (dead — cleaning up)")
+            ws.clear_pid()
+            issues.append(("warn", f"cleared stale daemon PID file (PID {pid} not alive)"))
+    else:
+        state_tbl.add_row("daemon", "not running")
     state_tbl.add_row(
         "cycle",
         f"{cycle} / {cfg.loop.max_cycles or '∞'}  (from {src})",
@@ -708,35 +720,90 @@ def cmd_pause(workspace: Path, reason: str) -> int:
     return 0
 
 
-def cmd_status(workspace: Path) -> int:
+def cmd_status(workspace: Path, as_json: bool = False) -> int:
     ws = Workspace(workspace.resolve())
     if not ws.is_initialized():
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
+    from .diagnostics import build_snapshot
+
     cfg = CrewConfig.load(ws.crew_yaml)
+    snap = build_snapshot(
+        ws, crew_name=cfg.name, backend=cfg.backend,
+        goal_label=_goal_label_for_logs(ws),
+    )
+
+    if as_json:
+        import json
+
+        console.print_json(json.dumps(snap.to_dict()))
+        return 0
+
     table = Table(title=f"crewd status — {cfg.name}")
     table.add_column("field"); table.add_column("value")
-    table.add_row("workspace", str(ws.root))
+    table.add_row("workspace", snap.workspace_root)
     table.add_row("remote", cfg.target.remote or "(unset)")
     table.add_row("branch", cfg.target.branch)
-    table.add_row("cycle", str(ws.read_cycle()))
-    table.add_row("stopped", "yes" if ws.is_stopped() else "no")
-    table.add_row("paused", ws.pause_reason() or "no")
-    # Daemon status
-    pid = ws.read_pid()
-    if pid is not None:
-        alive = ws.is_daemon_alive()
-        status = f"PID {pid} ([green]running[/])" if alive else f"PID {pid} ([red]dead[/])"
-        table.add_row("daemon", status)
-        if not alive:
-            ws.clear_pid()
+    table.add_row("backend", snap.backend)
+    table.add_row("goal", snap.goal_label or "[dim]none[/]")
+
+    # Durable journal truth.
+    if snap.run_id is None:
+        table.add_row("run", "[dim]no dispatch journal yet[/]")
+    else:
+        table.add_row("run", f"{snap.run_status} ({snap.run_id})")
+        table.add_row("routing authority", f"{snap.authority_holder} ({snap.routing_authority})")
+        if snap.current_attempt is not None:
+            a = snap.current_attempt
+            taint = " [red]tainted[/]" if a.get("tainted") else ""
+            table.add_row(
+                "current attempt",
+                f"{a['role']} · {a['state']} · gen {a['generation']}{taint}",
+            )
+        table.add_row("pending handoffs", str(snap.pending_handoff_count))
+        if snap.latest_handoff is not None:
+            h = snap.latest_handoff
+            present = [k for k in ("evidence", "changed", "remaining", "disagreement", "blocker")
+                       if h[k].get("present")]
+            table.add_row(
+                "latest handoff",
+                f"{h['role']} → {h['outcome_class']}"
+                + (f" · {h['reason']}" if h["reason"] else "")
+                + (f"  [dim](fields: {', '.join(present)})[/]" if present else ""),
+            )
+        if snap.latest_decision is not None:
+            d = snap.latest_decision
+            table.add_row(
+                "latest lead decision",
+                f"{d['kind']}" + (f" → {d['role']}" if d["role"] else ""),
+            )
+        if snap.wake_condition:
+            table.add_row("wake condition", snap.wake_condition)
+        if snap.human_blocker:
+            table.add_row("human blocker", snap.human_blocker)
+
+    # Lower-authority controls / liveness.
+    if snap.daemon_pid is not None:
+        alive = "[green]running[/]" if snap.daemon_alive else "[red]dead (stale PID)[/]"
+        table.add_row("daemon", f"PID {snap.daemon_pid} ({alive})")
     else:
         table.add_row("daemon", "[dim]not running[/]")
-    table.add_row("backend", cfg.backend)
+    table.add_row("stopped", "yes" if snap.stopped else "no")
+    table.add_row("paused", snap.paused_reason or "no")
+    if snap.exit_reason:
+        table.add_row("last exit-reason", snap.exit_reason)
+
     for r in ROLES:
         if r in cfg.roles:
             table.add_row(f"  {r}", f"{cfg.roles[r].model} ({cfg.roles[r].family})")
+
     console.print(table)
+
+    if snap.contradictions:
+        console.print("[yellow]⚠ inconsistent state detected:[/]")
+        for c in snap.contradictions:
+            console.print(f"  [yellow]•[/] {c}")
+    console.print(f"[blue]next action[/] ([bold]{snap.next_action.value}[/]): {snap.next_action_detail}")
     return 0
 
 
