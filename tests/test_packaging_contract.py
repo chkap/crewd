@@ -127,3 +127,25 @@ def test_legacy_backend_migration_has_no_sdk_extra():
     with pytest.raises(ValueError) as ei:
         get_backend("copilot")
     assert "crewd[sdk]" not in str(ei.value)
+
+
+def test_docs_use_per_subcommand_workspace_flag():
+    """Quickstart docs must not use the root-level ``crewd -w <ws> <cmd>`` form.
+
+    ``-w/--workspace`` is defined only on each subcommand (see ``src/crewd/cli.py``),
+    so ``crewd -w "$(pwd)" doctor`` fails with ``No such option: -w`` and breaks the
+    canonical quickstart for a new operator. The valid form is ``crewd <cmd> ... -w``.
+    Guards both operator-facing docs against regressing to the invalid placement.
+    """
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    # Matches ``crewd -w`` and ``run crewd -w`` (root-level flag before the subcommand).
+    bad = re.compile(r"\bcrewd -w\b")
+    for name in ("README.md", "SKILL.md"):
+        text = (root / name).read_text()
+        offenders = [ln for ln in text.splitlines() if bad.search(ln)]
+        assert not offenders, (
+            f"{name} uses invalid root-level -w placement (must be per-subcommand): "
+            f"{offenders}"
+        )

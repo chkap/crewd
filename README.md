@@ -25,27 +25,27 @@ uv --directory ~/crewd run crewd init my-crew --repo myorg/my-app
 
 # 2. Edit the goal
 cd my-crew
-uv --directory ~/crewd run crewd -w "$(pwd)" goal --edit
+uv --directory ~/crewd run crewd goal --edit -w "$(pwd)"
 
 # 3. Sanity check (config, families, target repo clone, agents/, inbox)
-uv --directory ~/crewd run crewd -w "$(pwd)" doctor
+uv --directory ~/crewd run crewd doctor -w "$(pwd)"
 
 # 4. Smoke test: one dispatcher step in the foreground (Lead is solicited,
 #    then at most one role it dispatches runs one attempt)
-uv --directory ~/crewd run crewd -w "$(pwd)" run --once
+uv --directory ~/crewd run crewd run --once -w "$(pwd)"
 
 # 5. (debug/compat escape hatch) Force a single tick of ONE named role,
 #    bypassing the Lead dispatcher — handy for isolating one role
-uv --directory ~/crewd run crewd -w "$(pwd)" tick lead
+uv --directory ~/crewd run crewd tick lead -w "$(pwd)"
 
 # 6. Run until completed, human-blocked, max-cycles, or signal
-uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon
+uv --directory ~/crewd run crewd run --daemon -w "$(pwd)"
 
 # 7. Check on it
-uv --directory ~/crewd run crewd -w "$(pwd)" status
+uv --directory ~/crewd run crewd status -w "$(pwd)"
 
 # 8. Stop gracefully (writes STOPPED + sends SIGINT to daemon)
-uv --directory ~/crewd run crewd -w "$(pwd)" stop
+uv --directory ~/crewd run crewd stop -w "$(pwd)"
 ```
 
 > ⚠️ When invoking via `uv --directory ~/crewd run crewd`, **always pass `-w "$(pwd)"`** — `uv --directory` changes uv's resolution cwd to the crewd repo, so workspace auto-discovery would otherwise pick the wrong directory.
