@@ -281,3 +281,103 @@ def test_taint_store_clear_enables_recovery(tmp_path):
 def test_attempt_config_defaults():
     c = AttemptConfig()
     assert c.wait_timeout > 0 and c.abort_timeout > 0
+
+
+# ─────────────────────── unconfirmed cleanup (R4/R5) ───────────────────────
+def test_disconnect_failure_taints_even_on_success(taint_store):
+    """A successful attempt whose cleanup cannot be confirmed must not remain
+    silently resumable — the session id is tainted (resume gate)."""
+    ops = FakeOps(run_signal=RunSignal.IDLE, disconnect_error=True)
+    res = run_attempt(ops, taint_store, prompt="hi", resume=False)
+    assert res.outcome is AttemptOutcome.IDLE_COMPLETED  # work did complete
+    assert res.cleanup_confirmed is False
+    assert res.tainted is True
+    assert taint_store.is_tainted(ops.session_id)
+
+
+def test_drained_events_are_attached_and_redacted(taint_store):
+    ops = FakeOps(
+        run_signal=RunSignal.IDLE,
+        events=["event:assistant_message", "token ghp_" + "A" * 36],
+    )
+    res = run_attempt(ops, taint_store, prompt="hi", resume=False)
+    assert "event:assistant_message" in res.session_event_summaries
+    assert all("ghp_" not in s for s in res.session_event_summaries)
+
+
+# ─────────────────────── adapter correctness (Advisory) ───────────────────────
+class _FakeSdkSession:
+    """Minimal stand-in for a copilot session to unit-test SdkRoleRuntime.run/abort."""
+
+    def __init__(self, *, wait_raises=None, wait_return=None, events=None):
+        self.wait_raises = wait_raises
+        self.wait_return = wait_return
+        self._events = events or []
+        self.sent_prompts = []
+        self.aborted = False
+
+    async def send_and_wait(self, prompt, timeout=None):
+        self.sent_prompts.append(prompt)
+        if self.wait_raises is not None:
+            raise self.wait_raises
+        return self.wait_return
+
+    async def abort(self):
+        self.aborted = True
+
+    async def get_events(self):
+        return list(self._events)
+
+
+def _runtime_with_session(session):
+    from crewd.sdk_adapter import SdkRoleRuntime, _LoopThread
+
+    rt = SdkRoleRuntime(
+        session_id="s", role="worker", model="m",
+        config_dir=__import__("pathlib").Path("/tmp"),
+        working_dir=__import__("pathlib").Path("/tmp"),
+    )
+    rt._loop = _LoopThread()
+    rt._session = session
+    return rt
+
+
+def test_adapter_run_none_return_is_idle_not_timeout():
+    """send_and_wait returning None means idle-with-no-assistant-message, NOT a
+    wait timeout (which the SDK signals via TimeoutError)."""
+    rt = _runtime_with_session(_FakeSdkSession(wait_return=None))
+    try:
+        assert rt.run("hi", timeout=1) is RunSignal.IDLE
+    finally:
+        rt._teardown_loop()
+
+
+def test_adapter_run_timeouterror_is_wait_timeout():
+    rt = _runtime_with_session(_FakeSdkSession(wait_raises=TimeoutError()))
+    try:
+        assert rt.run("hi", timeout=1) is RunSignal.WAIT_TIMEOUT
+    finally:
+        rt._teardown_loop()
+
+
+def test_adapter_abort_does_not_send_new_turn():
+    """Abort confirmation must not start a new turn; it polls durable events."""
+    session = _FakeSdkSession(events=[type("E", (), {"type": "session.abort"})()])
+    rt = _runtime_with_session(session)
+    try:
+        confirmed = rt.abort(timeout=1)
+        assert confirmed is True
+        assert session.aborted is True
+        assert session.sent_prompts == []  # NO new turn sent
+    finally:
+        rt._teardown_loop()
+
+
+def test_adapter_abort_unconfirmed_when_no_marker():
+    session = _FakeSdkSession(events=[])  # no abort/idle marker
+    rt = _runtime_with_session(session)
+    try:
+        assert rt.abort(timeout=1) is False
+        assert session.sent_prompts == []
+    finally:
+        rt._teardown_loop()

@@ -151,10 +151,17 @@ class AttemptResult:
     events: list[LifecycleEvent] = field(default_factory=list)
     error: str | None = None               # redacted SDK error message, if any
     tainted: bool = False
+    # Redacted durable SDK session-event summaries drained this attempt.
+    session_event_summaries: list[str] = field(default_factory=list)
+    # False when post-attempt cleanup (disconnect) could not be confirmed. Such a
+    # session is conservatively tainted so it is never silently resumed (R4/R5),
+    # even though the work outcome itself may be a success.
+    cleanup_confirmed: bool = True
 
     def __post_init__(self) -> None:
-        # Invariant: exactly one terminal outcome, and taint iff TAINTED.
-        self.tainted = self.outcome.taints_session
+        # Invariant: taint iff the terminal outcome taints OR cleanup was
+        # unconfirmed (unconfirmed cleanup must not remain silently resumable).
+        self.tainted = self.outcome.taints_session or not self.cleanup_confirmed
 
 
 # ─────────────────────────── SDK port (fakeable) ───────────────────────────
@@ -304,6 +311,8 @@ def run_attempt(
     attempt_id = _new_attempt_id(session_id, clock)
     start = clock()
     events: list[LifecycleEvent] = []
+    drained: list[str] = []
+    cleanup_ok = True
 
     def emit(phase: LifecyclePhase, detail: str = "") -> None:
         events.append(
@@ -327,7 +336,29 @@ def run_attempt(
             duration=clock() - start,
             events=events,
             error=redact(error) if error else None,
+            session_event_summaries=list(drained),
+            cleanup_confirmed=cleanup_ok,
         )
+
+    def cleanup() -> None:
+        """Drain durable event summaries, then disconnect.
+
+        On an unconfirmed disconnect the session id is tainted so it is never
+        silently resumed (R4/R5): unconfirmed cleanup is not a resumable state.
+        """
+        nonlocal cleanup_ok
+        try:
+            drained.extend(redact(s) for s in ops.drain_events())
+        except SdkError as e:
+            emit(LifecyclePhase.DISCONNECTED, f"event drain error: {e}")
+        try:
+            ops.disconnect()
+            emit(LifecyclePhase.DISCONNECTED, "clean")
+        except SdkError as e:
+            cleanup_ok = False
+            emit(LifecyclePhase.DISCONNECTED, f"disconnect error: {e}")
+            taint_store.taint(session_id)
+            emit(LifecyclePhase.SESSION_TAINTED, "cleanup unconfirmed; refusing future resume")
 
     emit(LifecyclePhase.ATTEMPT_STARTED, f"resume={resume}")
 
@@ -350,11 +381,11 @@ def run_attempt(
     try:
         signal = ops.run(prompt, cfg.wait_timeout)
     except SdkError as e:
-        _safe_disconnect(ops, emit)
+        cleanup()
         return finish(AttemptOutcome.SDK_ERROR, str(e))
 
     if signal is RunSignal.IDLE:
-        _safe_disconnect(ops, emit)
+        cleanup()
         return finish(AttemptOutcome.IDLE_COMPLETED)
 
     # Wait timed out — NOT a cancellation yet. Issue a bounded abort.
@@ -368,11 +399,15 @@ def run_attempt(
 
     if confirmed:
         emit(LifecyclePhase.ABORT_CONFIRMED, "session idle after abort")
-        _safe_disconnect(ops, emit)
+        cleanup()
         return finish(AttemptOutcome.ABORTED_CLEAN)
 
     # Abort could not be confirmed → force stop and taint.
     emit(LifecyclePhase.ABORT_FAILED, "abort not confirmed within bound")
+    try:
+        drained.extend(redact(s) for s in ops.drain_events())
+    except SdkError:
+        pass
     try:
         ops.force_stop()
     except SdkError as e:
@@ -382,14 +417,6 @@ def run_attempt(
     taint_store.taint(session_id)
     emit(LifecyclePhase.SESSION_TAINTED, "session marked unsafe to resume")
     return finish(AttemptOutcome.TAINTED, "wait timed out; abort unconfirmed; session tainted")
-
-
-def _safe_disconnect(ops: SdkOps, emit) -> None:
-    try:
-        ops.disconnect()
-        emit(LifecyclePhase.DISCONNECTED, "clean")
-    except SdkError as e:
-        emit(LifecyclePhase.DISCONNECTED, f"disconnect error: {e}")
 
 
 def _new_attempt_id(session_id: str, clock) -> str:

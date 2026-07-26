@@ -1,9 +1,11 @@
 # SDK-native role backend (`backend: copilot-sdk`)
 
-Status: **capability + seam established (#10)**. Tick-loop wiring is deferred to
-#11. This document records the transport decision, the offline-verified SDK
-capability facts, the attempt lifecycle state machine, the open capability
-risks, and a bounded live-smoke procedure.
+Status: **operational for a single-role tick (#10)**. Selecting
+`backend: copilot-sdk` runs a role through a real Copilot **session** via the
+adapter + attempt state machine and maps the typed outcome back to the legacy
+exit code. Replacing fixed round-table scheduling and consuming the richer
+persisted handoffs is #11 (which reads the `<log>.attempt.json` sidecar this
+backend writes, rather than reconstructing lifecycle meaning from exit codes).
 
 It is the design baseline for replacing the `copilot -p` subprocess backend
 (`crewd.backends.CopilotBackend`) with the official
@@ -32,7 +34,7 @@ the state machine + tests), not conventions.
 |--------|------|-------------|
 | `crewd.session_backend` | Domain port + attempt state machine + taint store. Fully unit-testable. | **No** — SDK-independent |
 | `crewd.sdk_adapter` | Concrete `SdkOps` over `copilot.CopilotClient`; async→sync bridge. | Yes (lazy, inside `open()`) |
-| `crewd.backends.SdkBackend` | `Backend`-shaped entry (`doctor`/`run_role`) selected by `backend: copilot-sdk`. | Lazy, for `doctor()` only |
+| `crewd.backends.SdkBackend` | `Backend`-shaped entry (`doctor`/`run_role`) selected by `backend: copilot-sdk`; maps outcome→exit code. | Lazy, via the adapter |
 
 `session_backend` defines the narrow `SdkOps` Protocol
 (`open`/`run`/`abort`/`drain_events`/`disconnect`/`force_stop`). The real adapter
@@ -104,14 +106,55 @@ Invariants (all covered by `tests/test_session_backend.py`):
   marks success or taints; it only *triggers* a bounded `abort()`.
 - **`force_stop` always taints.** Even if `force_stop()` itself raises, the
   session is still recorded `TAINTED` (fail-safe, not fail-open).
+- **Unconfirmed cleanup is not resumable.** If `disconnect()` cannot be
+  confirmed — even on an otherwise successful `IDLE_COMPLETED` attempt — the
+  session id is tainted (`cleanup_confirmed=False`), so the next tick starts a
+  fresh session instead of silently resuming a half-torn-down one (R4/R5).
 - **Tainted sessions refuse resume** unless `allow_tainted_resume=True` is
-  passed explicitly (operator override).
+  passed explicitly (operator override). The backend's automatic recovery for a
+  tainted-but-resumable session is to **create fresh**, never auto-resume.
 - **Durable logs are redacted.** `redact()` strips GitHub tokens, JWTs, and
-  `bearer`/`authorization`/`api_key`-style secrets before anything is written to
-  the adapter-owned event log.
+  `bearer`/`authorization`/`api_key`-style secrets before anything (lifecycle
+  events *or* drained SDK event summaries) is written to the log.
 
 `build_session_id(workspace_id, goal_label, role)` returns a deterministic hash
 so the same role in the same workspace/epoch resumes the same session.
+
+## Backend wiring (`SdkBackend.run_role`)
+
+`SdkBackend` maps the legacy `Backend.run_role(...)` call onto the state machine:
+
+- **model / directories / prompt / timeout** → `SdkRoleRuntime` construction +
+  `AttemptConfig(wait_timeout=timeout)`; `working_directory = cwd`,
+  `config_directory = config_dir`.
+- **resume decision** comes from a *persisted SDK-init marker*
+  (`config_dir/.crewd-sdk-session`), **not** the CLI's `first_run`
+  (`session-state/` presence). A legacy workspace switching to the SDK backend
+  therefore does not assume an SDK session already exists.
+- **outcome → exit code** at the compatibility edge:
+  `idle_completed→0`, `aborted_clean→130`, `tainted→124`, `sdk_error→1`
+  (mirroring `CopilotBackend`'s SIGINT/SIGKILL conventions). The **typed**
+  result is persisted to `<log>.attempt.json` for #11.
+- **cleanup** is owned by the state machine (disconnect / force_stop).
+- `ops_factory` is injectable so the whole selectable path is covered by
+  deterministic tests without the SDK (`tests/test_config.py`).
+
+### Tool-permission compatibility policy
+
+The legacy `copilot -p` backend ran with `--allow-all-tools` so roles could do
+their git/GitHub/file work. To keep `backend: copilot-sdk` *operationally*
+equivalent (not merely importable), the adapter defaults to an **allow-all**
+permission handler. A fail-closed handler is available via
+`SdkRoleRuntime(allow_all_tools=False)` + explicit `available_tools`.
+
+### `extra_add_dirs` / multi-dir compatibility
+
+The SDK exposes a single `working_directory` and has **no `--add-dir`
+equivalent**. `run_role` computes any requested `add_dirs` that are not the
+working directory and writes an **explicit, actionable diagnostic** naming them
+(rather than silently dropping them). Until a safe mapping is proven, place
+required paths under the working directory (e.g. via the role worktree) or keep
+`backend: copilot` for cross-dir roles.
 
 ## Offline-verified SDK capability facts (`github-copilot-sdk` 1.0.8)
 
@@ -123,26 +166,30 @@ Verified by importing the package and inspecting signatures (module name is
 - `.create_session(session_id=, model=, working_directory=, config_directory=,
   available_tools=, excluded_tools=, on_permission_request=, hooks=,
   reasoning_effort=, on_event=)` and `.resume_session(session_id, ...)`.
-- `session.send_and_wait(prompt, timeout=) -> SessionEvent | None`. **A timeout
-  returns `None` but does NOT abort in-flight work** — this is exactly why the
-  state machine treats wait-timeout and abort as distinct steps.
+- `session.send_and_wait(prompt, timeout=)` waits for `session.idle` and returns
+  the last assistant-message event, **which may legitimately be `None`** when
+  idle is reached with no assistant message. A wait *timeout* is signalled by
+  **`TimeoutError`**, *not* by a `None` return. The adapter's idle oracle is
+  therefore "the call returned without raising", and a `None` return is
+  `IDLE`, not a timeout (corrected per Advisory, from official source).
 - `session.abort()`, `session.get_events() -> list[SessionEvent]`,
   `session.disconnect()`.
 - Default transport = SDK-owned child stdio (`StdioRuntimeConnection`).
 
 ## Open capability risks (need the live experiment)
 
-1. **No `--add-dir` equivalent.** The CLI backend passes `add_dirs` so a role can
-   read sibling crew dirs. `create_session` exposes `working_directory` /
-   `config_directory` but **no multi-add-dir**. `extra_add_dirs` mapping is
-   unresolved and flagged; the live experiment must confirm whether a hook or a
-   symlinked working dir covers it.
-2. **Abort-confirmation semantics.** We confirm a clean abort by checking the
-   session returns to idle within the abort bound. Whether `abort()` is
-   synchronous or needs an idle-event poll must be validated live; today the
-   adapter treats an unconfirmed abort as taint (safe default).
+1. **No `--add-dir` equivalent** (see compatibility policy above). The live
+   experiment must confirm whether a hook or a symlinked working dir covers the
+   `extra_add_dirs` use case; until then the backend surfaces a diagnostic.
+2. **Abort-confirmation semantics.** The adapter confirms cancellation by
+   polling the durable event history for the SDK's `abort`/idle marker **without
+   sending a new turn** (an empty `send_and_wait` would start a fresh turn — the
+   bug Advisory flagged). A real-time *pre-registered idle latch* (Advisory
+   option 1, matching the official E2E test) is stronger and is the documented
+   next step once the live smoke pins the exact event type.
 3. **Event ordering / idle detection.** Which concrete `SessionEvent` type marks
-   "turn idle" vs. "still working" must be pinned against a real runtime.
+   "turn idle" / "aborted" vs. "still working" must be pinned against a real
+   runtime; `_is_abort_or_idle_event` currently matches tolerantly by type name.
 
 ## Live-smoke procedure (bounded, run manually with auth)
 
@@ -161,21 +208,20 @@ this is a manual, bounded checklist — not an automated test:
        await c.start()
        s = await c.create_session(model="claude-sonnet-4.6")
        ev = await s.send_and_wait("Reply with the single word: ok", timeout=60)
-       print("idle?", ev is not None, "events:", len(await s.get_events()))
+       print("idle (no exception) events:", len(await s.get_events()))
        await s.disconnect(); await c.stop()
    asyncio.run(main())
    ```
 3. Resolve each open risk above and record findings back into this file:
-   - the concrete idle/working `SessionEvent` types,
-   - whether `abort()` needs an idle poll,
+   - the concrete idle/working/abort `SessionEvent` types (then tighten
+     `_is_abort_or_idle_event` and consider the pre-registered idle latch),
+   - whether `abort()` needs an idle poll or exposes a waitable,
    - the `extra_add_dirs` answer.
-4. Only after those are pinned does #11 wire `SdkBackend.run_role` onto the
-   Lead-directed dispatch loop.
 
 ## Config
 
 `config.py` accepts `backend: "copilot" | "copilot-sdk"` (default `"copilot"`).
 Selecting `copilot-sdk` runs `SdkBackend.doctor()` in preflight (verifies
-`import copilot` succeeds). `run_role` intentionally raises `NotImplementedError`
-pointing at #11 until the loop coupling lands — selecting the backend today
-validates the environment without silently falling back to `copilot -p`.
+`import copilot` succeeds) and then executes each role tick through a real SDK
+session. It never silently falls back to `copilot -p`.
+

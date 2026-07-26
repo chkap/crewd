@@ -72,6 +72,7 @@ class SdkRoleRuntime(SdkOps):
         available_tools: list[str] | None = None,
         excluded_tools: list[str] | None = None,
         reasoning_effort: str | None = None,
+        allow_all_tools: bool = True,
     ) -> None:
         self.session_id = session_id
         self.role = role
@@ -81,6 +82,7 @@ class SdkRoleRuntime(SdkOps):
         self.available_tools = available_tools
         self.excluded_tools = excluded_tools
         self.reasoning_effort = reasoning_effort
+        self.allow_all_tools = allow_all_tools
         self._loop: _LoopThread | None = None
         self._client = None  # copilot.CopilotClient
         self._session = None  # copilot.CopilotSession
@@ -103,7 +105,9 @@ class SdkRoleRuntime(SdkOps):
                 session_id=self.session_id,
                 working_directory=str(self.working_dir),
                 config_directory=str(self.config_dir),
-                on_permission_request=_deny_all_permission,
+                on_permission_request=(
+                    _allow_all_permission if self.allow_all_tools else _deny_all_permission
+                ),
             )
             if self.available_tools is not None:
                 kwargs["available_tools"] = self.available_tools
@@ -126,11 +130,13 @@ class SdkRoleRuntime(SdkOps):
     def run(self, prompt: str, timeout: float) -> RunSignal:
         assert self._session is not None and self._loop is not None
         try:
-            # send_and_wait returns the terminal event on idle, or None on its
-            # own wait timeout. We add a small margin and treat the SDK's None
-            # (and our own outer timeout) as WAIT_TIMEOUT — the in-flight work is
-            # NOT aborted by this call.
-            result = self._loop.run(
+            # Idle oracle = the call returning WITHOUT raising. Per the official
+            # SDK, send_and_wait waits for `session.idle` and returns the last
+            # assistant-message event, which may legitimately be ``None`` when
+            # idle was reached with no assistant message. A wait *timeout* is
+            # signalled by TimeoutError, NOT by a None return — so None is IDLE,
+            # not a timeout. The in-flight work is never aborted by this call.
+            self._loop.run(
                 self._session.send_and_wait(prompt, timeout=timeout),
                 timeout=timeout + 30,
             )
@@ -138,7 +144,7 @@ class SdkRoleRuntime(SdkOps):
             return RunSignal.WAIT_TIMEOUT
         except Exception as e:
             raise SdkError(f"run failed: {e}") from e
-        return RunSignal.IDLE if result is not None else RunSignal.WAIT_TIMEOUT
+        return RunSignal.IDLE
 
     def abort(self, timeout: float) -> bool:
         assert self._session is not None and self._loop is not None
@@ -146,13 +152,24 @@ class SdkRoleRuntime(SdkOps):
             self._loop.run(self._session.abort(), timeout=timeout)
         except Exception as e:
             raise SdkError(f"abort failed: {e}") from e
-        # Confirm the session returned to idle within the bound by waiting for a
-        # short empty turn; if the SDK cannot confirm, treat as unconfirmed.
-        try:
-            self._loop.run(self._session.send_and_wait("", timeout=timeout), timeout=timeout + 5)
-            return True
-        except Exception:
-            return False
+        # Confirm cancellation WITHOUT sending a new turn (an empty
+        # send_and_wait would start a fresh turn, neither a read-only idle probe
+        # nor proof the aborted turn settled). Instead, poll the durable event
+        # history for the SDK's `abort` marker within the bound. A real-time
+        # pre-registered idle latch (Advisory option 1) is stronger and is the
+        # documented next step once the live smoke pins the exact event contract.
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            try:
+                events = self._loop.run(self._session.get_events(), timeout=10)
+            except Exception:
+                return False
+            if any(_is_abort_or_idle_event(ev) for ev in events[self._event_count:]):
+                return True
+            _time.sleep(0.2)
+        return False
 
     def drain_events(self) -> list[str]:
         if self._session is None or self._loop is None:
@@ -199,13 +216,37 @@ def _drop(d: dict, key: str) -> dict:
 
 
 def _deny_all_permission(_request):
-    """Fail-closed permission handler.
+    """Fail-closed permission handler (opt-in via ``allow_all_tools=False``).
 
-    Tool allowlists must be explicit and permission handlers must fail closed
-    (Advisory). Production tool policy is configured via ``available_tools`` /
-    ``excluded_tools``; this handler denies anything that still reaches it.
+    Denies anything reaching it. Use when a role must be sandboxed to an explicit
+    ``available_tools`` allowlist only.
     """
     return {"result": "deny"}
+
+
+def _allow_all_permission(_request):
+    """Allow-all permission handler — the default.
+
+    Compatibility policy: the legacy ``copilot -p`` backend ran with
+    ``--allow-all-tools`` so roles could perform their git/GitHub/file work.
+    The SDK backend keeps that behaviour by default so selecting
+    ``backend: copilot-sdk`` is operationally equivalent, not merely importable.
+    Tighter policy is available via ``allow_all_tools=False`` +
+    ``available_tools``/``excluded_tools``.
+    """
+    return {"result": "allow"}
+
+
+def _is_abort_or_idle_event(ev) -> bool:
+    """True if a durable SDK event marks the aborted turn as settled.
+
+    Matches the SDK's `abort` history event (and idle markers) by type name,
+    without depending on a concrete event class. The exact type is pinned by the
+    live smoke; this is deliberately tolerant of naming.
+    """
+    t = getattr(ev, "type", None)
+    name = str(getattr(t, "value", t) or "").lower()
+    return "abort" in name or "idle" in name or "cancel" in name
 
 
 def _summarise_event(ev) -> str:

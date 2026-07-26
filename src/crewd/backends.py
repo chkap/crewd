@@ -124,37 +124,214 @@ class CopilotBackend:
 class SdkBackend:
     """SDK-native execution boundary (official ``github-copilot-sdk``).
 
-    This is the new backend introduced by #10. It exposes the same ``doctor`` /
-    ``run_role`` shape as :class:`CopilotBackend` so config loading, preflight,
-    and the CLI keep working when ``backend: copilot-sdk`` is selected.
+    Runs one role tick through a real Copilot **session** (via the
+    :mod:`crewd.sdk_adapter` transport) driven by the
+    :func:`crewd.session_backend.run_attempt` lifecycle state machine, and maps
+    the typed :class:`~crewd.session_backend.AttemptOutcome` back to the legacy
+    integer exit code the tick loop expects. Selecting ``backend: copilot-sdk``
+    is therefore operational, not merely importable.
 
-    Per Lead's direction on #10, this PR establishes the SDK capability facts,
-    the transport decision, and the fakeable adapter/state-machine seam
-    (:mod:`crewd.session_backend`, :mod:`crewd.sdk_adapter`) *before* coupling
-    the round-table tick loop to it. Wiring ``run_role`` onto the persisted
-    Lead-directed dispatcher is the subject of #11, so calling it here raises a
-    clear, actionable error rather than silently driving `copilot -p`.
+    Scope boundary with #11: this backend makes a *single existing role tick*
+    execute through the SDK. Replacing fixed round-table scheduling and consuming
+    richer persisted handoffs is #11 — it reads the typed sidecar this backend
+    writes (``<log>.attempt.json``) rather than reconstructing lifecycle meaning
+    from exit codes.
+
+    ``ops_factory`` is injectable so the full selectable path (not just the
+    domain state machine) is covered by deterministic tests without the SDK.
     """
 
     name = "copilot-sdk"
+
+    # Exit-code mapping at the legacy Backend edge (typed outcome is persisted
+    # separately for #11). Chosen to mirror CopilotBackend's conventions:
+    #   0   clean completion            (CLI: normal exit)
+    #   130 cancelled after wait timeout (CLI: SIGINT after timeout)
+    #   124 tainted / unsafe to resume   (CLI: SIGKILL after timeout)
+    #   1   SDK error                    (CLI: generic nonzero)
+    _EXIT = {
+        "idle_completed": 0,
+        "aborted_clean": 130,
+        "tainted": 124,
+        "sdk_error": 1,
+    }
+
+    def __init__(self, ops_factory=None, taint_store_path: Path | None = None):
+        self._ops_factory = ops_factory
+        self._taint_store_path = taint_store_path
 
     def doctor(self) -> list[str]:
         from .sdk_adapter import sdk_available
 
         errs = []
-        if not sdk_available():
+        # The default (real) factory needs the SDK; an injected factory does not.
+        if self._ops_factory is None and not sdk_available():
             errs.append(
                 "`github-copilot-sdk` (import `copilot`) not installed. "
-                "Add it to the environment to use backend: copilot-sdk."
+                "Add it (`pip install 'crewd[sdk]'`) to use backend: copilot-sdk."
             )
         return errs
 
-    def run_role(self, *args, **kwargs) -> int:  # pragma: no cover - intentional guard
-        raise NotImplementedError(
-            "backend 'copilot-sdk' is not yet wired into the tick loop; the "
-            "persisted Lead-directed dispatcher that consumes the SDK session "
-            "boundary is tracked in #11. Use backend: copilot until then."
+    def run_role(
+        self,
+        role: str,
+        model: str,
+        config_dir: Path,
+        add_dirs: list[Path],
+        prompt: str,
+        log_path: Path,
+        timeout: int,
+        cwd: Path,
+        first_run: bool,
+    ) -> int:
+        import json
+
+        from .session_backend import (
+            AttemptConfig,
+            TaintStore,
+            TaintedSessionError,
+            build_session_id,
+            run_attempt,
         )
+
+        config_dir.mkdir(parents=True, exist_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Session identity is derived from workspace identity (the role's config
+        # dir, which encodes workspace + role) — never merely the role.
+        session_id = build_session_id(
+            workspace_id=str(config_dir.resolve()), goal_label="", role=role
+        )
+
+        taint_path = self._taint_store_path or (config_dir / ".crewd-sdk-taint")
+        taint_store = TaintStore(taint_path)
+
+        # Resume is decided by *persisted SDK-init state*, not the CLI's
+        # session-state dir (`first_run`): a legacy workspace switching to the
+        # SDK backend must not assume an SDK session already exists.
+        marker = config_dir / ".crewd-sdk-session"
+        resume = marker.exists() and marker.read_text().strip() == session_id
+
+        log_lines: list[str] = [
+            f"[crewd] backend=copilot-sdk role={role} model={model} "
+            f"session={session_id} resume={resume} first_run={first_run}"
+        ]
+
+        # If a resumable session is tainted, conservatively recover by starting a
+        # FRESH session (create, not resume) — never auto-resume a tainted id.
+        if resume and taint_store.is_tainted(session_id):
+            log_lines.append(
+                f"[crewd] session {session_id} is tainted; starting a fresh "
+                f"session instead of resuming (unsafe-resume needs explicit override)"
+            )
+            taint_store.clear(session_id)
+            resume = False
+
+        # extra_add_dirs / multi-dir compatibility: the SDK exposes a single
+        # working_directory and no `--add-dir` equivalent. Surface any dirs we
+        # cannot mount with an explicit, actionable diagnostic instead of
+        # silently dropping them (a safe mapping is not yet proven — see #10 doc).
+        try:
+            unmapped = [d for d in add_dirs if Path(d).resolve() != Path(cwd).resolve()]
+        except Exception:
+            unmapped = list(add_dirs)
+        if unmapped:
+            log_lines.append(
+                "[crewd] WARNING: backend copilot-sdk cannot mount extra add-dirs "
+                "(no SDK `--add-dir` equivalent). The role can only access its "
+                f"working_directory ({cwd}). Unmapped dirs: "
+                + ", ".join(str(d) for d in unmapped)
+                + ". Until a safe mapping is proven, place required paths under the "
+                "working_directory (e.g. via the role worktree) or keep backend: "
+                "copilot for cross-dir roles."
+            )
+
+        ops = self._make_ops(
+            session_id=session_id,
+            role=role,
+            model=model,
+            config_dir=config_dir,
+            working_dir=cwd,
+        )
+
+        cfg = AttemptConfig(wait_timeout=float(timeout))
+        try:
+            result = run_attempt(
+                ops, taint_store, prompt=prompt, resume=resume, config=cfg
+            )
+        except TaintedSessionError as e:
+            log_lines.append(f"[crewd] {e}")
+            self._write_log(log_path, log_lines)
+            return self._EXIT["tainted"]
+
+        # Durable, redacted per-attempt trail (lifecycle + SDK event summaries).
+        for ev in result.events:
+            log_lines.append(ev.to_line())
+        for s in result.session_event_summaries:
+            log_lines.append(f"  sdk-event: {s}")
+        log_lines.append(
+            f"[crewd] outcome={result.outcome.value} duration={result.duration:.3f}s "
+            f"tainted={result.tainted} cleanup_confirmed={result.cleanup_confirmed}"
+        )
+        self._write_log(log_path, log_lines)
+
+        # Persist the typed result for #11 (so the dispatcher need not reconstruct
+        # lifecycle meaning from the exit code).
+        sidecar = log_path.with_suffix(log_path.suffix + ".attempt.json")
+        try:
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "attempt_id": result.attempt_id,
+                        "session_id": result.session_id,
+                        "role": result.role,
+                        "outcome": result.outcome.value,
+                        "duration": result.duration,
+                        "tainted": result.tainted,
+                        "cleanup_confirmed": result.cleanup_confirmed,
+                        "error": result.error,
+                        "events": [
+                            {"phase": ev.phase.value, "elapsed": ev.elapsed, "detail": ev.detail}
+                            for ev in result.events
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+        except Exception:
+            pass
+
+        # Record SDK-init state so the next tick resumes deliberately (only when
+        # the session is still trustworthy).
+        if not result.tainted:
+            marker.write_text(session_id)
+        elif marker.exists():
+            marker.unlink()
+
+        return self._EXIT.get(result.outcome.value, 1)
+
+    def _make_ops(self, *, session_id, role, model, config_dir, working_dir):
+        if self._ops_factory is not None:
+            return self._ops_factory(
+                session_id=session_id,
+                role=role,
+                model=model,
+                config_dir=config_dir,
+                working_dir=working_dir,
+            )
+        from .sdk_adapter import SdkRoleRuntime
+
+        return SdkRoleRuntime(
+            session_id=session_id,
+            role=role,
+            model=model,
+            config_dir=config_dir,
+            working_dir=working_dir,
+        )
+
+    @staticmethod
+    def _write_log(log_path: Path, lines: list[str]) -> None:
+        log_path.write_text("\n".join(lines) + "\n")
 
 
 def get_backend(name: str) -> Backend:
