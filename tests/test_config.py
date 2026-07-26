@@ -12,7 +12,7 @@ def test_default_config_has_four_roles():
     assert cfg.target.remote == "acme/widget"
     assert cfg.target.repo == "./repo"
     assert cfg.target.branch == "main"
-    assert cfg.backend == "copilot"
+    assert cfg.backend == "copilot-sdk"
 
 
 def test_family_validation_passes_by_default():

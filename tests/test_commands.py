@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import signal
-import threading
-import time
 import pytest
 
 from crewd import commands
@@ -84,35 +82,46 @@ def test_cmd_doctor_missing_agent_md_is_error(tmp_ws: Workspace, monkeypatch):
     assert rc == 1
 
 
-# ─── run ───
-def test_cmd_run_once_walks_all_roles(tmp_ws: Workspace, monkeypatch):
+# ─── run (dispatcher-driven) ───
+def _use_fake(monkeypatch, fake):
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
+    monkeypatch.setattr(commands, "build_executor", lambda _cfg: fake)
+
+
+def test_cmd_run_once_advances_one_dispatch_step(tmp_ws: Workspace, monkeypatch):
+    from fakes import FakeExecutor, dispatch_to, finish
+
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
     commands._render_agent_files(tmp_ws, cfg)
-    backend = _StubBackend(healthy=True)
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+    fake = FakeExecutor(lead_script=[dispatch_to("worker"), finish()])
+    _use_fake(monkeypatch, fake)
     rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
     assert rc == 0
-    # All four roles ticked exactly once in round-table order
-    assert [c["role"] for c in backend.calls] == ["lead", "advisory", "worker", "verifier"]
-    # goal_label + workspace_root are threaded to the backend boundary.
-    assert all(c["goal_label"] == "goal:v1" for c in backend.calls)
-    assert all(c["workspace_root"] == tmp_ws.root for c in backend.calls)
-    # Cycle counter advanced
+    # One step = the Lead solicitation that dispatches worker; worker not yet run.
+    assert len(fake.lead_calls) == 1
+    assert fake.role_calls == []
     assert tmp_ws.read_cycle() == 1
-    assert (tmp_ws.state_dir / "logs" / "goal-v1" / "lead" / "0001.log").exists()
 
 
-def test_cmd_run_once_without_advisory_skips_it(tmp_ws: Workspace, monkeypatch):
+def test_cmd_run_full_reaches_finish(tmp_ws: Workspace, monkeypatch):
+    from fakes import FakeExecutor, dispatch_to, finish
+
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
-    del cfg.roles["advisory"]
-    cfg.save(tmp_ws.crew_yaml)
     commands._render_agent_files(tmp_ws, cfg)
-    backend = _StubBackend(healthy=True)
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
-    rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
+    fake = FakeExecutor(lead_script=[dispatch_to("worker"), finish("accepted")])
+    _use_fake(monkeypatch, fake)
+    rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
     assert rc == 0
-    assert [c["role"] for c in backend.calls] == ["lead", "worker", "verifier"]
-    assert not (tmp_ws.role_cfg_dir("advisory") / "AGENTS.md").exists()
+    assert [r.role for r in fake.role_calls] == ["worker"]
+    assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
+
+
+def test_cmd_run_rejects_legacy_copilot_backend(tmp_ws: Workspace, monkeypatch):
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.backend = "copilot"
+    cfg.save(tmp_ws.crew_yaml)
+    rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
+    assert rc == 2  # preflight refuses the retired subprocess backend
 
 
 def test_cmd_run_role_only_ticks_one(tmp_ws: Workspace, monkeypatch):
@@ -124,22 +133,6 @@ def test_cmd_run_role_only_ticks_one(tmp_ws: Workspace, monkeypatch):
     assert rc == 0
     assert len(backend.calls) == 1
     assert backend.calls[0]["role"] == "worker"
-
-
-def test_cmd_run_first_run_skips_continue_then_uses_continue(tmp_ws: Workspace, monkeypatch):
-    cfg = CrewConfig.load(tmp_ws.crew_yaml)
-    commands._render_agent_files(tmp_ws, cfg)
-    backend = _StubBackend(healthy=True, create_session=True)
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
-    # First cycle
-    commands.cmd_run(tmp_ws.root, once=True, role=None)
-    first_cycle_calls = list(backend.calls)
-    # Each role's first call should be first_run=True
-    assert all(c["first_run"] for c in first_cycle_calls)
-    backend.calls.clear()
-    # Second cycle — sessions now exist, first_run should be False
-    commands.cmd_run(tmp_ws.root, once=True, role=None)
-    assert all(not c["first_run"] for c in backend.calls)
 
 
 def test_cmd_run_aborts_on_family_mismatch(tmp_ws: Workspace, monkeypatch):
@@ -171,63 +164,104 @@ def test_cmd_run_aborts_when_checkout_missing(tmp_ws: Workspace, monkeypatch):
     assert rc == 2
 
 
-def test_cmd_run_resume_clears_stopped_then_runs(tmp_ws: Workspace, monkeypatch):
+def test_cmd_run_stopped_persists_until_explicit_resume(tmp_ws: Workspace, monkeypatch):
+    """A plain `crewd run` must NOT clear a STOPPED sentinel (durable operator
+    stop); only `crewd resume` reactivates, after which run proceeds."""
+    from fakes import FakeExecutor, finish
+
     tmp_ws.stop("from-test")
     assert tmp_ws.is_stopped()
-    backend = _StubBackend(healthy=True)
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
-    rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
+    fake = FakeExecutor(lead_script=[finish("done")])
+    _use_fake(monkeypatch, fake)
+
+    # Plain run: halts with the distinct stopped reason, does no Lead work, and
+    # leaves the sentinel in place.
+    rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
     assert rc == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "stopped"
+    assert tmp_ws.is_stopped()  # NOT erased by a plain run
+    assert fake.lead_calls == []
+
+    # Explicit resume clears the sentinel + reactivates the dispatcher run.
+    assert commands.cmd_resume(tmp_ws.root) == 0
     assert not tmp_ws.is_stopped()
-    assert len(backend.calls) == 4
+
+    # Now a run proceeds to finish.
+    rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
+    assert rc == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
+    assert len(fake.lead_calls) == 1
+
+
+def test_cmd_run_does_not_bypass_lead_pause(tmp_ws: Workspace, monkeypatch):
+    """Regression: a plain run after a Lead human-block must not erase it."""
+    from fakes import FakeExecutor, finish, pause
+
+    # First run: Lead pauses → durable human blocker.
+    fake1 = FakeExecutor(lead_script=[pause("human-blocked: approval needed")])
+    _use_fake(monkeypatch, fake1)
+    assert commands.cmd_run(tmp_ws.root, once=False, role=None) == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+
+    # Second plain run: must report the blocker and do NO work (no bypass).
+    fake2 = FakeExecutor(lead_script=[finish("sneaky")])
+    _use_fake(monkeypatch, fake2)
+    assert commands.cmd_run(tmp_ws.root, once=False, role=None) == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+    assert fake2.lead_calls == []
+
+    # Explicit resume, then run proceeds.
+    assert commands.cmd_resume(tmp_ws.root) == 0
+    fake3 = FakeExecutor(lead_script=[finish("accepted")])
+    _use_fake(monkeypatch, fake3)
+    assert commands.cmd_run(tmp_ws.root, once=False, role=None) == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
+    assert len(fake3.lead_calls) == 1
 
 
 def test_cmd_run_signal_request_stop_breaks_loop(tmp_ws: Workspace, monkeypatch):
-    """Spawn a thread that sends SIGINT mid-loop; verify clean exit (rc=0)."""
-    cfg = CrewConfig.load(tmp_ws.crew_yaml)
-    cfg.loop.sleep_secs = 1
-    cfg.save(tmp_ws.crew_yaml)
+    """A SIGINT mid-loop must exit cleanly (rc=0) with the interrupted reason."""
+    from fakes import FakeExecutor, dispatch_to
 
-    backend = _StubBackend(healthy=True)
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+    # Lead keeps dispatching worker forever; SIGINT after the first turn halts it.
+    fake = FakeExecutor(lead_script=[dispatch_to("worker")] * 100)
+    _use_fake(monkeypatch, fake)
 
-    def kicker():
-        time.sleep(0.5)  # let loop start cycle 1
-        signal.raise_signal(signal.SIGINT)
+    orig = fake.run_lead
 
-    t = threading.Thread(target=kicker, daemon=True)
-    t.start()
+    def kicker(req, *, on_started=None):
+        if len(fake.lead_calls) >= 1:
+            signal.raise_signal(signal.SIGINT)
+        return orig(req, on_started=on_started)
+
+    fake.run_lead = kicker  # type: ignore[method-assign]
     rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
-    t.join(timeout=2)
     assert rc == 0
-    # At least cycle 1 ran fully
-    assert tmp_ws.read_cycle() >= 1
+    assert tmp_ws.exit_reason_file.read_text().strip() == "interrupted"
 
 
-def test_cmd_run_max_cycles_limit(tmp_ws: Workspace, monkeypatch):
+def test_cmd_run_max_work_exhaustion(tmp_ws: Workspace, monkeypatch):
+    from fakes import FakeExecutor, dispatch_to
+
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
     cfg.loop.sleep_secs = 0
-    cfg.loop.max_cycles = 2
+    cfg.loop.max_cycles = 2  # → dispatcher max_work budget
     cfg.save(tmp_ws.crew_yaml)
-    backend = _StubBackend(healthy=True)
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+    fake = FakeExecutor(lead_script=[dispatch_to("worker")] * 20)
+    _use_fake(monkeypatch, fake)
     rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
     assert rc == 0
-    assert tmp_ws.read_cycle() == 2
-    # 4 roles × 2 cycles
-    assert len(backend.calls) == 8
+    assert tmp_ws.exit_reason_file.read_text().strip() == "exhausted"
 
 
-def test_cmd_run_pauses_after_lead_without_ticking_other_roles(tmp_ws: Workspace, monkeypatch):
-    backend = _PausingBackend()
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+def test_cmd_run_lead_pause_exits_human_blocked(tmp_ws: Workspace, monkeypatch):
+    from fakes import FakeExecutor, pause
 
+    fake = FakeExecutor(lead_script=[pause("human-blocked: operator approval required")])
+    _use_fake(monkeypatch, fake)
     rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
-
     assert rc == 0
-    assert [call["role"] for call in backend.calls] == ["lead"]
-    assert tmp_ws.is_paused()
-    assert not tmp_ws.is_stopped()
+    assert fake.role_calls == []  # no role work launched
     assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
 
 
@@ -328,22 +362,6 @@ class _StubBackend:
         if self._create_session:
             (config_dir / "session-state").mkdir(parents=True, exist_ok=True)
         return 0
-
-
-class _PausingBackend(_StubBackend):
-    def __init__(self):
-        super().__init__(healthy=True)
-
-    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs):
-        rc = super().run_role(
-            role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs
-        )
-        if role == "lead":
-            ws_root = config_dir.parent.parent
-            (ws_root / "state" / "PAUSED").write_text(
-                "human-blocked: operator approval required\n"
-            )
-        return rc
 
 
 def _fake_gh_ok(cmd, *a, **kw):

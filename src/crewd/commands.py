@@ -447,78 +447,17 @@ def _goal_label_for_logs(ws: Workspace) -> str | None:
         return None
 
 
-class _LoopController:
-    """Holds state for the foreground loop. Allows clean signal handling."""
+def build_executor(cfg: CrewConfig):
+    """Construct the typed AttemptExecutor the orchestrator drives.
 
-    def __init__(self, ws: Workspace, cfg: CrewConfig, backend, goal_state: GoalState):
-        self.ws = ws
-        self.cfg = cfg
-        self.backend = backend
-        self.goal_state = goal_state
-        self._interrupted = False
+    Kept as a module-level seam so tests can inject a deterministic fake without
+    the SDK. Only the SDK transport is supported now that the legacy subprocess
+    backend is retired; ``_preflight`` rejects any other ``backend`` value before
+    this is reached.
+    """
+    from .executor import SdkAttemptExecutor
 
-    def request_stop(self, signum, frame):
-        if self._interrupted:
-            console.print("\n[red]double signal — exiting hard[/]")
-            sys.exit(130)
-        console.print(f"\n[yellow]signal {signum} received — finishing current tick then stopping[/]")
-        self._interrupted = True
-
-    def _save_cycle(self, cycle: int) -> None:
-        self.goal_state.cycles = cycle
-        self.goal_state.save(self.ws.goal_json)
-        # Mirror to legacy cycle.txt for back-compat with existing reads
-        self.ws.write_cycle(cycle)
-
-    def loop(self, once: bool) -> int:
-        cycle = self.goal_state.cycles
-        while True:
-            if self.ws.is_stopped():
-                console.print(f"[yellow]STOPPED sentinel present; exiting at cycle {cycle}[/]")
-                _write_exit_reason(self.ws, "goal-complete")
-                return 0
-            if self.ws.is_paused():
-                console.print(
-                    f"[yellow]PAUSED for human input at cycle {cycle}:[/] "
-                    f"{self.ws.pause_reason()}"
-                )
-                _write_exit_reason(self.ws, "human-blocked")
-                return 0
-            if self._interrupted:
-                console.print("[yellow]interrupted; exiting cleanly[/]")
-                _write_exit_reason(self.ws, "interrupted")
-                return 0
-            cycle += 1
-            self._save_cycle(cycle)
-            console.print(f"\n[bold cyan]── cycle {cycle} ──[/]")
-            for r in ROLES:
-                if r not in self.cfg.roles:
-                    continue
-                if self.ws.is_stopped() or self.ws.is_paused() or self._interrupted:
-                    break
-                _tick_role(self.ws, self.cfg, self.backend, r, cycle)
-            if self.ws.is_stopped():
-                console.print(f"[yellow]STOPPED detected after cycle {cycle}[/]")
-                _write_exit_reason(self.ws, "goal-complete")
-                return 0
-            if self.ws.is_paused():
-                console.print(
-                    f"[yellow]PAUSED detected after cycle {cycle}:[/] "
-                    f"{self.ws.pause_reason()}"
-                )
-                _write_exit_reason(self.ws, "human-blocked")
-                return 0
-            if once:
-                return 0
-            if self.cfg.loop.max_cycles and cycle >= self.cfg.loop.max_cycles:
-                console.print(f"[blue]reached max_cycles={self.cfg.loop.max_cycles}[/]")
-                _write_exit_reason(self.ws, "exhausted")
-                return 0
-            # Sleep in 1-second slices so signals/sentinels are picked up promptly.
-            for _ in range(self.cfg.loop.sleep_secs):
-                if self._interrupted or self.ws.is_stopped() or self.ws.is_paused():
-                    break
-                time.sleep(1)
+    return SdkAttemptExecutor()
 
 
 def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfig, object, GoalState] | int:
@@ -541,7 +480,13 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             console.print(f"[red]family check:[/] {e}")
         return 2
 
-    backend = get_backend(cfg.backend)
+    try:
+        backend = get_backend(cfg.backend)
+    except ValueError as e:
+        # Legacy `backend: copilot` (the retired subprocess transport) or an
+        # unknown backend: refuse before any work with a migration diagnostic.
+        console.print(f"[red]backend:[/] {e}")
+        return 2
     bd_errs = backend.doctor()
     if bd_errs:
         for e in bd_errs:
@@ -567,11 +512,21 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
     return ws, cfg, backend, goal_state
 
 
-def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:
-    """Foreground loop. Walks roles in fixed order each cycle, sleeping between cycles.
+def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
+    from .orchestrator import Orchestrator
 
-    --once: run a single cycle then exit.
-    --role X: tick only role X (single tick), ignore loop.
+    executor = build_executor(cfg)
+    return Orchestrator(ws, cfg, executor, goal_state)
+
+
+def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:
+    """Foreground dispatcher-driven run.
+
+    Advances the goal run until Lead finishes/waits/pauses, the work budget
+    exhausts, or an operator control/signal halts it — each mapped to a distinct
+    persisted exit reason. ``--once`` advances exactly one dispatch step.
+    ``--role X`` runs a single tick of role X through the SDK backend directly
+    (bypassing the dispatcher), for manual/debug use.
     auto_render: if True (default), re-render agents/ when crew.yaml is newer.
     """
     result = _preflight(workspace, auto_render)
@@ -583,16 +538,19 @@ def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = T
         cycle = goal_state.cycles
         return _tick_role(ws, cfg, backend, role, cycle)
 
-    # Clear stale exit-reason at start
+    # Clear stale exit-reason at start (a report artifact, not a durable blocker)
     if ws.exit_reason_file.exists():
         ws.exit_reason_file.unlink()
-    ws.resume()  # clear STOPPED/PAUSED if present (run is explicit intent)
-    ctrl = _LoopController(ws, cfg, backend, goal_state)
+    # NOTE: a plain `crewd run` deliberately does NOT clear STOPPED/PAUSED
+    # sentinels or auto-resume a paused/stopped dispatcher run — that would erase
+    # a durable human blocker (the bypass fixed in PR #16). Reactivating a
+    # halted run is the explicit `crewd resume` workflow's job.
+    orch = _build_orchestrator(ws, cfg, goal_state)
     # Install signal handlers (SIGINT, SIGTERM) — graceful stop
-    prev_int = signal.signal(signal.SIGINT, ctrl.request_stop)
-    prev_term = signal.signal(signal.SIGTERM, ctrl.request_stop)
+    prev_int = signal.signal(signal.SIGINT, orch.request_stop)
+    prev_term = signal.signal(signal.SIGTERM, orch.request_stop)
     try:
-        return ctrl.loop(once)
+        return orch.run(once)
     finally:
         signal.signal(signal.SIGINT, prev_int)
         signal.signal(signal.SIGTERM, prev_term)
@@ -648,16 +606,17 @@ def cmd_run_daemon(workspace: Path, once: bool, auto_render: bool = True) -> int
 
     ws.write_pid(_os.getpid())
 
-    # Clear stale state
+    # Clear stale state (exit-reason is a report artifact; do NOT clear the
+    # STOPPED/PAUSED sentinels — a plain daemon start must not erase a durable
+    # human blocker. Use `crewd resume` to reactivate a halted run.)
     if ws.exit_reason_file.exists():
         ws.exit_reason_file.unlink()
-    ws.resume()
 
-    ctrl = _LoopController(ws, cfg, backend, goal_state)
-    signal.signal(signal.SIGINT, ctrl.request_stop)
-    signal.signal(signal.SIGTERM, ctrl.request_stop)
+    orch = _build_orchestrator(ws, cfg, goal_state)
+    signal.signal(signal.SIGINT, orch.request_stop)
+    signal.signal(signal.SIGTERM, orch.request_stop)
     try:
-        rc = ctrl.loop(once)
+        rc = orch.run(once)
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -786,12 +745,51 @@ def cmd_resume(workspace: Path) -> int:
     if not ws.is_initialized():
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
+    cleared = False
     if ws.is_stopped() or ws.is_paused():
         ws.resume()
+        cleared = True
         console.print("[green]✓[/] STOPPED/PAUSED sentinels cleared")
-    else:
+    # The explicit resume workflow is the ONLY path allowed to reactivate a
+    # durable paused/waiting/interrupted/stopped dispatcher run (a plain `crewd
+    # run` must not, so a human blocker is never silently erased).
+    resumed = _resume_dispatch_run(ws)
+    if resumed:
+        console.print("[green]✓[/] dispatcher run resumed → active")
+    if not cleared and not resumed:
         console.print("[blue]not stopped or paused — nothing to do[/]")
     return 0
+
+
+def _resume_dispatch_run(ws: Workspace) -> bool:
+    """Transition a durable paused/waiting/interrupted/stopped run back to active.
+
+    Returns True iff a run was actually resumed. No-op (returns False) when there
+    is no dispatch journal yet or the run is active/terminal.
+    """
+    from .dispatcher import DecisionError, Dispatcher, RunStatus
+
+    db = ws.state_dir / "dispatch.db"
+    if not db.exists():
+        return False
+    label = _goal_label_for_logs(ws) or "goal:v1"
+    disp = Dispatcher(db)
+    try:
+        run = disp.start_or_resume_run(label)
+        resumable = {
+            RunStatus.PAUSED.value,
+            RunStatus.WAITING.value,
+            RunStatus.INTERRUPTED.value,
+            RunStatus.STOPPED.value,
+        }
+        if run.status in resumable:
+            disp.resume_run(run.id)
+            return True
+        return False
+    except (DecisionError, KeyError):
+        return False
+    finally:
+        disp.close()
 
 
 def cmd_logs(workspace: Path, role: str | None, cycle: int | None, tail: int, follow: bool) -> int:

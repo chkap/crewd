@@ -261,8 +261,15 @@ this is a manual, bounded checklist — not an automated test:
 
 ## Config
 
-`config.py` accepts `backend: "copilot" | "copilot-sdk"` (default `"copilot"`).
-Selecting `copilot-sdk` runs `SdkBackend.doctor()` in preflight (verifies
-`import copilot` succeeds) and then executes each role tick through a real SDK
-session. It never silently falls back to `copilot -p`.
+`config.py` accepts `backend: "copilot" | "copilot-sdk"` (default `"copilot-sdk"`).
+`copilot-sdk` runs `SdkBackend.doctor()` / `SdkAttemptExecutor.doctor()` in
+preflight (verifies `import copilot` succeeds) and then drives every role tick
+and Lead decision turn through a real SDK session — never a `copilot -p`
+subprocess.
+
+The legacy `"copilot"` value is **retired**: `get_backend("copilot")` raises a
+`ValueError` carrying an actionable migration diagnostic, and `crewd run`
+preflight converts that into exit code 2 rather than silently launching a
+subprocess. `CopilotBackend` has been deleted. See `docs/orchestrator.md` for the
+dispatcher-driven run loop that consumes this backend.
 

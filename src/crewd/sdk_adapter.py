@@ -73,6 +73,7 @@ class SdkRoleRuntime(SdkOps):
         excluded_tools: list[str] | None = None,
         reasoning_effort: str | None = None,
         allow_all_tools: bool = True,
+        lead_decision_capture: dict | None = None,
     ) -> None:
         self.session_id = session_id
         self.role = role
@@ -83,6 +84,12 @@ class SdkRoleRuntime(SdkOps):
         self.excluded_tools = excluded_tools
         self.reasoning_effort = reasoning_effort
         self.allow_all_tools = allow_all_tools
+        # When set (a Lead decision turn), the ``submit_lead_decision`` custom
+        # tool records its single candidate into this attempt-local
+        # :class:`~crewd.executor.LeadDecisionCapture` — memory only. The handler
+        # must NOT mutate any durable dispatcher state; the one consuming
+        # transaction is resolve_lead_solicitation.
+        self._lead_capture = lead_decision_capture
         self._loop: _LoopThread | None = None
         self._client = None  # copilot.CopilotClient
         self._session = None  # copilot.CopilotSession
@@ -113,6 +120,8 @@ class SdkRoleRuntime(SdkOps):
                 kwargs["excluded_tools"] = self.excluded_tools
             if self.reasoning_effort is not None:
                 kwargs["reasoning_effort"] = self.reasoning_effort
+            if self._lead_capture is not None:
+                self._add_lead_decision_tool(copilot, kwargs)
             if resume:
                 self._session = self._loop.run(
                     self._client.resume_session(self.session_id, **_drop(kwargs, "session_id"))
@@ -203,6 +212,25 @@ class SdkRoleRuntime(SdkOps):
             self._teardown_loop()
 
     # ── helpers ──
+    def _add_lead_decision_tool(self, copilot_mod, kwargs: dict) -> None:
+        """Register the ``submit_lead_decision`` custom tool for a Lead turn.
+
+        Built through the official SDK ``define_tool`` API and passed via the
+        ``tools=[...]`` create_session parameter. The handler ONLY records the
+        (untrusted) candidate payload into the attempt-local capture — it never
+        touches durable dispatcher state; the single consuming transaction is
+        :meth:`crewd.dispatcher.Dispatcher.resolve_lead_solicitation`.
+
+        Registration failure is **not** swallowed: it propagates to
+        :meth:`open`, which surfaces it as an :class:`SdkError` (a failed Lead
+        turn), so a signature drift can never silently drop the only
+        decision-delivery channel and let the run masquerade as healthy.
+        """
+        if self._lead_capture is None:
+            return
+        tool = make_lead_decision_tool(copilot_mod, self._lead_capture)
+        kwargs.setdefault("tools", []).append(tool)
+
     def _teardown_loop(self) -> None:
         if self._loop is not None:
             self._loop.close()
@@ -265,3 +293,99 @@ def sdk_available() -> bool:
         return True
     except Exception:
         return False
+
+
+# ── submit_lead_decision custom tool (official define_tool API) ──
+_LEAD_TOOL_DESCRIPTION = (
+    "Submit EXACTLY ONE routing decision for the crew this turn. Call this tool "
+    "once and only once. Fields: kind (one of dispatch, continue_lead, wait, "
+    "pause, finish); ack_handoff_ids (the list of pending handoff ids this "
+    "decision acknowledges); role (target role, required for kind=dispatch); "
+    "reason (optional rationale); wake_condition (required for kind=wait); "
+    "human_blocker (required for kind=pause); final_acceptance (required for "
+    "kind=finish)."
+)
+
+
+def _lead_decision_params_model():
+    """Build the Pydantic params model for the submit_lead_decision tool.
+
+    Imported lazily so this module stays import-safe without the SDK/pydantic.
+    """
+    from typing import List, Optional
+
+    from pydantic import BaseModel, Field
+
+    class SubmitLeadDecisionParams(BaseModel):
+        kind: str = Field(
+            description="one of: dispatch, continue_lead, wait, pause, finish"
+        )
+        ack_handoff_ids: List[str] = Field(
+            default_factory=list,
+            description="pending handoff ids this decision acknowledges",
+        )
+        role: Optional[str] = Field(
+            default=None, description="target role (required for kind=dispatch)"
+        )
+        reason: Optional[str] = Field(default=None, description="optional rationale")
+        wake_condition: Optional[str] = Field(
+            default=None, description="required for kind=wait"
+        )
+        human_blocker: Optional[str] = Field(
+            default=None, description="required for kind=pause"
+        )
+        final_acceptance: Optional[str] = Field(
+            default=None, description="required for kind=finish"
+        )
+
+    return SubmitLeadDecisionParams
+
+
+def make_lead_decision_handler(capture):
+    """Return the inner ``(params, invocation) -> result`` handler.
+
+    Records the decision payload into ``capture`` (a
+    :class:`~crewd.executor.LeadDecisionCapture`) enforcing exactly-one
+    submission; never mutates durable dispatcher state. A second call is
+    rejected with a typed error while the capture still records that multiple
+    calls occurred, so a double-submit resolves as an invalid solicitation.
+    """
+
+    def _handler(params, invocation=None):
+        if hasattr(params, "model_dump"):
+            payload = params.model_dump()
+        elif isinstance(params, dict):
+            payload = dict(params)
+        else:  # pragma: no cover - defensive; SDK passes a pydantic model
+            payload = {
+                k: getattr(params, k)
+                for k in dir(params)
+                if not k.startswith("_") and not callable(getattr(params, k))
+            }
+        accepted = capture.submit(payload)
+        if not accepted:
+            return {
+                "accepted": False,
+                "error": "exactly one submit_lead_decision call is allowed per turn",
+            }
+        return {"accepted": True}
+
+    return _handler
+
+
+def make_lead_decision_tool(copilot_mod, capture):
+    """Build the ``submit_lead_decision`` ``Tool`` via the official SDK API.
+
+    Uses ``copilot.define_tool(name, description=, handler=, params_type=)`` —
+    the documented tool-definition surface — so an SDK signature drift (e.g. the
+    removed ``CustomTool``) fails loudly here instead of silently dropping the
+    decision channel.
+    """
+    handler = make_lead_decision_handler(capture)
+    params_type = _lead_decision_params_model()
+    return copilot_mod.define_tool(
+        "submit_lead_decision",
+        description=_LEAD_TOOL_DESCRIPTION,
+        handler=handler,
+        params_type=params_type,
+    )
