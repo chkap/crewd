@@ -119,10 +119,17 @@ def test_clean_idle_no_progress_claim_is_honoured():
 
 
 def test_disagreement_is_folded_into_reason_not_authority():
-    h = RoleHandoff(outcome_class="completed", reason="done", disagreement="disagree with scope")
+    h = RoleHandoff(
+        outcome_class="completed",
+        evidence="PR #9",
+        changed="none (approved)",
+        reason="done",
+        disagreement="disagree with scope",
+    )
     t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
     assert t.outcome_class is HandoffOutcome.COMPLETED
     assert "disagreement: disagree with scope" in t.reason_returned
+    assert t.disagreement == "disagree with scope"
 
 
 def test_transport_error_overrides_success_claim():
@@ -169,3 +176,81 @@ def test_invalid_outcome_class_on_clean_idle_is_protocol_failure():
     t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
     assert t.outcome_class is HandoffOutcome.UNCERTAIN
     assert "invalid outcome_class" in t.reason_returned
+
+# ── #12 review fixes: malformed single submission + empty-completed guard ──
+def test_single_submission_but_missing_handoff_is_protocol_failure_not_crash():
+    # Regression (Verifier PR #21): the capture counted one submission but parsing
+    # produced handoff=None. Resolution must NOT dereference handoff.outcome_class
+    # (AttributeError) — it must degrade to an uncertain protocol failure.
+    t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), None, 1)
+    assert t.outcome_class is HandoffOutcome.UNCERTAIN
+    assert t.outcome_class.is_unproductive
+    assert "role_protocol_failure" in t.reason_returned
+    assert "malformed submit_role_handoff payload" in t.reason_returned
+
+
+def test_empty_completed_payload_is_protocol_failure_not_productive():
+    # Regression (Advisory PR #21): a success-shaped `completed` with every
+    # semantic field empty must NOT record as productive COMPLETED (which would
+    # reset the no-progress guard). It is an uncertain protocol failure.
+    h = RoleHandoff(outcome_class="completed")
+    t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
+    assert t.outcome_class is HandoffOutcome.UNCERTAIN
+    assert t.outcome_class.is_unproductive
+    assert "completed claim without concrete evidence" in t.reason_returned
+
+
+def test_completed_with_evidence_but_no_state_account_is_protocol_failure():
+    h = RoleHandoff(outcome_class="completed", evidence="PR #7")
+    t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
+    assert t.outcome_class is HandoffOutcome.UNCERTAIN
+    assert "explicit changed/unchanged state account" in t.reason_returned
+
+
+def test_completed_with_evidence_and_unchanged_account_is_honoured():
+    # Role-neutral: a no-mutation verifiable outcome (e.g. an approval) counts as
+    # progress when it carries evidence + an explicit `none` state account.
+    h = RoleHandoff(
+        outcome_class="completed", evidence="approved PR #21", changed="none (approved)"
+    )
+    t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
+    assert t.outcome_class is HandoffOutcome.COMPLETED
+
+
+def test_no_progress_without_reason_is_protocol_failure():
+    h = RoleHandoff(outcome_class="no_progress")
+    t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
+    assert t.outcome_class is HandoffOutcome.UNCERTAIN
+    assert "no_progress claim without a return reason" in t.reason_returned
+
+
+def test_blocker_is_carried_through_and_folded_into_reason():
+    h = RoleHandoff(
+        outcome_class="no_progress",
+        reason="cannot proceed",
+        blocker="needs product decision on scope",
+    )
+    t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
+    assert t.outcome_class is HandoffOutcome.NO_PROGRESS
+    assert t.blocker == "needs product decision on scope"
+    assert "blocker: needs product decision on scope" in t.reason_returned
+
+
+def test_blocker_and_disagreement_survive_transport_override():
+    # Even when the transport overrides the class, evidence context is preserved.
+    h = RoleHandoff(
+        outcome_class="completed",
+        disagreement="scope too broad",
+        blocker="missing API key",
+    )
+    t = resolve_role_terminal(_result(AttemptOutcome.SDK_ERROR, error="boom"), h, 1)
+    assert t.outcome_class is HandoffOutcome.FAILED
+    assert t.disagreement == "scope too broad"
+    assert t.blocker == "missing API key"
+
+
+def test_parse_role_handoff_reads_blocker():
+    h = parse_role_handoff(
+        {"outcome_class": "no_progress", "reason": "x", "blocker": "human decision needed"}
+    )
+    assert h.blocker == "human decision needed"

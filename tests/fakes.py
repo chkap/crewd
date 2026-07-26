@@ -68,6 +68,7 @@ class FakeExecutor:
         lead_outcome: Optional[AttemptOutcome] = None,
         block_until_cancel: bool = False,
         role_handoff=None,
+        role_handoff_submissions=None,
     ):
         self._lead_script = list(lead_script or [])
         self._role_outcome = role_outcome
@@ -78,6 +79,11 @@ class FakeExecutor:
         # role tick reports exactly one submission; None models a role that
         # submitted nothing (a protocol failure on a clean idle).
         self._role_handoff = role_handoff
+        # Optional override for the reported submission count, decoupled from the
+        # resolved handoff. Models the malformed-single-submission case (the SDK
+        # capture counted exactly one call but parsing produced no handoff), which
+        # must resolve to an uncertain protocol failure — not crash.
+        self._role_handoff_submissions = role_handoff_submissions
         # When set, a *role* attempt blocks until the orchestrator trips the
         # CancelToken, then returns CANCELLED_CLEAN — deterministically modelling
         # an in-flight role tick cancelled by an interrupt/operator stop. Lead
@@ -113,12 +119,17 @@ class FakeExecutor:
             )
         outcome = self._resolve_role_outcome(req)
         handoff = self._resolve_role_handoff(req)
+        submissions = (
+            self._role_handoff_submissions
+            if self._role_handoff_submissions is not None
+            else (1 if handoff is not None else 0)
+        )
         return RoleAttemptOutcome(
             result=_result(req.role, sid, outcome),
             session_id=sid,
             generation=0,
             handoff=handoff,
-            handoff_submissions=1 if handoff is not None else 0,
+            handoff_submissions=submissions,
         )
 
     def run_lead(self, req: AttemptRequest, *, on_started=None, cancel=None) -> LeadTurnOutcome:
@@ -198,6 +209,7 @@ def role_handoff(
     remaining: str = "",
     reason: str = "",
     disagreement: str = "",
+    blocker: str = "",
 ) -> RoleHandoff:
     """Build a structured role handoff for FakeExecutor's ``role_handoff``."""
     return RoleHandoff(
@@ -207,4 +219,5 @@ def role_handoff(
         remaining=remaining,
         reason=reason,
         disagreement=disagreement,
+        blocker=blocker,
     )

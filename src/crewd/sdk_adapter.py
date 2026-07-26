@@ -462,12 +462,18 @@ _ROLE_HANDOFF_DESCRIPTION = (
     "this tool EXACTLY ONCE before you finish. Fields: outcome_class (one of "
     "'completed' = you made meaningful progress, or 'no_progress' = nothing "
     "meaningful changed this attempt); evidence (concrete references — PR/issue "
-    "numbers, commit shas, test output, logs); changed (what state you changed, "
-    "or 'none'); remaining (what is left / the suggested next step); reason (why "
-    "you are returning control to Lead now); disagreement (optional — any "
-    "concrete disagreement or blocker, reported as evidence, not a routing "
-    "decision). Routing stays with Lead; the transport lifecycle overrides any "
-    "success claim if the turn errored, timed out, or was cancelled."
+    "numbers, commit shas, test output, logs — REQUIRED for a 'completed' "
+    "claim); changed (what state you changed, or 'none' with a short account of "
+    "the verifiable outcome you produced without mutation — REQUIRED for a "
+    "'completed' claim); remaining (what is left / the suggested next step); "
+    "reason (why you are returning control to Lead now — REQUIRED for a "
+    "'no_progress' claim); disagreement (optional — any concrete disagreement "
+    "with a peer/Lead, reported as evidence, not a routing decision); blocker "
+    "(optional — any concrete blocker preventing progress, e.g. a missing "
+    "requirement or a human-only decision). disagreement and blocker are "
+    "evidence for Lead; they never route. Routing stays with Lead; the transport "
+    "lifecycle overrides any success claim if the turn errored, timed out, or "
+    "was cancelled."
 )
 
 
@@ -482,19 +488,25 @@ def _role_handoff_params_model():
             description="one of: completed, no_progress"
         )
         evidence: Optional[str] = Field(
-            default=None, description="concrete references (PRs, commits, test output)"
+            default=None,
+            description="concrete references (PRs, commits, test output); required for 'completed'",
         )
         changed: Optional[str] = Field(
-            default=None, description="what state changed, or 'none'"
+            default=None,
+            description="what state changed, or 'none' + verifiable outcome; required for 'completed'",
         )
         remaining: Optional[str] = Field(
             default=None, description="remaining work / suggested next step"
         )
         reason: Optional[str] = Field(
-            default=None, description="why control is returning to Lead now"
+            default=None,
+            description="why control is returning to Lead now; required for 'no_progress'",
         )
         disagreement: Optional[str] = Field(
-            default=None, description="optional concrete disagreement/blocker (evidence, not routing)"
+            default=None, description="optional concrete disagreement (evidence, not routing)"
+        )
+        blocker: Optional[str] = Field(
+            default=None, description="optional concrete blocker (evidence, not routing)"
         )
 
     return SubmitRoleHandoffParams

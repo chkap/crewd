@@ -122,7 +122,8 @@ class RoleHandoff:
     dispatcher/orchestrator — never this payload — decide the routing class: on a
     clean idle turn the role may *claim* only ``completed`` vs ``no_progress``
     (:data:`ROLE_CLAIMABLE_OUTCOMES`); the transport lifecycle outcome overrides
-    any claim otherwise. ``disagreement`` is evidence, not authority.
+    any claim otherwise. ``disagreement`` and ``blocker`` are evidence for Lead's
+    routing, never routing authority.
     """
 
     outcome_class: str
@@ -131,6 +132,7 @@ class RoleHandoff:
     remaining: str = ""
     reason: str = ""
     disagreement: str = ""
+    blocker: str = ""
 
 
 @dataclass(frozen=True)
@@ -607,6 +609,7 @@ def parse_role_handoff(payload) -> RoleHandoff:
         remaining=_s("remaining"),
         reason=_s("reason"),
         disagreement=_s("disagreement"),
+        blocker=_s("blocker"),
     )
 
 
@@ -619,6 +622,40 @@ class RoleTerminal:
     changed: str
     remaining: str
     reason_returned: str
+    disagreement: str = ""
+    blocker: str = ""
+
+
+def _role_claim_defect(handoff: Optional[RoleHandoff], submissions: int) -> Optional[str]:
+    """Return a protocol-failure detail for a clean-idle role claim, else ``None``.
+
+    A clean idle turn may claim ``completed``/``no_progress`` only through
+    *exactly one* well-formed submission that also carries a minimal semantic
+    progress account, so a success-shaped but empty payload cannot silently reset
+    the no-progress guard (a defect #9/#12 explicitly aim to remove). The account
+    is role-neutral: ``completed`` needs concrete ``evidence`` **and** an explicit
+    state statement (``changed`` — which may legitimately be ``none`` for a
+    verifiable no-mutation outcome such as a Verifier approval or Advisory
+    finding); ``no_progress`` needs a non-empty return ``reason``.
+    """
+    if submissions == 0:
+        return "no submit_role_handoff call"
+    if submissions > 1:
+        return f"{submissions} submit_role_handoff calls (exactly one required)"
+    if handoff is None:
+        return "malformed submit_role_handoff payload"
+    oc = handoff.outcome_class
+    if oc not in ROLE_CLAIMABLE_OUTCOMES:
+        return f"invalid outcome_class {oc!r}"
+    if oc == "completed":
+        if not handoff.evidence.strip():
+            return "completed claim without concrete evidence"
+        if not handoff.changed.strip():
+            return "completed claim without an explicit changed/unchanged state account"
+    else:  # no_progress
+        if not handoff.reason.strip():
+            return "no_progress claim without a return reason"
+    return None
 
 
 def resolve_role_terminal(
@@ -634,17 +671,23 @@ def resolve_role_terminal(
     * Non-idle transport (error / wait-timeout / cancel / taint) overrides any
       success-shaped role claim — the role cannot upgrade a failed turn.
     * A clean idle turn lets the role's *single* structured handoff choose
-      ``completed`` vs ``no_progress`` (:data:`ROLE_CLAIMABLE_OUTCOMES`).
-    * Zero, multiple, or malformed submissions on a clean idle are a protocol
-      failure: resolved as ``uncertain`` (which counts toward the no-progress
-      bounds), never a silent completion.
+      ``completed`` vs ``no_progress`` (:data:`ROLE_CLAIMABLE_OUTCOMES`) *only*
+      when it carries a minimal semantic progress account (see
+      :func:`_role_claim_defect`).
+    * Zero, multiple, malformed, or under-substantiated submissions on a clean
+      idle are a protocol failure: resolved as ``uncertain`` (which counts toward
+      the no-progress bounds), never a silent completion. This path never
+      dereferences a missing handoff.
 
-    In every case the role's ``evidence``/``changed`` context is carried through
-    when present, so Lead routes on the richest available information.
+    In every case the role's ``evidence``/``changed``/``disagreement``/``blocker``
+    context is carried through when present, so Lead routes on the richest
+    available information (as evidence, never as routing authority).
     """
     ev = handoff.evidence if handoff else ""
     changed = handoff.changed if handoff else ""
     remaining = handoff.remaining if handoff else ""
+    disagreement = handoff.disagreement if handoff else ""
+    blocker = handoff.blocker if handoff else ""
 
     if result.outcome is not AttemptOutcome.IDLE_COMPLETED:
         # Transport is authoritative: the lifecycle outcome wins the class.
@@ -654,30 +697,21 @@ def resolve_role_terminal(
             changed=changed,
             remaining=result.error or remaining,
             reason_returned=f"sdk:{result.outcome.value}",
+            disagreement=disagreement,
+            blocker=blocker,
         )
 
-    # Clean idle turn: the role's exactly-one structured claim governs.
-    valid = (
-        submissions == 1
-        and handoff is not None
-        and handoff.outcome_class in ROLE_CLAIMABLE_OUTCOMES
-    )
-    if not valid:
-        detail = (
-            "no submit_role_handoff call"
-            if submissions == 0
-            else (
-                f"{submissions} submit_role_handoff calls (exactly one required)"
-                if submissions > 1
-                else f"invalid outcome_class {handoff.outcome_class!r}"
-            )
-        )
+    # Clean idle turn: the role's exactly-one, substantiated claim governs.
+    detail = _role_claim_defect(handoff, submissions)
+    if detail is not None:
         return RoleTerminal(
             outcome_class=HandoffOutcome.UNCERTAIN,
             evidence=ev,
             changed=changed,
             remaining=remaining or "role returned idle without a valid structured handoff",
             reason_returned=f"role_protocol_failure: {detail}",
+            disagreement=disagreement,
+            blocker=blocker,
         )
 
     claimed = (
@@ -686,12 +720,16 @@ def resolve_role_terminal(
         else HandoffOutcome.NO_PROGRESS
     )
     reason = handoff.reason or f"role:{handoff.outcome_class}"
-    if handoff.disagreement:
-        reason = f"{reason} | disagreement: {handoff.disagreement}"
+    if disagreement:
+        reason = f"{reason} | disagreement: {disagreement}"
+    if blocker:
+        reason = f"{reason} | blocker: {blocker}"
     return RoleTerminal(
         outcome_class=claimed,
         evidence=ev,
         changed=changed,
         remaining=remaining,
         reason_returned=reason,
+        disagreement=disagreement,
+        blocker=blocker,
     )

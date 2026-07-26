@@ -188,6 +188,8 @@ class HandoffView:
     changed: str
     remaining: str
     reason_returned: str
+    disagreement: str
+    blocker: str
     created_at: str
     consumed_by_dispatch_id: Optional[str]
 
@@ -334,6 +336,8 @@ CREATE TABLE IF NOT EXISTS handoff (
     changed TEXT NOT NULL DEFAULT '',
     remaining TEXT NOT NULL DEFAULT '',
     reason_returned TEXT NOT NULL DEFAULT '',
+    disagreement TEXT NOT NULL DEFAULT '',
+    blocker TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     consumed_by_dispatch_id TEXT REFERENCES dispatch(id)
 );
@@ -383,28 +387,40 @@ class Dispatcher:
         self._migrate()
 
     # Bump when a schema change needs an in-place migration of existing DBs.
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
 
     def _migrate(self) -> None:
         """Idempotently upgrade a database created by an earlier kernel version.
 
         ``CREATE TABLE IF NOT EXISTS`` in :data:`_SCHEMA` creates any *missing*
         tables (e.g. ``solicitation`` and its indexes on a pre-#17 database) but
-        never alters an *existing* ``goal_run`` — so a database created by the
-        merged #11 kernel lacks the ``authority_seq`` / ``invalid_solicitations``
-        columns and would fail to decode. Add them in place with safe
-        ``NOT NULL DEFAULT 0`` semantics. The column-existence check is the
-        durable oracle (idempotent across repeated opens); ``user_version`` is a
-        derived marker only. Runs as one transaction so a crash mid-upgrade
-        leaves the database wholly upgraded or wholly not.
+        never alters an *existing* table — so a database created by the merged
+        #11 kernel lacks the ``authority_seq`` / ``invalid_solicitations``
+        columns, and a database created by the merged #17 kernel lacks the #12
+        ``disagreement`` / ``blocker`` handoff columns, and either would fail to
+        decode. Add them in place with safe ``NOT NULL DEFAULT`` semantics. The
+        per-table column-existence check is the durable oracle (idempotent across
+        repeated opens); ``user_version`` is a derived marker only. Runs as one
+        transaction so a crash mid-upgrade leaves the database wholly upgraded or
+        wholly not.
         """
-        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(goal_run)").fetchall()}
+        goal_run_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(goal_run)").fetchall()
+        }
+        handoff_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(handoff)").fetchall()
+        }
         additions = [
-            ("authority_seq", "ALTER TABLE goal_run ADD COLUMN authority_seq INTEGER NOT NULL DEFAULT 0"),
-            ("invalid_solicitations",
+            (goal_run_cols, "authority_seq",
+             "ALTER TABLE goal_run ADD COLUMN authority_seq INTEGER NOT NULL DEFAULT 0"),
+            (goal_run_cols, "invalid_solicitations",
              "ALTER TABLE goal_run ADD COLUMN invalid_solicitations INTEGER NOT NULL DEFAULT 0"),
+            (handoff_cols, "disagreement",
+             "ALTER TABLE handoff ADD COLUMN disagreement TEXT NOT NULL DEFAULT ''"),
+            (handoff_cols, "blocker",
+             "ALTER TABLE handoff ADD COLUMN blocker TEXT NOT NULL DEFAULT ''"),
         ]
-        pending = [sql for name, sql in additions if name not in cols]
+        pending = [sql for cols, name, sql in additions if name not in cols]
         self._conn.execute("BEGIN IMMEDIATE;")
         try:
             for sql in pending:
@@ -600,6 +616,8 @@ class Dispatcher:
         changed: str = "",
         remaining: str = "",
         reason_returned: str = "",
+        disagreement: str = "",
+        blocker: str = "",
     ) -> str:
         """Atomically record the single terminal outcome, its immutable handoff,
         and hand routing authority back to Lead.
@@ -636,6 +654,7 @@ class Dispatcher:
             handoff_id = self._insert_handoff(
                 c, att["run_id"], attempt_id, att["role"], cls,
                 evidence, changed, remaining, reason_returned,
+                disagreement=disagreement, blocker=blocker,
             )
             self._return_to_lead(c, att["run_id"], cls)
         return handoff_id
@@ -966,13 +985,15 @@ class Dispatcher:
 
     # ── internal helpers ─────────────────────────────────────────
     def _insert_handoff(self, c, run_id, attempt_id, role, cls: HandoffOutcome,
-                        evidence, changed, remaining, reason_returned) -> str:
+                        evidence, changed, remaining, reason_returned,
+                        *, disagreement: str = "", blocker: str = "") -> str:
         handoff_id = _new_id("ho")
         c.execute(
             "INSERT INTO handoff (id, attempt_id, run_id, role, outcome_class, evidence, "
-            "changed, remaining, reason_returned, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "changed, remaining, reason_returned, disagreement, blocker, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (handoff_id, attempt_id, run_id, role, cls.value, evidence, changed,
-             remaining, reason_returned, _now()),
+             remaining, reason_returned, disagreement, blocker, _now()),
         )
         return handoff_id
 
@@ -1247,5 +1268,6 @@ def _handoff_view(row: sqlite3.Row) -> HandoffView:
         id=row["id"], attempt_id=row["attempt_id"], run_id=row["run_id"], role=row["role"],
         outcome_class=HandoffOutcome(row["outcome_class"]), evidence=row["evidence"],
         changed=row["changed"], remaining=row["remaining"], reason_returned=row["reason_returned"],
+        disagreement=row["disagreement"], blocker=row["blocker"],
         created_at=row["created_at"], consumed_by_dispatch_id=row["consumed_by_dispatch_id"],
     )

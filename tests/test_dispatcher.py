@@ -853,3 +853,51 @@ def test_migration_is_idempotent(tmp_path):
 def test_fresh_db_has_schema_version(tmp_path):
     disp = _open(tmp_path)
     assert disp._conn.execute("PRAGMA user_version").fetchone()[0] == Dispatcher._SCHEMA_VERSION
+
+
+# ────────── #12 review: disagreement/blocker fields + their migration ──────────
+def test_terminal_persists_disagreement_and_blocker(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    _drive(
+        disp, run.id, d.dispatch.id, "worker", AttemptOutcome.IDLE_COMPLETED,
+        outcome_class=HandoffOutcome.NO_PROGRESS,
+        reason_returned="blocked",
+        disagreement="scope too broad",
+        blocker="needs product decision",
+    )
+    ho = disp.pending_handoffs(run.id)[0]
+    assert ho.disagreement == "scope too broad"
+    assert ho.blocker == "needs product decision"
+    # Immutable across reopen.
+    disp.close()
+    disp2 = Dispatcher(tmp_path / "dispatch.sqlite3")
+    ho2 = disp2.pending_handoffs(run.id)[0]
+    assert ho2.disagreement == "scope too broad"
+    assert ho2.blocker == "needs product decision"
+
+
+def test_migration_adds_handoff_disagreement_and_blocker(tmp_path):
+    db = tmp_path / "dispatch.sqlite3"
+    _make_old_db(db)
+    # Seed a pre-#12 handoff row (no disagreement/blocker columns).
+    import sqlite3
+    c = sqlite3.connect(str(db))
+    c.execute("INSERT INTO dispatch (id, run_id, seq, kind, role, created_at) "
+              "VALUES ('dsp-1','run-1',1,'dispatch','worker','t1')")
+    c.execute("INSERT INTO attempt (id, dispatch_id, run_id, role, state, reserved_at) "
+              "VALUES ('att-1','dsp-1','run-1','worker','terminal','t1')")
+    c.execute("INSERT INTO handoff (id, attempt_id, run_id, role, outcome_class, created_at) "
+              "VALUES ('ho-1','att-1','run-1','worker','completed','t2')")
+    c.commit(); c.close()
+
+    disp = Dispatcher(db)
+    cols = [r["name"] for r in disp._conn.execute("PRAGMA table_info(handoff)").fetchall()]
+    assert cols.count("disagreement") == 1
+    assert cols.count("blocker") == 1
+    # A legacy row decodes with empty (defaulted) new fields.
+    ho = disp.pending_handoffs("run-1")[0]
+    assert ho.disagreement == ""
+    assert ho.blocker == ""
+    assert disp._conn.execute("PRAGMA user_version").fetchone()[0] == Dispatcher._SCHEMA_VERSION

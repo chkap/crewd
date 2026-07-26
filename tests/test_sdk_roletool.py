@@ -42,6 +42,9 @@ def test_make_role_handoff_tool_uses_official_define_tool():
     assert "outcome_class" in props
     assert "evidence" in props
     assert "remaining" in props
+    # #12 review: disagreement and blocker are explicit, first-class fields.
+    assert "disagreement" in props
+    assert "blocker" in props
 
 
 def test_role_runtime_wires_tool_into_create_session_kwargs():

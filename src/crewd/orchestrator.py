@@ -289,6 +289,8 @@ class Orchestrator:
             changed=terminal.changed,
             remaining=terminal.remaining,
             reason_returned=terminal.reason_returned,
+            disagreement=terminal.disagreement,
+            blocker=terminal.blocker,
         )
         self._persist_cycle()
 
@@ -428,7 +430,11 @@ class Orchestrator:
             f"work for this one attempt, then return control to Lead by calling "
             f"the `submit_role_handoff` tool EXACTLY ONCE with your structured "
             f"outcome (outcome_class=completed|no_progress, plus evidence, "
-            f"changed, remaining, reason, and any disagreement). Do not assume a "
+            f"changed, remaining, reason, and any disagreement or blocker). A "
+            f"`completed` claim MUST carry concrete evidence and an explicit "
+            f"changed/unchanged state account; a `no_progress` claim MUST carry a "
+            f"return reason — an empty success-shaped payload is treated as a "
+            f"protocol failure, not progress. Do not assume a "
             f"next role — routing is Lead's alone."
         )
 
@@ -443,6 +449,8 @@ class Orchestrator:
                     f"      evidence: {h.evidence or '(none)'}",
                     f"      changed: {h.changed or '(none)'}",
                     f"      remaining: {h.remaining or '(none)'}",
+                    f"      disagreement: {h.disagreement or '(none)'}",
+                    f"      blocker: {h.blocker or '(none)'}",
                 ]
                 blocks.append("\n".join(lines))
             pending_block = (
