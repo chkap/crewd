@@ -105,9 +105,7 @@ class SdkRoleRuntime(SdkOps):
                 session_id=self.session_id,
                 working_directory=str(self.working_dir),
                 config_directory=str(self.config_dir),
-                on_permission_request=(
-                    _allow_all_permission if self.allow_all_tools else _deny_all_permission
-                ),
+                on_permission_request=_permission_handler(copilot, self.allow_all_tools),
             )
             if self.available_tools is not None:
                 kwargs["available_tools"] = self.available_tools
@@ -215,26 +213,30 @@ def _drop(d: dict, key: str) -> dict:
     return {k: v for k, v in d.items() if k != key}
 
 
-def _deny_all_permission(_request):
-    """Fail-closed permission handler (opt-in via ``allow_all_tools=False``).
+def _permission_handler(copilot_mod, allow_all: bool):
+    """Return an SDK-shaped permission handler ``(request, invocation) -> result``.
 
-    Denies anything reaching it. Use when a role must be sandboxed to an explicit
-    ``available_tools`` allowlist only.
+    The official SDK invokes the handler as ``handler(permission_request,
+    {"session_id": ...})`` and expects a typed ``PermissionRequestResult`` — NOT
+    a ``{"result": ...}`` dict. Getting this wrong means a prompt-only smoke may
+    pass while the first permissioned shell/file op silently fails to preserve
+    legacy ``--allow-all-tools`` behaviour (Advisory).
+
+    Allow-all reuses the SDK's own ``PermissionHandler.approve_all`` (returns
+    ``PermissionDecisionApproveOnce``), matching the legacy default. Deny returns
+    a typed ``PermissionDecisionUserNotAvailable`` — the same decision the SDK
+    itself falls back to when no handler can satisfy a request.
     """
-    return {"result": "deny"}
+    if allow_all:
+        # Official approve_all is exactly `(request, invocation) -> approve-once`.
+        return copilot_mod.PermissionHandler.approve_all
 
+    from copilot.generated.rpc import PermissionDecisionUserNotAvailable
 
-def _allow_all_permission(_request):
-    """Allow-all permission handler — the default.
+    def _deny(_request, _invocation):
+        return PermissionDecisionUserNotAvailable()
 
-    Compatibility policy: the legacy ``copilot -p`` backend ran with
-    ``--allow-all-tools`` so roles could perform their git/GitHub/file work.
-    The SDK backend keeps that behaviour by default so selecting
-    ``backend: copilot-sdk`` is operationally equivalent, not merely importable.
-    Tighter policy is available via ``allow_all_tools=False`` +
-    ``available_tools``/``excluded_tools``.
-    """
-    return {"result": "allow"}
+    return _deny
 
 
 def _is_abort_or_idle_event(ev) -> bool:

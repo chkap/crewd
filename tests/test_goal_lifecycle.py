@@ -201,7 +201,7 @@ class _StubBackend:
     def doctor(self):
         return [] if self._healthy else ["unhealthy"]
 
-    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run):
+    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs):
         self.calls.append({"role": role, "first_run": first_run})
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("ok\n")
@@ -215,8 +215,8 @@ class _StoppingBackend(_StubBackend):
         super().__init__(healthy=True)
         self._ws_root: Path | None = None
 
-    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run):
-        rc = super().run_role(role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run)
+    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs):
+        rc = super().run_role(role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs)
         # config_dir is <ws>/cfg/<role>; sentinel is at <ws>/state/STOPPED
         ws_root = config_dir.parent.parent
         (ws_root / "state").mkdir(parents=True, exist_ok=True)

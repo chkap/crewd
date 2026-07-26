@@ -267,16 +267,117 @@ class TaintStore:
 
 
 # ─────────────────────────── deterministic session id ───────────────────────────
-def build_session_id(workspace_id: str, goal_label: str, role: str) -> str:
+def build_session_id(
+    workspace_id: str, goal_label: str, role: str, generation: int = 0
+) -> str:
     """Deterministic, collision-resistant session id.
 
-    Derived from workspace identity + goal epoch + role (Advisory: never merely
-    role), so the same role in the same goal epoch resumes the same session, and
-    a new goal epoch starts a fresh one.
+    Derived from workspace identity + goal epoch + role + recovery *generation*
+    (Advisory: never merely role, and taint recovery must not reuse a
+    force-stopped id). The same role in the same goal epoch resumes the same
+    session; a new goal epoch — or a bumped recovery generation after a taint —
+    yields a fresh id.
     """
-    raw = f"{workspace_id}\x1f{goal_label}\x1f{role}"
+    raw = f"{workspace_id}\x1f{goal_label}\x1f{role}\x1f{generation}"
     digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
-    return f"crewd-{role}-{goal_label.replace(':', '-')}-{digest}"
+    label = goal_label.replace(":", "-") or "nogoal"
+    return f"crewd-{role}-{label}-g{generation}-{digest}"
+
+
+@dataclass(frozen=True)
+class SessionDecision:
+    """Result of :meth:`SessionRegistry.decide`: which session id to run and how."""
+
+    session_id: str
+    resume: bool
+    generation: int
+    fresh_reason: str | None = None
+
+
+class SessionRegistry:
+    """Durable ``(goal_epoch, role) → active session id + recovery generation``.
+
+    Implements Advisory's recommended recovery model (option a): normal ticks
+    resume the active id; a new goal epoch starts generation 0 under a new epoch
+    key; a taint advances the generation to a brand-new id **without** clearing
+    the old taint record (the force-stopped artifact is preserved for audit and
+    never reused). Persisted as JSON and written atomically so a crash cannot
+    later select a stale/tainted session.
+    """
+
+    def __init__(self, path: Path, workspace_id: str):
+        self.path = path
+        self.workspace_id = workspace_id
+        self._state: dict | None = None
+
+    def _load(self) -> dict:
+        if self._state is None:
+            if self.path.exists():
+                try:
+                    import json
+
+                    self._state = json.loads(self.path.read_text())
+                except Exception:
+                    self._state = {}
+            else:
+                self._state = {}
+        return self._state
+
+    def _save(self) -> None:
+        import json
+        import os
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self._state, indent=2))
+        os.replace(tmp, self.path)  # atomic
+
+    @staticmethod
+    def _key(goal_label: str, role: str) -> str:
+        return f"{goal_label}\x1f{role}"
+
+    def decide(self, *, goal_label: str, role: str, taint_store: "TaintStore") -> SessionDecision:
+        """Choose the session id for this tick and persist it atomically.
+
+        Resumes the active id for ``(goal_label, role)`` when it exists and is not
+        tainted; otherwise creates a fresh id (a new epoch → generation 0; a
+        tainted active id → next generation).
+        """
+        state = self._load()
+        key = self._key(goal_label, role)
+        entry = state.get(key)
+
+        if entry is not None:
+            active = entry.get("session_id")
+            gen = int(entry.get("generation", 0))
+            if active and not taint_store.is_tainted(active):
+                return SessionDecision(session_id=active, resume=True, generation=gen)
+            # Active id is tainted → recover with a NEW generation (never reuse).
+            gen = gen + 1
+            new_id = build_session_id(self.workspace_id, goal_label, role, gen)
+            state[key] = {"session_id": new_id, "generation": gen}
+            self._save()
+            return SessionDecision(
+                session_id=new_id,
+                resume=False,
+                generation=gen,
+                fresh_reason=(
+                    f"prior session tainted; advanced to recovery generation {gen} "
+                    f"(old tainted id preserved for audit)"
+                ),
+            )
+
+        # First time for this (epoch, role): generation 0, fresh session.
+        gen = 0
+        new_id = build_session_id(self.workspace_id, goal_label, role, gen)
+        state[key] = {"session_id": new_id, "generation": gen}
+        self._save()
+        return SessionDecision(
+            session_id=new_id,
+            resume=False,
+            generation=gen,
+            fresh_reason="new (goal_epoch, role) session",
+        )
 
 
 # ─────────────────────────── the attempt state machine ───────────────────────────

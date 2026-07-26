@@ -14,6 +14,7 @@ from crewd.session_backend import (
     LifecyclePhase,
     RunSignal,
     SdkError,
+    SessionRegistry,
     TaintedSessionError,
     TaintStore,
     build_session_id,
@@ -253,6 +254,8 @@ def test_session_id_is_deterministic_and_epoch_scoped():
     assert a != c            # new epoch → new session
     assert a != d            # different role → different session
     assert "worker" in a and "goal-v1" in a
+    # Recovery generation changes the id so a tainted session is never reused.
+    assert build_session_id("ws1", "goal:v1", "worker", 1) != a
 
 
 # ─────────────────────── taint store persistence ───────────────────────
@@ -381,3 +384,66 @@ def test_adapter_abort_unconfirmed_when_no_marker():
         assert session.sent_prompts == []
     finally:
         rt._teardown_loop()
+
+
+# ─────────────────────── session registry (epoch + recovery gen) ───────────────────────
+def test_registry_first_tick_creates_then_resumes(tmp_path):
+    ts = TaintStore(tmp_path / "taint.txt")
+    reg = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    d1 = reg.decide(goal_label="goal:v1", role="worker", taint_store=ts)
+    assert d1.resume is False and d1.generation == 0
+    # Re-read from disk → same active id, now resumes.
+    reg2 = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    d2 = reg2.decide(goal_label="goal:v1", role="worker", taint_store=ts)
+    assert d2.resume is True
+    assert d2.session_id == d1.session_id
+
+
+def test_registry_new_goal_epoch_creates_fresh(tmp_path):
+    ts = TaintStore(tmp_path / "taint.txt")
+    reg = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    d1 = reg.decide(goal_label="goal:v1", role="worker", taint_store=ts)
+    d2 = reg.decide(goal_label="goal:v2", role="worker", taint_store=ts)
+    assert d2.resume is False              # new epoch → fresh session, not resume
+    assert d2.session_id != d1.session_id
+    assert d2.generation == 0
+    # The old epoch still resumes its own session independently.
+    d1b = reg.decide(goal_label="goal:v1", role="worker", taint_store=ts)
+    assert d1b.resume is True and d1b.session_id == d1.session_id
+
+
+def test_registry_tainted_active_advances_generation(tmp_path):
+    ts = TaintStore(tmp_path / "taint.txt")
+    reg = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    d1 = reg.decide(goal_label="goal:v1", role="worker", taint_store=ts)
+    ts.taint(d1.session_id)  # simulate a force-stop taint of the active session
+    d2 = reg.decide(goal_label="goal:v1", role="worker", taint_store=ts)
+    assert d2.resume is False                 # never resume a tainted id
+    assert d2.generation == d1.generation + 1  # advanced recovery generation
+    assert d2.session_id != d1.session_id
+    assert ts.is_tainted(d1.session_id)       # old taint record PRESERVED for audit
+
+
+# ─────────────────────── permission handler SDK contract ───────────────────────
+def test_permission_handler_allow_all_is_typed_approve():
+    """allow-all must be invoked as (request, invocation) and return the SDK's
+    typed approve decision — not a {'result': ...} dict (Advisory)."""
+    copilot = pytest.importorskip("copilot")
+    from copilot.generated.rpc import PermissionDecisionApproveOnce
+
+    from crewd.sdk_adapter import _permission_handler
+
+    handler = _permission_handler(copilot, allow_all=True)
+    res = handler(None, {"session_id": "s"})  # two-arg SDK invocation
+    assert isinstance(res, PermissionDecisionApproveOnce)
+
+
+def test_permission_handler_deny_is_typed_user_not_available():
+    copilot = pytest.importorskip("copilot")
+    from copilot.generated.rpc import PermissionDecisionUserNotAvailable
+
+    from crewd.sdk_adapter import _permission_handler
+
+    handler = _permission_handler(copilot, allow_all=False)
+    res = handler(None, {"session_id": "s"})
+    assert isinstance(res, PermissionDecisionUserNotAvailable)
