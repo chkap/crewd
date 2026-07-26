@@ -11,8 +11,13 @@ The roles are decoupled from the target repo: the workspace lives wherever you w
 ## Quickstart
 
 ```bash
-# 0. Install (editable)
+# 0. Install. crewd runs every role through the official GitHub Copilot SDK
+#    (`backend: copilot-sdk`, the default and only production backend), which is
+#    a required core dependency — so a plain install is fully runnable:
+#      • from this repo (editable/dev):
 cd ~/crewd && uv sync
+#      • as a package (pick one):
+#        pip install crewd        # or:  uv tool install crewd
 
 # 1. Create a crew workspace (separate from your target repo)
 mkdir -p ~/crews && cd ~/crews
