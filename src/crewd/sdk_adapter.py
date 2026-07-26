@@ -73,6 +73,7 @@ class SdkRoleRuntime(SdkOps):
         excluded_tools: list[str] | None = None,
         reasoning_effort: str | None = None,
         allow_all_tools: bool = True,
+        lead_decision_capture: dict | None = None,
     ) -> None:
         self.session_id = session_id
         self.role = role
@@ -83,6 +84,13 @@ class SdkRoleRuntime(SdkOps):
         self.excluded_tools = excluded_tools
         self.reasoning_effort = reasoning_effort
         self.allow_all_tools = allow_all_tools
+        # When set (a Lead decision turn), the ``submit_lead_decision`` custom
+        # tool records its single candidate here — attempt-local memory only. The
+        # handler must NOT mutate any durable dispatcher state; the one consuming
+        # transaction is resolve_lead_solicitation. ``captured_lead_decision``
+        # mirrors the same value for the executor to read after the turn.
+        self._lead_capture = lead_decision_capture
+        self.captured_lead_decision = None
         self._loop: _LoopThread | None = None
         self._client = None  # copilot.CopilotClient
         self._session = None  # copilot.CopilotSession
@@ -113,6 +121,8 @@ class SdkRoleRuntime(SdkOps):
                 kwargs["excluded_tools"] = self.excluded_tools
             if self.reasoning_effort is not None:
                 kwargs["reasoning_effort"] = self.reasoning_effort
+            if self._lead_capture is not None:
+                self._add_lead_decision_tool(copilot, kwargs)
             if resume:
                 self._session = self._loop.run(
                     self._client.resume_session(self.session_id, **_drop(kwargs, "session_id"))
@@ -203,6 +213,45 @@ class SdkRoleRuntime(SdkOps):
             self._teardown_loop()
 
     # ── helpers ──
+    def _add_lead_decision_tool(self, copilot_mod, kwargs: dict) -> None:
+        """Register the ``submit_lead_decision`` custom tool for a Lead turn.
+
+        The handler ONLY records the (untrusted) candidate payload into the
+        attempt-local capture dict — it never touches durable dispatcher state.
+        The single consuming transaction is
+        :meth:`crewd.dispatcher.Dispatcher.resolve_lead_solicitation`. The exact
+        SDK custom-tool registration shape is pinned by the bounded live smoke
+        (docs/sdk-backend.md); this wiring is defensive so a signature drift in
+        the SDK cannot crash the Lead turn — a missing capture simply yields no
+        candidate, which the dispatcher treats as an invalid solicitation.
+        """
+        capture = self._lead_capture
+
+        def _handler(payload=None, *args, **_kwargs):
+            candidate = payload if payload is not None else (args[0] if args else None)
+            if capture is not None:
+                capture["decision"] = candidate
+            self.captured_lead_decision = candidate
+            return {"accepted": True}
+
+        try:
+            tools = kwargs.setdefault("custom_tools", [])
+            tool = copilot_mod.CustomTool(
+                name="submit_lead_decision",
+                description=(
+                    "Submit exactly one routing decision for the crew. Fields: "
+                    "kind (dispatch|continue_lead|wait|pause|finish), "
+                    "ack_handoff_ids (list), role, reason, wake_condition, "
+                    "human_blocker, final_acceptance."
+                ),
+                handler=_handler,
+            )
+            tools.append(tool)
+        except Exception:
+            # Registration shape differs from this build's SDK; leave the turn to
+            # run without the tool (no candidate captured → invalid solicitation).
+            kwargs.pop("custom_tools", None)
+
     def _teardown_loop(self) -> None:
         if self._loop is not None:
             self._loop.close()

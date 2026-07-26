@@ -134,19 +134,30 @@ A "crash" discards the `Dispatcher` and reopens a fresh one on the same file:
   reconciled `uncertain` with **no** handoff emitted, authority returns to Lead
   with a bumped nonce, and the lost in-memory candidate can never be applied.
 
-## Open items (slice B / live-smoke)
+## Integration status (issue #17)
 
-- Wire the kernel into a new `orchestrator.py` in place of the round-robin loop;
-  feed real SDK attempts through `reserve → start → terminal`, and obtain Lead
-  decisions through `open_lead_solicitation → run Lead turn → resolve_lead_solicitation`.
-- Add the typed `execute_attempt` / `AttemptExecutor` seam (+ `FakeExecutor`) and
-  the `submit_lead_decision` SDK custom tool whose handler only captures a
-  candidate in attempt-local memory.
-- Add a thread-safe `request_cancel(reason)` cancellation hook in the adapter and
-  a distinct clean-cancel terminal classification in `run_attempt`; taint an
-  orphaned session **before** finalizing its uncertain handoff on restart.
-- Reject `backend: copilot` with an actionable migration diagnostic; delete
-  `CopilotBackend`; prove by code search + per-entry-point reachability tests that
-  no production `copilot -p` path remains.
+The kernel is now wired into production via `orchestrator.py` and the typed
+`AttemptExecutor` seam — see `docs/orchestrator.md`. Delivered:
+
+- `orchestrator.py` replaces the round-robin loop; drives
+  `open_lead_solicitation → run Lead turn → resolve_lead_solicitation` and
+  `reserve → start → record_terminal` through the executor seam.
+- Typed `AttemptExecutor` / `SdkAttemptExecutor` / `FakeExecutor` seam
+  (`executor.py`, `tests/fakes.py`) plus the `submit_lead_decision` custom tool
+  whose handler only captures a candidate in attempt-local memory.
+- `backend: copilot` rejected with a migration diagnostic; `CopilotBackend`
+  deleted.
+- Full fake-SDK routing/restart matrix (`tests/test_orchestrator.py`).
+
+## Deferred (clearly-scoped follow-up)
+
+- Thread-safe `request_cancel(reason)` mid-attempt cancellation + a distinct
+  clean-cancel terminal in `run_attempt`, and taint-before-finalize orphan
+  recovery. This is a genuinely separate race: a POSIX signal handler runs
+  re-entrantly on the main thread while it is blocked inside the async SDK
+  bridge, so safe mid-attempt cancellation requires a worker-thread execution
+  model. The orchestrator today handles signals/operator controls **between**
+  steps (interrupt → `interrupted`, stop, pause); a step interrupted in-flight
+  is reconciled `uncertain` on the next start and never replayed.
 - Finalize `max_consecutive_unproductive` / `max_edge_repeats` once #12 defines
   the progress token that distinguishes real progress from a bare completion.

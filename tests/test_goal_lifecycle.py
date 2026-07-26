@@ -59,9 +59,12 @@ def test_cmd_run_detects_goal_sha_mismatch(tmp_ws: Workspace, monkeypatch):
 
 
 # ─── Exit reason files ───
-def test_exit_reason_written_on_stopped(tmp_ws: Workspace, monkeypatch):
-    backend = _StoppingBackend()
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+def test_exit_reason_written_on_finish(tmp_ws: Workspace, monkeypatch):
+    from fakes import FakeExecutor, finish
+
+    fake = FakeExecutor(lead_script=[finish("accepted")])
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
+    monkeypatch.setattr(commands, "build_executor", lambda _cfg: fake)
     rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
     assert rc == 0
     assert tmp_ws.exit_reason_file.exists()
@@ -69,12 +72,15 @@ def test_exit_reason_written_on_stopped(tmp_ws: Workspace, monkeypatch):
 
 
 def test_exit_reason_exhausted_on_max_cycles(tmp_ws: Workspace, monkeypatch):
+    from fakes import FakeExecutor, dispatch_to
+
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
     cfg.loop.sleep_secs = 0
     cfg.loop.max_cycles = 1
     cfg.save(tmp_ws.crew_yaml)
-    backend = _StubBackend(healthy=True)
-    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+    fake = FakeExecutor(lead_script=[dispatch_to("worker")] * 20)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
+    monkeypatch.setattr(commands, "build_executor", lambda _cfg: fake)
     rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
     assert rc == 0
     assert tmp_ws.exit_reason_file.read_text().strip() == "exhausted"
@@ -206,22 +212,6 @@ class _StubBackend:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("ok\n")
         return 0
-
-
-class _StoppingBackend(_StubBackend):
-    """Writes STOPPED sentinel after first lead tick."""
-
-    def __init__(self):
-        super().__init__(healthy=True)
-        self._ws_root: Path | None = None
-
-    def run_role(self, role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs):
-        rc = super().run_role(role, model, config_dir, add_dirs, prompt, log_path, timeout, cwd, first_run, **kwargs)
-        # config_dir is <ws>/cfg/<role>; sentinel is at <ws>/state/STOPPED
-        ws_root = config_dir.parent.parent
-        (ws_root / "state").mkdir(parents=True, exist_ok=True)
-        (ws_root / "state" / "STOPPED").write_text("goal-complete\n")
-        return rc
 
 
 def _explode_subprocess(cmd, *a, **kw):

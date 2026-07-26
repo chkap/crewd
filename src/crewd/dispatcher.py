@@ -1108,12 +1108,53 @@ class Dispatcher:
         fresh = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
         return DecisionResult(run=_run_view(fresh), dispatch=dispatch)
 
+    def mark_run_status(
+        self, run_id: str, status: RunStatus, *, human_blocker: str | None = None
+    ) -> RunView:
+        """Durably record an operator-driven halt (stopped/paused/interrupted).
+
+        This is the write counterpart to :meth:`resume_run`: it lets the
+        orchestrator persist *why* a run stopped launching work so a restart sees
+        the halt instead of resuming as if nothing happened. Only the operator
+        halt states are permitted here; routing decisions (wait/finish) flow
+        through :meth:`lead_decide` / :meth:`resolve_lead_solicitation`, and
+        ``exhausted`` is set only by the budget guards. Idempotent: re-marking a
+        run already in the target status is a no-op. Terminal ``finished`` /
+        ``exhausted`` runs cannot be overwritten (raises :class:`DecisionError`).
+        """
+        allowed = {RunStatus.STOPPED, RunStatus.PAUSED, RunStatus.INTERRUPTED}
+        if status not in allowed:
+            raise DecisionError(f"mark_run_status only accepts {allowed}, not {status}")
+        terminal = {RunStatus.FINISHED.value, RunStatus.EXHAUSTED.value}
+        with self._txn() as c:
+            run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(run_id)
+            if run["status"] == status.value:
+                return _run_view(run)
+            if run["status"] in terminal:
+                raise DecisionError(
+                    f"run {run_id} is {run['status']} (terminal) and cannot be {status.value}"
+                )
+            c.execute(
+                "UPDATE goal_run SET status = ?, human_blocker = ? WHERE id = ?",
+                (status.value, human_blocker, run_id),
+            )
+            run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+        return _run_view(run)
+
     # ── read helpers (test/observability) ────────────────────────
     def get_attempt(self, attempt_id: str) -> AttemptView:
         row = self._conn.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
         if row is None:
             raise KeyError(attempt_id)
         return _attempt_view(row)
+
+    def get_dispatch(self, dispatch_id: str) -> DispatchView:
+        row = self._conn.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+        if row is None:
+            raise KeyError(dispatch_id)
+        return _dispatch_view(row)
 
     def export_run(self, run_id: str) -> dict:
         """A derived, human-readable snapshot (never the source of truth)."""
