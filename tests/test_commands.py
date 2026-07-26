@@ -229,7 +229,7 @@ def test_cmd_run_signal_request_stop_breaks_loop(tmp_ws: Workspace, monkeypatch)
 
     orig = fake.run_lead
 
-    def kicker(req, *, on_started=None):
+    def kicker(req, *, on_started=None, cancel=None):
         if len(fake.lead_calls) >= 1:
             signal.raise_signal(signal.SIGINT)
         return orig(req, on_started=on_started)

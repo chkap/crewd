@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from .dispatcher import LeadDecision
-from .session_backend import AttemptOutcome, AttemptResult
+from .session_backend import AttemptOutcome, AttemptResult, CancelToken
 
 # Callback the orchestrator supplies to durably journal an attempt as `started`
 # with its selected session identity BEFORE any SDK send. Called at most once,
@@ -133,7 +133,13 @@ class AttemptExecutor(Protocol):
         """Return a list of health-check error strings; empty means healthy."""
         ...
 
-    def execute_role(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> RoleAttemptOutcome:
+    def execute_role(
+        self,
+        req: AttemptRequest,
+        *,
+        on_started: Optional[OnStarted] = None,
+        cancel: "Optional[CancelToken]" = None,
+    ) -> RoleAttemptOutcome:
         """Run one role tick, returning its typed outcome (never raises for a
         normal SDK failure — that is encoded in ``result.outcome``).
 
@@ -142,14 +148,26 @@ class AttemptExecutor(Protocol):
         identity is durably journaled before transport work begins. It is not
         called when the attempt is refused pre-execution (a mounting error): no
         session is opened and no send occurs.
+
+        ``cancel`` is an optional :class:`~crewd.session_backend.CancelToken` the
+        orchestrator may trip (from its control/signal poll) to cancel the attempt
+        while it is in flight. A clean, confirmed cancellation yields
+        :attr:`~crewd.session_backend.AttemptOutcome.CANCELLED_CLEAN`; an
+        unconfirmed one taints the session.
         """
         ...
 
-    def run_lead(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> LeadTurnOutcome:
+    def run_lead(
+        self,
+        req: AttemptRequest,
+        *,
+        on_started: Optional[OnStarted] = None,
+        cancel: "Optional[CancelToken]" = None,
+    ) -> LeadTurnOutcome:
         """Run one Lead decision turn, returning its typed outcome + candidate.
 
         ``on_started`` has the same pre-send journaling contract as
-        :meth:`execute_role`.
+        :meth:`execute_role`; ``cancel`` the same in-flight cancellation contract.
         """
         ...
 
@@ -209,8 +227,14 @@ class SdkAttemptExecutor:
         return errs
 
     # ── public seam ─────────────────────────────────────────────
-    def execute_role(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> RoleAttemptOutcome:
-        session_id, generation, mount_err, run = self._run(req, lead=False)
+    def execute_role(
+        self,
+        req: AttemptRequest,
+        *,
+        on_started: Optional[OnStarted] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> RoleAttemptOutcome:
+        session_id, generation, mount_err, run = self._run(req, lead=False, cancel=cancel)
         if mount_err is not None:
             # No session opened and no SDK send — nothing to journal as started.
             return RoleAttemptOutcome(
@@ -229,8 +253,14 @@ class SdkAttemptExecutor:
             result=result, session_id=session_id, generation=generation
         )
 
-    def run_lead(self, req: AttemptRequest, *, on_started: Optional[OnStarted] = None) -> LeadTurnOutcome:
-        session_id, generation, mount_err, run = self._run(req, lead=True)
+    def run_lead(
+        self,
+        req: AttemptRequest,
+        *,
+        on_started: Optional[OnStarted] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> LeadTurnOutcome:
+        session_id, generation, mount_err, run = self._run(req, lead=True, cancel=cancel)
         if mount_err is not None:
             return LeadTurnOutcome(
                 result=_error_result(req, session_id, mount_err),
@@ -250,7 +280,7 @@ class SdkAttemptExecutor:
         )
 
     # ── shared machinery ────────────────────────────────────────
-    def _run(self, req: AttemptRequest, *, lead: bool):
+    def _run(self, req: AttemptRequest, *, lead: bool, cancel: Optional[CancelToken] = None):
         """Resolve session identity + mounting, returning a deferred runner.
 
         Returns ``(session_id, generation, mount_error, runner)``. ``runner`` is
@@ -333,7 +363,8 @@ class SdkAttemptExecutor:
             nonlocal log_lines
             try:
                 result = run_attempt(
-                    ops, taint_store, prompt=req.prompt, resume=resume, config=cfg
+                    ops, taint_store, prompt=req.prompt, resume=resume, config=cfg,
+                    cancel=cancel,
                 )
             except TaintedSessionError as e:
                 log_lines.append(f"[crewd] {e}")

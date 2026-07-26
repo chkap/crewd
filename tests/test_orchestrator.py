@@ -237,11 +237,11 @@ def test_signal_interrupt_exits_interrupted(tmp_ws: Workspace):
     orig = fake.run_lead
     state = {"n": 0}
 
-    def wrapped(req, *, on_started=None):
+    def wrapped(req, *, on_started=None, cancel=None):
         state["n"] += 1
         if state["n"] >= 2:
             orch._interrupted = True
-        return orig(req, on_started=on_started)
+        return orig(req, on_started=on_started, cancel=cancel)
 
     fake.run_lead = wrapped  # type: ignore[method-assign]
     rc = orch.run(once=False)
@@ -261,7 +261,7 @@ def test_attempt_journaled_started_before_send(tmp_ws: Workspace):
 
     orig = fake.execute_role
 
-    def spy(req: AttemptRequest, *, on_started=None):
+    def spy(req: AttemptRequest, *, on_started=None, cancel=None):
         order: list[str] = observed.setdefault("order", [])
 
         def _wrapped_on_started(session_id, generation):
@@ -270,7 +270,7 @@ def test_attempt_journaled_started_before_send(tmp_ws: Workspace):
             on_started(session_id, generation)
 
         order.append("body-start")  # executor body begins after on_started
-        return orig(req, on_started=_wrapped_on_started)
+        return orig(req, on_started=_wrapped_on_started, cancel=cancel)
 
     fake.execute_role = spy  # type: ignore[method-assign]
     rc = orch.run(once=False)
@@ -289,11 +289,11 @@ def test_on_started_failure_surfaces_not_swallowed(tmp_ws: Workspace):
 
     orig = fake.execute_role
 
-    def boom(req, *, on_started=None):
+    def boom(req, *, on_started=None, cancel=None):
         def _failing(session_id, generation):
             raise RuntimeError("journal write failed")
 
-        return orig(req, on_started=_failing)
+        return orig(req, on_started=_failing, cancel=cancel)
 
     fake.execute_role = boom  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="journal write failed"):
@@ -324,3 +324,140 @@ def test_plain_run_does_not_resume_paused(tmp_ws: Workspace):
     assert rc == 0
     assert tmp_ws.exit_reason_file.read_text().strip() == "goal-complete"
     assert _final_run(tmp_ws).status == RunStatus.FINISHED.value
+
+# ── in-flight cancellation: interrupt cancels the active attempt (worker thread) ──
+def test_interrupt_cancels_inflight_attempt_cleanly(tmp_ws: Workspace):
+    # A role attempt blocks until cancelled; the orchestrator's control poll must
+    # trip the CancelToken (interrupt) so the attempt returns CANCELLED_CLEAN,
+    # which is recorded as a distinct `cancelled` handoff (never `completed`).
+    fake = FakeExecutor(lead_script=[dispatch_to("worker")], block_until_cancel=True)
+    orch = _orch(tmp_ws, fake)
+
+    # Trip the interrupt shortly after the worker attempt begins (on another
+    # thread) so the poll loop requests cancellation while it is in flight.
+    import threading
+
+    def _interrupt_soon():
+        while not fake.role_calls:
+            pass
+        orch._interrupted = True
+
+    threading.Thread(target=_interrupt_soon, daemon=True).start()
+    rc = orch.run(once=False)
+    assert rc == 0
+    # The worker ran exactly once (blocked, then cancelled — never replayed).
+    assert [r.role for r in fake.role_calls] == ["worker"]
+    assert tmp_ws.exit_reason_file.read_text().strip() == "interrupted"
+    # The cancelled attempt produced a distinct `cancelled` handoff class.
+    from crewd.dispatcher import HandoffOutcome
+
+    disp = Dispatcher(tmp_ws.state_dir / "dispatch.db")
+    try:
+        run = disp.start_or_resume_run("goal:v1")
+        rows = disp._conn.execute(
+            "SELECT outcome_class FROM handoff WHERE run_id = ?", (run.id,)
+        ).fetchall()
+        classes = {r["outcome_class"] for r in rows}
+    finally:
+        disp.close()
+    assert HandoffOutcome.CANCELLED.value in classes
+    assert HandoffOutcome.COMPLETED.value not in classes
+
+
+def test_operator_stop_cancels_inflight_attempt(tmp_ws: Workspace):
+    # An operator STOP sentinel raised mid-attempt must also cancel the in-flight
+    # attempt (same single owner) and exit `stopped`.
+    fake = FakeExecutor(lead_script=[dispatch_to("worker")], block_until_cancel=True)
+    orch = _orch(tmp_ws, fake)
+
+    import threading
+
+    def _stop_soon():
+        while not fake.role_calls:
+            pass
+        tmp_ws.stop("operator requested")
+
+    threading.Thread(target=_stop_soon, daemon=True).start()
+    rc = orch.run(once=False)
+    assert rc == 0
+    assert [r.role for r in fake.role_calls] == ["worker"]
+    assert tmp_ws.exit_reason_file.read_text().strip() == "stopped"
+
+
+# ── restart recovery: orphaned `started` session is tainted before finalize ──
+def test_restart_taints_orphan_session_before_finalize(tmp_ws: Workspace):
+    # Drive the kernel to an in-flight (started) worker attempt with a known
+    # session id, then run a fresh orchestrator: the orphan session must be
+    # tainted BEFORE the uncertain handoff is finalized, and recovery must never
+    # resume the orphan generation normally.
+    db = tmp_ws.state_dir / "dispatch.db"
+    tmp_ws.state_dir.mkdir(parents=True, exist_ok=True)
+    disp = Dispatcher(db)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    from crewd.dispatcher import LeadDecision
+
+    disp.resolve_lead_solicitation(
+        sol.attempt_id,
+        outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.dispatch("worker", ack=()),
+        configured_roles=("lead", "worker", "verifier", "advisory"),
+    )
+    run = disp.get_run(run.id)
+    attempt_id = disp.reserve_attempt(run.id, run.routing_authority, "worker")
+    disp.mark_started(attempt_id, session_id="orphan-sess-worker-g0", generation=0)
+    disp.close()
+
+    # Record which orphans were tainted, in order relative to finalize. We assert
+    # the taint callback fires for the started orphan with its session identity.
+    tainted: list[tuple[str, int, str]] = []
+
+    fake = FakeExecutor(lead_script=[pause("human-blocked: after crash")])
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    gs = GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="x")
+    gs.save(tmp_ws.goal_json)
+    orch = Orchestrator(
+        tmp_ws, cfg, fake, gs,
+        taint_orphan=lambda sid, gen, role: tainted.append((sid, gen, role)),
+    )
+    rc = orch.run(once=False)
+    assert rc == 0
+    assert fake.role_calls == []  # no replay
+    # The orphaned started session was tainted with its exact identity.
+    assert ("orphan-sess-worker-g0", 0, "worker") in tainted
+    disp2 = Dispatcher(db)
+    att = disp2.get_attempt(attempt_id)
+    assert att.state == AttemptState.RECONCILED_UNCERTAIN
+    disp2.close()
+
+
+def test_restart_recovery_is_idempotent(tmp_ws: Workspace):
+    # Recovery itself may crash and be retried: reconcile_on_restart must be
+    # idempotent (re-taint is a no-op, no duplicate uncertain handoff on the
+    # already-reconciled attempt).
+    db = tmp_ws.state_dir / "dispatch.db"
+    tmp_ws.state_dir.mkdir(parents=True, exist_ok=True)
+    disp = Dispatcher(db)
+    run = disp.start_or_resume_run("goal:v1")
+    sol = disp.open_lead_solicitation(run.id)
+    from crewd.dispatcher import LeadDecision
+
+    disp.resolve_lead_solicitation(
+        sol.attempt_id,
+        outcome=AttemptOutcome.IDLE_COMPLETED,
+        decision=LeadDecision.dispatch("worker", ack=()),
+        configured_roles=("lead", "worker", "verifier", "advisory"),
+    )
+    run = disp.get_run(run.id)
+    attempt_id = disp.reserve_attempt(run.id, run.routing_authority, "worker")
+    disp.mark_started(attempt_id, session_id="orphan-2", generation=0)
+
+    calls: list[str] = []
+    taint = lambda sid, gen, role: calls.append(sid)
+    first = disp.reconcile_on_restart(run.id, taint_orphan=taint)
+    second = disp.reconcile_on_restart(run.id, taint_orphan=taint)
+    assert len(first) == 1  # one uncertain handoff created
+    assert second == []     # nothing left in-flight; idempotent
+    # The orphan was only in `started` on the first pass, so tainted once.
+    assert calls == ["orphan-2"]
+    disp.close()

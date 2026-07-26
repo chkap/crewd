@@ -11,6 +11,7 @@ import pytest
 from crewd.session_backend import (
     AttemptConfig,
     AttemptOutcome,
+    CancelToken,
     LifecyclePhase,
     RunSignal,
     SdkError,
@@ -318,6 +319,7 @@ class _FakeSdkSession:
         self._events = events or []
         self.sent_prompts = []
         self.aborted = False
+        self.abort_count = 0
 
     async def send_and_wait(self, prompt, timeout=None):
         self.sent_prompts.append(prompt)
@@ -327,6 +329,7 @@ class _FakeSdkSession:
 
     async def abort(self):
         self.aborted = True
+        self.abort_count += 1
 
     async def get_events(self):
         return list(self._events)
@@ -382,6 +385,33 @@ def test_adapter_abort_unconfirmed_when_no_marker():
     try:
         assert rt.abort(timeout=1) is False
         assert session.sent_prompts == []
+    finally:
+        rt._teardown_loop()
+
+
+def test_adapter_request_abort_then_abort_issues_once():
+    """A non-blocking request_abort (control poll) followed by the state machine's
+    confirming abort must issue exactly one SDK abort — single escalation owner."""
+    import time
+
+    session = _FakeSdkSession(events=[type("E", (), {"type": "session.abort"})()])
+    rt = _runtime_with_session(session)
+    try:
+        rt.request_abort()          # fire-and-forget schedule on the loop
+        time.sleep(0.1)             # let the scheduled coroutine run
+        confirmed = rt.abort(timeout=1)  # confirm only; must NOT issue a 2nd abort
+        assert confirmed is True
+        assert session.abort_count == 1
+    finally:
+        rt._teardown_loop()
+
+
+def test_adapter_abort_without_prior_request_issues_once():
+    session = _FakeSdkSession(events=[type("E", (), {"type": "session.abort"})()])
+    rt = _runtime_with_session(session)
+    try:
+        assert rt.abort(timeout=1) is True
+        assert session.abort_count == 1
     finally:
         rt._teardown_loop()
 
@@ -447,3 +477,157 @@ def test_permission_handler_deny_is_typed_user_not_available():
     handler = _permission_handler(copilot, allow_all=False)
     res = handler(None, {"session_id": "s"})
     assert isinstance(res, PermissionDecisionUserNotAvailable)
+
+
+# ─────────────────────── external cancellation ───────────────────────
+class CancellableOps(FakeOps):
+    """FakeOps whose ``run`` blocks until an external abort is requested.
+
+    Models an in-flight turn: ``run`` waits on an event that ``request_abort``
+    sets, then returns IDLE (the SDK's send_and_wait returns when the abort
+    settles the turn). ``abort`` records how many times it was issued so a test
+    can prove the wait-timeout/cancel escalation is a single owner.
+    """
+
+    def __init__(self, *, abort_confirmed=True, **kw):
+        super().__init__(abort_confirmed=abort_confirmed, **kw)
+        import threading
+
+        self._abort_event = threading.Event()
+        self.abort_issued = 0
+        self.request_abort_calls = 0
+
+    def run(self, prompt: str, timeout: float) -> RunSignal:
+        self.calls.append("run")
+        # Block until an external cancel unblocks us (bounded so a bug can't hang).
+        self._abort_event.wait(timeout=5)
+        return RunSignal.IDLE
+
+    def request_abort(self) -> None:
+        self.request_abort_calls += 1
+        self._abort_event.set()
+
+    def abort(self, timeout: float) -> bool:
+        self.abort_issued += 1
+        return super().abort(timeout)
+
+
+def test_external_cancel_confirmed_is_cancelled_clean(taint_store):
+    ops = CancellableOps(abort_confirmed=True)
+    cancel = CancelToken()
+
+    import threading
+
+    def _cancel_soon():
+        # Wait until run() is blocking, then request cancellation.
+        while "run" not in ops.calls:
+            pass
+        cancel.request("operator-stop")
+
+    threading.Thread(target=_cancel_soon, daemon=True).start()
+    res = run_attempt(ops, taint_store, prompt="hi", resume=False, cancel=cancel)
+    # An idle that arrives because of an external abort is NOT a completion.
+    assert res.outcome is AttemptOutcome.CANCELLED_CLEAN
+    assert not res.tainted
+    assert not taint_store.is_tainted(ops.session_id)
+    phases = [e.phase for e in res.events]
+    assert LifecyclePhase.CANCEL_REQUESTED in phases
+    # Single escalation owner: abort issued exactly once even though request_abort
+    # (via the waker) and the confirming abort both ran.
+    assert ops.abort_issued == 1
+
+
+def test_external_cancel_unconfirmed_taints(taint_store):
+    ops = CancellableOps(abort_confirmed=False)
+    cancel = CancelToken()
+
+    import threading
+
+    def _cancel_soon():
+        while "run" not in ops.calls:
+            pass
+        cancel.request("signal")
+
+    threading.Thread(target=_cancel_soon, daemon=True).start()
+    res = run_attempt(ops, taint_store, prompt="hi", resume=False, cancel=cancel)
+    # Unconfirmed cancel force-stops and taints (never a clean cancel).
+    assert res.outcome is AttemptOutcome.TAINTED
+    assert res.tainted
+    assert taint_store.is_tainted(ops.session_id)
+    assert "force_stop" in ops.calls
+
+
+def test_cancel_before_wait_still_interrupts(taint_store):
+    # Request cancellation BEFORE the attempt starts waiting: bind_waker must fire
+    # the pending request immediately so the run doesn't block for the full bound.
+    ops = CancellableOps(abort_confirmed=True)
+    cancel = CancelToken()
+    cancel.request("early")
+    res = run_attempt(ops, taint_store, prompt="hi", resume=False, cancel=cancel)
+    assert res.outcome is AttemptOutcome.CANCELLED_CLEAN
+    assert ops.request_abort_calls >= 1
+
+
+def test_no_cancel_idle_is_still_completed(taint_store):
+    # With a token that is never tripped, a normal idle is an ordinary completion.
+    ops = FakeOps(run_signal=RunSignal.IDLE)
+    cancel = CancelToken()
+    res = run_attempt(ops, taint_store, prompt="hi", resume=False, cancel=cancel)
+    assert res.outcome is AttemptOutcome.IDLE_COMPLETED
+
+
+# ─────────────────────── CancelToken unit ───────────────────────
+def test_cancel_token_first_reason_wins_idempotent():
+    tok = CancelToken()
+    fired = []
+    tok.bind_waker(lambda: fired.append(1))
+    tok.request("first")
+    tok.request("second")
+    assert tok.is_requested
+    assert tok.reason == "first"
+    # Waker fires once per first request (subsequent requests are no-ops).
+    assert fired == [1]
+
+
+def test_cancel_token_waker_fires_if_bound_after_request():
+    tok = CancelToken()
+    tok.request("pre-bind")
+    fired = []
+    tok.bind_waker(lambda: fired.append(1))
+    assert fired == [1]
+
+
+def test_cancel_token_waker_exception_is_swallowed():
+    tok = CancelToken()
+
+    def _boom():
+        raise RuntimeError("waker boom")
+
+    tok.bind_waker(_boom)
+    # Must not raise into the requester (a control poll / signal path).
+    tok.request("x")
+    assert tok.is_requested
+
+
+def test_cancel_token_concurrent_requests_single_owner():
+    tok = CancelToken()
+    fired = []
+    tok.bind_waker(lambda: fired.append(1))
+
+    import threading
+
+    barrier = threading.Barrier(8)
+
+    def _req(n):
+        barrier.wait()
+        tok.request(f"r{n}")
+
+    threads = [threading.Thread(target=_req, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # Exactly one reason won and the waker fired exactly once despite 8 racers.
+    assert tok.is_requested
+    assert fired == [1]
+    assert tok.reason is not None

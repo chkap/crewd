@@ -97,23 +97,36 @@ candidate only when `count == 1`; `count == 0` or `count > 1` resolves as an
 invalid solicitation with handoffs retained.
 
 
-## Signals / operator controls
+## Signals / operator controls & in-flight cancellation
 
-Signal handlers (`request_stop`) set an interrupted flag; the loop checks it
-**between** steps and exits `interrupted` after persisting `RunStatus.INTERRUPTED`.
-A second signal exits hard (130). Workspace `STOPPED` / `PAUSED` sentinels are
-honoured the same way.
+Each attempt runs on a short-lived **worker thread** while the main loop polls
+operator controls. A pending interrupt (`request_stop` sets a flag) or a
+workspace `STOPPED` sentinel is observed *while the attempt is in flight* and
+trips a single `CancelToken`, which issues a **non-blocking** SDK abort so the
+in-flight turn unwinds promptly instead of after the wait bound. A wait-timeout,
+a signal, and an operator stop therefore all funnel through **one** cancellation
+requester, while the `run_attempt` state machine remains the sole *owner* of the
+abort → confirm → force-stop → taint escalation — there is never a double abort.
 
-## Deferred (scoped follow-up)
+An externally cancelled turn that settles idle is the distinct
+`AttemptOutcome.CANCELLED_CLEAN` (handoff class `cancelled`), **never**
+`idle_completed`; an unconfirmed abort force-stops and taints. After the current
+step terminalises, the between-steps control check maps the run to its durable
+exit reason (`interrupted` / `stopped` / `human-blocked`). A second signal exits
+hard (130). `PAUSED` is honoured between steps (a human blocker is not a reason
+to abort in-flight work).
 
-Mid-attempt cancellation (`request_cancel(reason)` + a distinct clean-cancel
-terminal in `run_attempt`) and taint-before-finalize orphan-session recovery are
-a separate slice. A POSIX signal handler runs re-entrantly on the main thread
-while it is blocked inside the async SDK bridge, so safe *in-flight* cancellation
-requires a worker-thread execution model — genuinely independent race-handling
-work kept out of this PR for reviewability. Today an in-flight attempt
-interrupted by a signal is reconciled `uncertain` on the next start and never
-replayed; its SDK session is left resumable rather than force-tainted.
+## Restart recovery (taint-before-finalize)
+
+`reconcile_on_restart` runs before any new work. Every attempt still `started`
+(its session identity already journaled **before** the SDK send) has its orphaned
+session generation **tainted before** the uncertain handoff is finalized, so a
+crashed in-flight generation is never resumed normally — the next session
+decision refuses the tainted id and advances to a fresh recovery generation.
+Because the taint is idempotent and the reconciling state transition is a single
+atomic step, a crash *during* recovery is safe: re-running re-taints (a no-op)
+and then finalizes, so recovery is itself durable and retryable. A hard second
+signal or restart therefore cannot resume the orphan generation.
 
 ## Tests
 

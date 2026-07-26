@@ -153,16 +153,18 @@ The kernel is now wired into production via `orchestrator.py` and the typed
 - `backend: copilot` rejected with a migration diagnostic; `CopilotBackend`
   deleted.
 - Full fake-SDK routing/restart matrix (`tests/test_orchestrator.py`).
+- Thread-safe in-flight external cancellation: a single `CancelToken`
+  (`session_backend.py`) shared by timeout / signal / operator-stop requests a
+  **non-blocking** SDK abort while the attempt runs on a worker thread; the
+  `run_attempt` state machine remains the sole abort/escalation owner. An
+  externally cancelled turn that settles idle is the distinct
+  `AttemptOutcome.CANCELLED_CLEAN` (handoff class `cancelled`), never a
+  completion; an unconfirmed abort taints. `reconcile_on_restart(taint_orphan=…)`
+  taints an orphaned `started` session **before** finalizing its uncertain
+  handoff, so a crashed generation is never resumed normally; the taint is
+  idempotent and the finalize atomic, so recovery is itself durable/retryable.
 
 ## Deferred (clearly-scoped follow-up)
 
-- Thread-safe `request_cancel(reason)` mid-attempt cancellation + a distinct
-  clean-cancel terminal in `run_attempt`, and taint-before-finalize orphan
-  recovery. This is a genuinely separate race: a POSIX signal handler runs
-  re-entrantly on the main thread while it is blocked inside the async SDK
-  bridge, so safe mid-attempt cancellation requires a worker-thread execution
-  model. The orchestrator today handles signals/operator controls **between**
-  steps (interrupt → `interrupted`, stop, pause); a step interrupted in-flight
-  is reconciled `uncertain` on the next start and never replayed.
 - Finalize `max_consecutive_unproductive` / `max_edge_repeats` once #12 defines
   the progress token that distinguishes real progress from a bare completion.

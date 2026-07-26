@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -114,6 +115,7 @@ class HandoffOutcome(str, Enum):
             HandoffOutcome.NO_PROGRESS,
             HandoffOutcome.FAILED,
             HandoffOutcome.TIMED_OUT,
+            HandoffOutcome.CANCELLED,
             HandoffOutcome.UNCERTAIN,
         )
 
@@ -128,6 +130,7 @@ def classify(outcome: AttemptOutcome) -> HandoffOutcome:
         AttemptOutcome.IDLE_COMPLETED: HandoffOutcome.COMPLETED,
         AttemptOutcome.SDK_ERROR: HandoffOutcome.FAILED,
         AttemptOutcome.ABORTED_CLEAN: HandoffOutcome.TIMED_OUT,
+        AttemptOutcome.CANCELLED_CLEAN: HandoffOutcome.CANCELLED,
         AttemptOutcome.TAINTED: HandoffOutcome.UNCERTAIN,
     }[outcome]
 
@@ -365,7 +368,14 @@ class Dispatcher:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.limits = limits or DispatcherLimits()
         # isolation_level=None → autocommit off via explicit BEGIN in _txn.
-        self._conn = sqlite3.connect(str(self.db_path), isolation_level=None)
+        # check_same_thread=False: the orchestrator journals `mark_started` from
+        # the attempt's worker thread while the main thread polls controls. Access
+        # is still serialized by ``self._lock`` (the single-writer invariant holds
+        # — there is never truly concurrent DB use, only cross-thread use).
+        self._conn = sqlite3.connect(
+            str(self.db_path), isolation_level=None, check_same_thread=False
+        )
+        self._lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON;")
         self._conn.execute("PRAGMA synchronous = FULL;")
@@ -416,14 +426,19 @@ class Dispatcher:
 
     @contextmanager
     def _txn(self) -> Iterator[sqlite3.Connection]:
-        """One IMMEDIATE transaction; commit on success, rollback on error."""
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
-            yield self._conn
-            self._conn.execute("COMMIT;")
-        except BaseException:
-            self._conn.execute("ROLLBACK;")
-            raise
+        """One IMMEDIATE transaction; commit on success, rollback on error.
+
+        Lock-guarded so a cross-thread ``mark_started`` (worker thread) can never
+        interleave with a main-thread transaction.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE;")
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT;")
+            except BaseException:
+                self._conn.execute("ROLLBACK;")
+                raise
 
     # ── run lifecycle ────────────────────────────────────────────
     def start_or_resume_run(self, goal_label: str) -> RunView:
@@ -626,14 +641,35 @@ class Dispatcher:
         return handoff_id
 
     # ── restart reconciliation ───────────────────────────────────
-    def reconcile_on_restart(self, run_id: str) -> list[str]:
+    def reconcile_on_restart(self, run_id: str, *, taint_orphan=None) -> list[str]:
         """Reconcile in-flight attempts after a crash.
 
         Any attempt still ``reserved`` or ``started`` (no terminal record) is
         marked ``reconciled_uncertain`` and emits an ``uncertain`` handoff, then
         routing authority returns to Lead. Never auto-replays. Idempotent.
+
+        ``taint_orphan(session_id, generation, role)``, when supplied, is invoked
+        for every ``started`` orphan (an attempt that had already selected its
+        session identity and could have reached the SDK transport) **before** the
+        uncertain handoff is finalized. This durably poisons the orphaned session
+        generation so it cannot be resumed *normally* on the next tick or after a
+        second signal — recovery advances to a fresh generation instead. Because
+        the taint is idempotent and the state transition below is a single atomic
+        step, a crash *during* recovery is safe: re-running re-taints (a no-op) and
+        then finalizes, so recovery itself is durable and retryable.
         """
         created: list[str] = []
+        # Phase 1 — taint orphan sessions BEFORE any durable finalize. Ordered
+        # first (and outside the finalizing txn) so we never finalize an uncertain
+        # handoff while leaving its orphaned session silently resumable.
+        if taint_orphan is not None:
+            orphans = self._conn.execute(
+                "SELECT id, role, session_id, generation FROM attempt "
+                "WHERE run_id = ? AND state = ? AND session_id IS NOT NULL",
+                (run_id, AttemptState.STARTED.value),
+            ).fetchall()
+            for o in orphans:
+                taint_orphan(o["session_id"], int(o["generation"]), o["role"])
         with self._txn() as c:
             rows = c.execute(
                 "SELECT a.*, d.kind AS dispatch_kind FROM attempt a "
