@@ -18,9 +18,9 @@ from typing import Protocol, runtime_checkable
 
 LEGACY_COPILOT_MIGRATION = (
     "backend: copilot (the `copilot -p` subprocess transport) has been removed. "
-    "crewd now runs roles through the official github-copilot-sdk. "
-    "Set `backend: copilot-sdk` in crew.yaml (and `pip install 'crewd[sdk]'`), "
-    "then run `crewd doctor`."
+    "crewd now runs roles through the official github-copilot-sdk (a required "
+    "core dependency). Set `backend: copilot-sdk` in crew.yaml, then run "
+    "`crewd doctor`."
 )
 
 

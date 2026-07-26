@@ -264,8 +264,13 @@ class SdkAttemptExecutor:
         errs: list[str] = []
         if self._ops_factory is None and not sdk_available():
             errs.append(
-                "`github-copilot-sdk` (import `copilot`) not installed. "
-                "Add it (`pip install 'crewd[sdk]'`) to use backend: copilot-sdk."
+                "`github-copilot-sdk` (import `copilot`) is not importable, but it "
+                "is a required dependency of crewd for the default `backend: "
+                "copilot-sdk`. Repair the existing install so its declared "
+                "dependencies are present — e.g. `uv sync` (repo checkout), "
+                "`pip install --upgrade --force-reinstall crewd` (pip), or "
+                "`uv tool install --reinstall crewd` (uv tool) — then run "
+                "`crewd doctor`."
             )
         return errs
 

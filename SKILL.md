@@ -40,7 +40,7 @@ Trigger if the user asks to:
 
 ```bash
 # Inside a workspace dir:
-uv --directory ~/crewd run crewd -w "$(pwd)" <command>
+uv --directory ~/crewd run crewd <command> -w "$(pwd)"
 ```
 
 If you've installed `crewd` on PATH (e.g. `uv pip install -e ~/crewd`), you can drop the `uv --directory` prefix and rely on git-style upward `crew.yaml` discovery — but the safe form above always works.
@@ -52,12 +52,12 @@ mkdir -p ~/crews && cd ~/crews
 uv --directory ~/crewd run crewd init my-crew --repo owner/target-repo
 cd my-crew
 $EDITOR GOAL.md                                                # write the spec
-uv --directory ~/crewd run crewd -w "$(pwd)" doctor            # must be 0 errors
-uv --directory ~/crewd run crewd -w "$(pwd)" run --once        # one dispatcher step (Lead + ≤1 dispatched attempt)
-uv --directory ~/crewd run crewd -w "$(pwd)" tick lead         # debug/compat: force 1 named role, bypassing dispatch
-uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon     # loop in background
-uv --directory ~/crewd run crewd -w "$(pwd)" status           # check daemon + crew state
-uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (STOPPED + SIGINT)
+uv --directory ~/crewd run crewd doctor -w "$(pwd)"            # must be 0 errors
+uv --directory ~/crewd run crewd run --once -w "$(pwd)"        # one dispatcher step (Lead + ≤1 dispatched attempt)
+uv --directory ~/crewd run crewd tick lead -w "$(pwd)"         # debug/compat: force 1 named role, bypassing dispatch
+uv --directory ~/crewd run crewd run --daemon -w "$(pwd)"     # loop in background
+uv --directory ~/crewd run crewd status -w "$(pwd)"           # check daemon + crew state
+uv --directory ~/crewd run crewd stop -w "$(pwd)"             # graceful stop (STOPPED + SIGINT)
 ```
 
 `init` registers the workspace in `~/.crewd/registry.json` so `crewd list` / `crewd cd <name>` work from anywhere.
@@ -121,7 +121,7 @@ Skip `new-goal` and the resumed lead session will see the old `PASS` and write `
 ## Doctor — read this first when something's wrong
 
 ```bash
-crewd -w "$(pwd)" doctor
+crewd doctor -w "$(pwd)"
 ```
 
 It prints: roles table (models / families / agent.md freshness / session-state / last-log), state table (STOPPED, PAUSED/reason, cycle), inbox table (pending count + last sender per role), recent activity, and a `suggestions:` list. Anything tagged `ERROR` blocks `run` (rc=1).
@@ -176,5 +176,5 @@ When Lead writes `state/PAUSED`, the loop stops before the next role and records
 cd ~/crewd && uv run pytest -q
 # then in a throwaway workspace:
 uv --directory ~/crewd run crewd init /tmp/crewd-smoke --repo owner/dummy
-uv --directory ~/crewd run crewd -w /tmp/crewd-smoke doctor
+uv --directory ~/crewd run crewd doctor -w /tmp/crewd-smoke
 ```
