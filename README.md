@@ -2,7 +2,7 @@
 
 > Multi-agent coding crew CLI — **Lead / Worker / Verifier / Advisory** running as separate Copilot CLI sessions, with GitHub Issues as the message bus.
 
-`crewd` packages a multi-role autonomous coding crew into a reusable CLI. The core loop is **Lead / Worker / Verifier**, with **Advisory as an optional fourth role** when you want proactive research and tradeoff analysis. Each role is a `gh copilot` session with its own `COPILOT_HOME` (pointed at `cfg/<role>/`, so its config + conversation are independent and resumable), a per-role `agent.md` describing responsibilities, and a fixed-order round-table loop that ticks each configured role once per cycle in this order: **Lead → Advisory → Worker → Verifier**.
+`crewd` packages a multi-role autonomous coding crew into a reusable CLI. The roles are **Lead / Worker / Verifier**, with **Advisory as an optional fourth role** when you want proactive research and tradeoff analysis. Each role runs as an official **GitHub Copilot SDK session** (`backend: copilot-sdk`) with its own `config_directory` (pointed at `cfg/<role>/`, so its config + conversation are independent and resumable) and a per-role `agent.md` describing responsibilities. There is **no fixed round-robin**: the **Lead dynamically directs the crew** via a durable dispatcher. Each cycle the Lead is solicited and returns exactly one typed decision (`dispatch` a role, `continue_lead`, `wait`, `pause`, or `finish`); a dispatched role runs one attempt and returns exactly one typed handoff (`completed` / `no_progress`) that feeds the Lead's next decision. All dispatches, attempts, and handoffs are journaled to a SQLite run log for restart-safe, at-least-once, idempotent recovery.
 
 The roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
 
@@ -25,11 +25,13 @@ uv --directory ~/crewd run crewd -w "$(pwd)" goal --edit
 # 3. Sanity check (config, families, target repo clone, agents/, inbox)
 uv --directory ~/crewd run crewd -w "$(pwd)" doctor
 
-# 4. Smoke test: one tick of one role
-uv --directory ~/crewd run crewd -w "$(pwd)" tick lead
-
-# 5. Run one full cycle in foreground
+# 4. Smoke test: one dispatcher step in the foreground (Lead is solicited,
+#    then at most one role it dispatches runs one attempt)
 uv --directory ~/crewd run crewd -w "$(pwd)" run --once
+
+# 5. (debug/compat escape hatch) Force a single tick of ONE named role,
+#    bypassing the Lead dispatcher — handy for isolating one role
+uv --directory ~/crewd run crewd -w "$(pwd)" tick lead
 
 # 6. Run until completed, human-blocked, max-cycles, or signal
 uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon
@@ -128,8 +130,8 @@ Hard rules baked into `doctor` and `run`:
 | `doctor`                                 | Status dashboard with diagnostics (roles, state, inbox, recent logs, issues). |
 | `refresh`                                | Re-render agents/ + AGENTS.md; migrate old workspace layout if needed.         |
 | `goal [--edit] [--from FILE]`            | Print, `$EDITOR`-edit, or install `GOAL.md` from a file.                       |
-| `run [--once] [--role R] [--daemon] [--no-auto-render]` | Foreground loop (default) or background daemon (`--daemon`). `--once` / `--role` as before. |
-| `tick <role>`                            | Imperative single tick of one role (alias for `run --role`).                   |
+| `run [--once] [--role R] [--daemon] [--no-auto-render]` | Foreground loop (default) or background daemon (`--daemon`). `--once` runs a single dispatcher step (Lead solicited + at most one dispatched attempt), not a full round of every role. `--role R` bypasses the dispatcher to force one named role. |
+| `tick <role>`                            | Debug/compat escape hatch: one tick of a single named role, bypassing the Lead dispatcher (alias for `run --role`). |
 | `stop [--reason] [--force]`              | Write `STOPPED` + signal daemon (`SIGINT`; `--force` sends `SIGKILL`).         |
 | `pause "<reason>"`                       | Write `PAUSED`; loop exits with `human-blocked` and keeps goal issues open.    |
 | `resume`                                 | Clear `STOPPED` and `PAUSED`.                                                  |
@@ -149,7 +151,7 @@ Hard rules baked into `doctor` and `run`:
 cannot advance without a human/operator action. Lead must first exhaust autonomous work,
 post the exact blocker and requested action on the task and umbrella issues, then write a
 single-line `state/PAUSED` reason beginning with `human-blocked:`. The loop exits after
-Lead's tick, so Advisory, Worker, and Verifier are not invoked pointlessly.
+Lead's decision, so Advisory, Worker, and Verifier are not invoked pointlessly.
 
 After resolving the blocker:
 
@@ -181,7 +183,7 @@ loop:
   sleep_secs: 60
   per_tick_timeout: 900       # default per-role timeout
   max_cycles: 0               # 0 = forever
-backend: copilot              # only backend currently
+backend: copilot-sdk          # official GitHub Copilot SDK sessions (default; legacy `copilot` is retired)
 extra_add_dirs:               # optional: extra host dirs every role can access
   - /home/me/web-deploy       #   (deploy checkouts, persistent data dirs, …)
   - ../shared-data            #   relative entries resolve against the workspace
@@ -201,7 +203,7 @@ crewd talk worker "small PRs only — split #42 into 3 PRs"
 crewd inbox lead OVERRIDE "drop feature X, focus on auth bug"
 ```
 
-The role consumes its inbox file at the start of its next tick and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (preserving an audit trail). `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
+The role consumes its inbox file at the start of its next run (when it is next dispatched) and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (preserving an audit trail). `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
 
 **Start a new goal on the same workspace**
 
@@ -215,7 +217,7 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 
 **Graceful shutdown**
 
-`run` installs `SIGINT` / `SIGTERM` handlers that finish the current tick and then write `state/exit-reason`. Send a second signal to abort hard. Backend itself escalates `SIGINT → SIGTERM → SIGKILL` to copilot subprocesses.
+`run` installs `SIGINT` / `SIGTERM` handlers that finish the current attempt and then write `state/exit-reason`. Send a second signal to abort hard. Mid-attempt, the orchestrator requests a single non-blocking `CancelToken` abort of the in-flight SDK session; if the abort cannot be confirmed idle, that session is tainted and force-stopped so the next run starts a fresh generation rather than resuming a dirty session.
 
 ---
 
@@ -224,7 +226,7 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 | Symptom                                                       | Fix                                                                                |
 | ------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `STOPPED` present at cycle 0 (doctor flags it)                | `crewd resume && crewd run`                                                        |
-| Copilot `--continue` fails with `CAPIError 400`               | `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-run (fresh session). |
+| Copilot session resume fails (`CAPIError 400` / broken session-state)         | Rare — a tainted session auto-advances to a fresh generation on the next run. To force it, `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-run. |
 | `family check: worker.family == verifier.family`              | Edit `crew.yaml` so they differ; rerun.                                            |
 | `target repo clone missing`                                   | `crewd attach <owner/repo> --clone`                                                |
 | `GOAL.md changed since goal vN started`                       | `crewd new-goal --from GOAL.md` to start a new epoch.                              |
@@ -234,7 +236,7 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 
 ## Status
 
-- Backend: **GitHub Copilot CLI only** (`gh copilot`).
+- Backend: **official GitHub Copilot SDK** (`backend: copilot-sdk`, default). The legacy `gh copilot` subprocess backend is retired — selecting `backend: copilot` fails with a migration error.
 - Tested on Linux (Azure VM). Templates live in `src/crewd/templates/agents/*.j2`.
 - See `tests/` for unit coverage; integration testing is via dogfooding on real repos.
 
@@ -248,7 +250,13 @@ src/crewd/
   commands.py           — command implementations
   config.py             — pydantic schema for crew.yaml + GoalState
   workspace.py          — path layout + sentinels
-  backends.py           — copilot subprocess + signal escalation
+  orchestrator.py       — Lead-directed run loop (replaces round-robin); pre-send journal identity + cancellable attempts
+  dispatcher.py         — durable SQLite run journal (dispatch/attempt/handoff/solicitation), restart-safe reconcile
+  executor.py           — SdkAttemptExecutor: runs one role/lead attempt → typed handoff/decision + durable log
+  sdk_adapter.py        — official Copilot SDK runtime + typed tools (submit_lead_decision / submit_role_handoff)
+  session_backend.py    — session registry, goal-scoped ids + generations, CancelToken, taint store, outcomes
+  diagnostics.py        — read-only operator status surface (snapshot + safe next action, bounded redaction)
+  backends.py           — thin SdkBackend exit-code adapter (retires legacy `copilot` with a migration error)
   registry.py           — user-level workspace registry (~/.crewd/registry.json)
   templates_render.py   — jinja2 helpers
   templates/
@@ -262,6 +270,10 @@ SKILL.md                — instructions for AI agents operating crewd
 docs/
   retrospective-orchestration.md — evidence baseline for the SDK-native, Lead-directed refactor
   sdk-backend.md                 — SDK-native role backend: transport decision, lifecycle SM, capability facts
+  dispatcher.md                  — durable dispatch journal: schema, invariants, restart reconciliation
+  orchestrator.md                — Lead-directed run loop, cancellation, operator diagnostics
+scripts/
+  live_smoke.py                  — bounded integrated live SDK smoke (see docs/sdk-backend.md)
 ```
 
 ---
@@ -273,6 +285,11 @@ docs/
   and recovery requirements that the SDK-native, Lead-directed refactor is built against.
 - [`docs/sdk-backend.md`](docs/sdk-backend.md) — SDK-native role backend (`backend: copilot-sdk`):
   transport decision (per-role stdio), the one-attempt lifecycle state machine, offline-verified
-  `github-copilot-sdk` capability facts, open capability risks, and the bounded live-smoke procedure.
+  `github-copilot-sdk` capability facts, the (now resolved) capability risks, and the bounded
+  live-smoke procedure.
+- [`docs/dispatcher.md`](docs/dispatcher.md) — durable dispatch kernel: journal schema, exclusive
+  Lead authority, at-least-once idempotent handoffs, restart reconciliation, and schema migration.
+- [`docs/orchestrator.md`](docs/orchestrator.md) — Lead-directed run loop: exit reasons, pre-send
+  journal identity, the exactly-one typed channel, mid-attempt cancellation, and operator diagnostics.
 
 License: internal / unreleased.

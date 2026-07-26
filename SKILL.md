@@ -1,6 +1,6 @@
 ---
 name: crewd
-description: Operate the crewd multi-agent coding crew CLI — bootstrap a workspace, attach a GitHub repo, run/tick the Lead/Worker/Verifier/Advisory loop, send operator messages via the inbox, swap goals between epochs, and recover from common failures (corrupt copilot sessions, family-collision, stuck STOPPED).
+description: Operate the crewd multi-agent coding crew CLI — bootstrap a workspace, attach a GitHub repo, run the Lead-directed Lead/Worker/Verifier/Advisory dispatcher, send operator messages via the inbox, swap goals between epochs, and recover from common failures (tainted SDK sessions, family-collision, stuck STOPPED).
 ---
 
 # crewd skill
@@ -16,7 +16,7 @@ A CLI (`uv` + `typer` + `jinja2` + `pydantic`) that runs a 4-role autonomous cod
 - **verifier** — reviews PRs, merges. No code. Two tiers: per-PR + final `crewd:acceptance` gate.
 - **advisory** — research, citations, design pointers. No code, no merges.
 
-Each role is a `gh copilot` subprocess with its own `COPILOT_HOME` set to `cfg/<role>/` (private resumable conversation + config), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
+Each role runs as an official **GitHub Copilot SDK session** with its own `config_directory` set to `cfg/<role>/` (private resumable conversation + config), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. There is **no fixed round-robin**: the **Lead directs the crew** — each cycle it returns one typed decision (`dispatch`/`continue_lead`/`wait`/`pause`/`finish`) and a dispatched role returns one typed handoff (`completed`/`no_progress`), all journaled to a durable SQLite run log for restart-safe recovery. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
 
 ## When to use this skill
 
@@ -53,8 +53,8 @@ uv --directory ~/crewd run crewd init my-crew --repo owner/target-repo
 cd my-crew
 $EDITOR GOAL.md                                                # write the spec
 uv --directory ~/crewd run crewd -w "$(pwd)" doctor            # must be 0 errors
-uv --directory ~/crewd run crewd -w "$(pwd)" tick lead         # smoke-test 1 role
-uv --directory ~/crewd run crewd -w "$(pwd)" run --once        # one full cycle
+uv --directory ~/crewd run crewd -w "$(pwd)" run --once        # one dispatcher step (Lead + ≤1 dispatched attempt)
+uv --directory ~/crewd run crewd -w "$(pwd)" tick lead         # debug/compat: force 1 named role, bypassing dispatch
 uv --directory ~/crewd run crewd -w "$(pwd)" run --daemon     # loop in background
 uv --directory ~/crewd run crewd -w "$(pwd)" status           # check daemon + crew state
 uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (STOPPED + SIGINT)
@@ -69,7 +69,7 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 ├── crew.yaml              ← edit to change models / families / loop
 ├── GOAL.md                ← spec; do NOT hand-edit after run starts (use new-goal)
 ├── cfg/<role>/AGENTS.md        ← role instructions (Copilot auto-loads from cwd)
-├── cfg/<role>/session-state/   ← copilot session (COPILOT_HOME=cfg/<role>; rotate on corruption, see below)
+├── cfg/<role>/session-state/   ← Copilot SDK session (config_directory=cfg/<role>; auto-rotates to a fresh generation on taint, see below)
 ├── cfg/<role>/worktree/        ← git worktree from repo/ (isolated repo copy)
 ├── state/STOPPED          ← sentinel; loop exits at next check
 ├── state/PAUSED           ← human/operator action required; goal remains open
@@ -78,14 +78,14 @@ uv --directory ~/crewd run crewd -w "$(pwd)" stop             # graceful stop (S
 ├── state/goal.json        ← {version, label, goal_md_sha256, cycles}
 ├── state/exit-reason      ← written on graceful exit
 ├── state/inbox/<role>.md  ← operator → role messages (consumed + moved to .processed by role)
-├── state/logs/<role>/NNNN.log  ← per-tick output
+├── state/logs/<role>/NNNN.log  ← per-attempt output
 └── repo/              ← target repo clone (main branch; per-role worktrees in cfg/)
 ```
 
 ## Operator nudges
 
 ```bash
-# free-form (always shows up in role's next tick prompt):
+# free-form (always shows up the next time the role is run/dispatched):
 crewd talk worker "small PRs only — split #42 into 3"
 
 # prioritised (preferred for machine-readable directives):
@@ -94,7 +94,7 @@ crewd inbox advisory ADVICE "investigate https://example.com/postmortem"
 crewd inbox verifier INFO "expect a doc-only PR shortly"
 ```
 
-Priorities: `OVERRIDE > ADVICE > INFO`. The role consumes the inbox at the start of its next tick and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (audit trail), so messages don't pile up.
+Priorities: `OVERRIDE > ADVICE > INFO`. The role consumes the inbox at the start of its next run (when it is next dispatched) and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (audit trail), so messages don't pile up.
 
 ## Goal lifecycle (epochs)
 
@@ -131,7 +131,7 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 | Symptom                                                          | Recovery                                                                                                |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `STOPPED` present at cycle 0                                     | `crewd resume && crewd run`                                                                             |
-| Copilot `--continue` fails with `CAPIError 400` (orphan tool_use) | `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-tick (fresh session). |
+| SDK session resume fails / dirty session          | Rare — a tainted session auto-advances to a fresh generation on the next run. To force it, `mv cfg/<role>/session-state cfg/<role>/session-state.broken-$(date +%s)` then re-run. |
 | `family check: worker.family == verifier.family`                 | Edit `crew.yaml` so families differ (e.g. gpt vs claude). Auto re-render handles agents/.               |
 | `target repo clone missing`                                      | `crewd attach <owner/repo> --clone`                                                                     |
 | `GOAL.md changed since goal vN started`                          | `crewd new-goal --from GOAL.md` (don't bypass — see Hard rule #4).                                      |
@@ -141,7 +141,7 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 
 ## Graceful shutdown semantics
 
-`run` (foreground or `--daemon`) installs `SIGINT`/`SIGTERM` handlers that flip an interrupt flag — the current tick finishes, then `state/exit-reason` is written and the loop exits 0. `crewd stop` writes the `STOPPED` sentinel and sends `SIGINT` to the daemon PID if running; `--force` sends `SIGKILL`. The backend escalates child copilot processes `SIGINT → SIGTERM → SIGKILL` (SIGINT preferred — copilot has a dedicated handler that flushes events.jsonl cleanest, avoiding the orphan tool_use that breaks `--continue`).
+`run` (foreground or `--daemon`) installs `SIGINT`/`SIGTERM` handlers that flip an interrupt flag — the current attempt finishes, then `state/exit-reason` is written and the loop exits 0. `crewd stop` writes the `STOPPED` sentinel and sends `SIGINT` to the daemon PID if running; `--force` sends `SIGKILL`. Mid-attempt cancellation is a single non-blocking `CancelToken` abort of the in-flight SDK session; if the abort cannot be confirmed idle the session is tainted and force-stopped, so the next run starts a fresh generation instead of resuming a dirty session. A second signal aborts hard.
 
 When Lead writes `state/PAUSED`, the loop stops before the next role and records
 `exit-reason: human-blocked`. This is resumable and deliberately distinct from
@@ -161,7 +161,13 @@ When Lead writes `state/PAUSED`, the loop stops before the next role and records
 - `src/crewd/commands.py` — implementations (init, run loop, new_goal, doctor)
 - `src/crewd/config.py` — pydantic schema for `crew.yaml` and `GoalState`
 - `src/crewd/workspace.py` — path layout + STOPPED sentinel
-- `src/crewd/backends.py` — copilot subprocess + signal escalation
+- `src/crewd/orchestrator.py` — Lead-directed run loop (cancellable attempts, pre-send journal identity)
+- `src/crewd/dispatcher.py` — durable SQLite run journal (dispatch/attempt/handoff/solicitation)
+- `src/crewd/executor.py` — runs one role/lead attempt → typed handoff/decision
+- `src/crewd/sdk_adapter.py` — official Copilot SDK runtime + typed tools
+- `src/crewd/session_backend.py` — session registry, goal-scoped ids/generations, CancelToken, taint store
+- `src/crewd/diagnostics.py` — read-only operator status surface
+- `src/crewd/backends.py` — thin SdkBackend exit-code adapter (retires legacy `copilot`)
 - `src/crewd/templates/agents/*.j2` — role prompts (UX lens, two-tier verifier, Final Acceptance Gate)
 
 ## Verification after any change

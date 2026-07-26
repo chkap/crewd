@@ -118,18 +118,25 @@ def test_clean_idle_no_progress_claim_is_honoured():
     assert t.outcome_class.is_unproductive
 
 
-def test_disagreement_is_folded_into_reason_not_authority():
+def test_disagreement_is_carried_as_field_not_folded_into_reason():
     h = RoleHandoff(
         outcome_class="completed",
         evidence="PR #9",
         changed="none (approved)",
         reason="done",
         disagreement="disagree with scope",
+        blocker="waiting on infra",
     )
     t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
     assert t.outcome_class is HandoffOutcome.COMPLETED
-    assert "disagreement: disagree with scope" in t.reason_returned
+    # reason_returned is the role's faithful reason — disagreement/blocker are
+    # first-class fields and must NOT be concatenated into it (that both corrupts
+    # the durable reason and double-renders the two fields downstream).
+    assert t.reason_returned == "done"
+    assert "disagreement" not in t.reason_returned
+    assert "blocker" not in t.reason_returned
     assert t.disagreement == "disagree with scope"
+    assert t.blocker == "waiting on infra"
 
 
 def test_transport_error_overrides_success_claim():
@@ -224,7 +231,7 @@ def test_no_progress_without_reason_is_protocol_failure():
     assert "no_progress claim without a return reason" in t.reason_returned
 
 
-def test_blocker_is_carried_through_and_folded_into_reason():
+def test_blocker_is_carried_as_field_not_folded_into_reason():
     h = RoleHandoff(
         outcome_class="no_progress",
         reason="cannot proceed",
@@ -233,7 +240,9 @@ def test_blocker_is_carried_through_and_folded_into_reason():
     t = resolve_role_terminal(_result(AttemptOutcome.IDLE_COMPLETED), h, 1)
     assert t.outcome_class is HandoffOutcome.NO_PROGRESS
     assert t.blocker == "needs product decision on scope"
-    assert "blocker: needs product decision on scope" in t.reason_returned
+    # blocker travels as its own field; reason_returned stays faithful.
+    assert t.reason_returned == "cannot proceed"
+    assert "blocker" not in t.reason_returned
 
 
 def test_blocker_and_disagreement_survive_transport_override():

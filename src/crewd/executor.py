@@ -719,11 +719,12 @@ def resolve_role_terminal(
         if handoff.outcome_class == "completed"
         else HandoffOutcome.NO_PROGRESS
     )
+    # ``reason_returned`` is the role's faithful return reason. ``disagreement``
+    # and ``blocker`` are first-class fields carried separately (below) and are
+    # rendered on their own lines everywhere they surface (the production Lead
+    # prompt and the status projection). Do NOT fold them into ``reason`` — doing
+    # so both corrupts the durable reason and double-renders those two fields.
     reason = handoff.reason or f"role:{handoff.outcome_class}"
-    if disagreement:
-        reason = f"{reason} | disagreement: {disagreement}"
-    if blocker:
-        reason = f"{reason} | blocker: {blocker}"
     return RoleTerminal(
         outcome_class=claimed,
         evidence=ev,
