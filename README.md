@@ -259,6 +259,16 @@ src/crewd/
       verifier.agent.md.j2
       advisory.agent.md.j2
 SKILL.md                — instructions for AI agents operating crewd
+docs/
+  retrospective-orchestration.md — evidence baseline for the SDK-native, Lead-directed refactor
 ```
+
+---
+
+## Design docs
+
+- [`docs/retrospective-orchestration.md`](docs/retrospective-orchestration.md) — evidence-led
+  retrospective of prior crew histories. Establishes the orchestration, prompt, observability,
+  and recovery requirements that the SDK-native, Lead-directed refactor is built against.
 
 License: internal / unreleased.
