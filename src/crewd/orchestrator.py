@@ -13,22 +13,25 @@ status — Lead finishes, waits, or pauses; the work budget exhausts; or an
 operator control / signal halts it — mapping each terminal condition to a
 distinct persisted exit reason. ``--once`` advances exactly one step.
 
-Scope note (issue #17): explicit external-signal cancellation of an in-flight
-attempt (``request_cancel`` + a distinct clean-cancel terminal) and
-taint-before-finalize orphan-session recovery are a separate, independent
-race handled in a follow-up slice. Here a signal halts the loop *between*
-steps; the reserved/started attempt of an interrupted step is reconciled as
-``uncertain`` on the next start (never replayed), and the orphaned SDK session
-is left resumable rather than force-tainted. To keep that follow-up *safe*,
-this orchestrator already journals each attempt as ``started`` with its selected
-session identity **before** any SDK send (via the executor's pre-send
-``on_started`` hook), so an attempt that reaches the transport always has a
-durable session to taint/recover.
+Cancellation & recovery (issue #17): an interrupt or operator STOP cancels the
+in-flight attempt promptly — the attempt runs on a worker thread while the main
+loop polls controls and *requests* a non-blocking SDK abort through a single
+:class:`~crewd.session_backend.CancelToken`. Timeout, signal, and operator stop
+therefore share one cancellation owner (the attempt state machine), with no
+double escalation; an externally cancelled turn that settles idle is a distinct
+``cancelled_clean`` outcome, never a completion, and an unconfirmed abort taints.
+On restart, each attempt still ``started`` (its session identity already
+journaled **before** any SDK send, via the executor's pre-send ``on_started``
+hook) has its orphaned session generation tainted **before** the uncertain
+handoff is finalized, so a crashed generation is never resumed normally — and
+because the taint is idempotent and the finalize is atomic, recovery is itself
+durable and retryable.
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from rich.console import Console
 
@@ -43,6 +46,7 @@ from .dispatcher import (
     RunStatus,
 )
 from .executor import AttemptExecutor, AttemptRequest
+from .session_backend import CancelToken
 from .workspace import Workspace
 
 console = Console()
@@ -80,6 +84,8 @@ class Orchestrator:
         *,
         dispatcher: Dispatcher | None = None,
         max_steps: int = 10000,
+        poll_interval: float = 0.05,
+        taint_orphan: Optional[Callable[[str, int, str], None]] = None,
     ):
         self.ws = ws
         self.cfg = cfg
@@ -94,6 +100,12 @@ class Orchestrator:
         self._max_steps = max_steps
         self._interrupted = False
         self._cycle = goal_state.cycles
+        # How often the control poll checks for an interrupt / operator stop while
+        # an attempt is in flight (so cancellation is prompt but cheap).
+        self._poll_interval = poll_interval
+        # Injectable so deterministic tests can observe the orphan-session taint
+        # without the real per-role taint file; defaults to the durable taint.
+        self._taint_orphan = taint_orphan or self._taint_orphan_session
 
     @staticmethod
     def _db_path(ws: Workspace) -> Path:
@@ -135,7 +147,10 @@ class Orchestrator:
                 return self._exit(_STATUS_EXIT.get(status, "goal-complete"))
 
         # Reconcile any in-flight attempt orphaned by a crash BEFORE new work.
-        self.disp.reconcile_on_restart(run.id)
+        # Orphaned `started` sessions are tainted before their uncertain handoff
+        # is finalized, so a crashed in-flight generation is never resumed
+        # normally (recovery advances to a fresh generation).
+        self.disp.reconcile_on_restart(run.id, taint_orphan=self._taint_orphan)
 
         steps = 0
         while True:
@@ -208,7 +223,11 @@ class Orchestrator:
         # executor's on_started hook. Persistence failure is NOT swallowed: it
         # propagates and aborts the run rather than continuing with an unjournaled
         # in-flight attempt (restart reconciliation then handles the solicitation).
-        turn = self.executor.run_lead(req, on_started=self._on_started(sol.attempt_id))
+        turn = self._execute_cancellably(
+            lambda cancel: self.executor.run_lead(
+                req, on_started=self._on_started(sol.attempt_id), cancel=cancel
+            )
+        )
         self.disp.resolve_lead_solicitation(
             sol.attempt_id,
             outcome=turn.result.outcome,
@@ -235,7 +254,11 @@ class Orchestrator:
         # Journal session identity BEFORE the SDK send (see _lead_step). This is
         # what makes the deferred taint/orphan-recovery follow-up safe: an attempt
         # that reaches the transport is always durably `started` with its session.
-        outcome = self.executor.execute_role(req, on_started=self._on_started(attempt_id))
+        outcome = self._execute_cancellably(
+            lambda cancel: self.executor.execute_role(
+                req, on_started=self._on_started(attempt_id), cancel=cancel
+            )
+        )
         result = outcome.result
         self.disp.record_terminal(
             attempt_id,
@@ -260,6 +283,74 @@ class Orchestrator:
             self.disp.mark_started(attempt_id, session_id=session_id, generation=generation)
 
         return _cb
+
+    # ── in-flight cancellation ──────────────────────────────────
+    def _execute_cancellably(self, fn: "Callable[[CancelToken], object]"):
+        """Run one attempt on a worker thread while polling operator controls.
+
+        The attempt (``fn``) runs off the main thread so the main thread stays
+        free to observe an interrupt/operator-stop and *request* cancellation via
+        a single :class:`~crewd.session_backend.CancelToken`. This poll loop is the
+        sole cancellation *requester* (timeout, signal, and operator stop all
+        funnel through the one token, so there is no double escalation); the
+        attempt state machine remains the sole cancellation *owner*. The request
+        is non-blocking: it pokes the SDK to abort the in-flight turn and lets the
+        state machine confirm/escalate. Exceptions raised by ``fn`` (e.g. a
+        pre-send journaling failure) propagate unchanged.
+        """
+        cancel = CancelToken()
+        box: dict = {}
+
+        def _worker() -> None:
+            try:
+                box["result"] = fn(cancel)
+            except BaseException as e:  # re-raised on the main thread below
+                box["error"] = e
+
+        t = threading.Thread(target=_worker, name="crewd-attempt", daemon=True)
+        t.start()
+        while t.is_alive():
+            if not cancel.is_requested:
+                reason = self._cancel_reason()
+                if reason is not None:
+                    console.print(
+                        f"[yellow]cancelling in-flight attempt (non-blocking abort): {reason}[/]"
+                    )
+                    cancel.request(reason)
+            t.join(timeout=self._poll_interval)
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def _cancel_reason(self) -> Optional[str]:
+        """The reason to cancel an in-flight attempt now, or ``None``.
+
+        A pending interrupt or operator STOP both demand the active attempt be
+        cancelled promptly rather than after it finishes; the between-steps
+        controls (:meth:`_check_controls`) then map the run to its exit reason.
+        """
+        if self._interrupted:
+            return "signal"
+        if self.ws.is_stopped():
+            return "operator-stop"
+        return None
+
+    def _taint_orphan_session(self, session_id: str, generation: int, role: str) -> None:
+        """Durably taint an orphaned session generation found on restart.
+
+        Uses the same per-role taint file the SDK executor consults, so the next
+        session decision for this role refuses to resume the orphaned id and
+        advances to a fresh recovery generation. Idempotent (safe to retry if
+        recovery itself crashed mid-way).
+        """
+        from .session_backend import TaintStore
+
+        store = TaintStore(self.ws.role_cfg_dir(role) / ".crewd-sdk-taint")
+        store.taint(session_id)
+        console.print(
+            f"[yellow]restart: orphaned session tainted (role={role} gen={generation}); "
+            f"recovery will start a fresh generation[/]"
+        )
 
     # ── request/prompt construction ──
     def _request(self, role: str, prompt: str) -> AttemptRequest:

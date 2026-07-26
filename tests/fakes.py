@@ -61,31 +61,56 @@ class FakeExecutor:
         lead_script: Optional[list] = None,
         role_outcome=AttemptOutcome.IDLE_COMPLETED,
         lead_outcome: Optional[AttemptOutcome] = None,
+        block_until_cancel: bool = False,
     ):
         self._lead_script = list(lead_script or [])
         self._role_outcome = role_outcome
         self._lead_outcome = lead_outcome
+        # When set, a *role* attempt blocks until the orchestrator trips the
+        # CancelToken, then returns CANCELLED_CLEAN — deterministically modelling
+        # an in-flight role tick cancelled by an interrupt/operator stop. Lead
+        # turns are unaffected (they must still produce the dispatch decision).
+        self._block_until_cancel = block_until_cancel
         self.lead_calls: list[AttemptRequest] = []
         self.role_calls: list[AttemptRequest] = []
 
     def doctor(self) -> list[str]:
         return []
 
-    def execute_role(self, req: AttemptRequest, *, on_started=None) -> RoleAttemptOutcome:
+    @staticmethod
+    def _await_cancel(cancel) -> None:
+        # Deterministic: spin briefly until the poll loop requests cancellation.
+        import time
+
+        for _ in range(2000):
+            if cancel is not None and cancel.is_requested:
+                return
+            time.sleep(0.001)
+
+    def execute_role(self, req: AttemptRequest, *, on_started=None, cancel=None) -> RoleAttemptOutcome:
         self.role_calls.append(req)
-        outcome = self._resolve_role_outcome(req)
         sid = f"sess-{req.role}"
         if on_started is not None:
             on_started(sid, 0)
+        if self._block_until_cancel:
+            self._await_cancel(cancel)
+            return RoleAttemptOutcome(
+                result=_result(req.role, sid, AttemptOutcome.CANCELLED_CLEAN),
+                session_id=sid,
+                generation=0,
+            )
+        outcome = self._resolve_role_outcome(req)
         return RoleAttemptOutcome(
             result=_result(req.role, sid, outcome), session_id=sid, generation=0
         )
 
-    def run_lead(self, req: AttemptRequest, *, on_started=None) -> LeadTurnOutcome:
+    def run_lead(self, req: AttemptRequest, *, on_started=None, cancel=None) -> LeadTurnOutcome:
         self.lead_calls.append(req)
         pending_ids = _pending_ids_from_prompt(req.prompt)
         item = self._lead_script.pop(0) if self._lead_script else None
         decision = item(pending_ids) if callable(item) else item
+        if on_started is not None:
+            on_started("sess-lead", 0)
         if self._lead_outcome is not None:
             outcome = self._lead_outcome
         else:
@@ -94,8 +119,6 @@ class FakeExecutor:
                 if decision is not None
                 else AttemptOutcome.SDK_ERROR
             )
-        if on_started is not None:
-            on_started("sess-lead", 0)
         return LeadTurnOutcome(
             result=_result("lead", "sess-lead", outcome),
             session_id="sess-lead",

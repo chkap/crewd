@@ -104,6 +104,13 @@ Invariants (all covered by `tests/test_session_backend.py`):
   asserts the outcome is terminal).
 - **Wait timeout ≠ cancellation.** `RunSignal.WAIT_TIMEOUT` never by itself
   marks success or taints; it only *triggers* a bounded `abort()`.
+- **External cancellation is a distinct outcome.** A `CancelToken` (shared by
+  wait-timeout, signal, and operator-stop requesters) trips a **non-blocking**
+  `request_abort()` so an in-flight `run()` unwinds; `run_attempt` is the single
+  abort/escalation owner (one abort, never doubled). A confirmed cancel is
+  `AttemptOutcome.CANCELLED_CLEAN` (never `IDLE_COMPLETED` — an idle that arrives
+  *because* the abort settled is not a completion); an unconfirmed cancel
+  force-stops and taints exactly like an unconfirmed timeout abort.
 - **`force_stop` always taints.** Even if `force_stop()` itself raises, the
   session is still recorded `TAINTED` (fail-safe, not fail-open).
 - **Unconfirmed cleanup is not resumable.** If `disconnect()` cannot be

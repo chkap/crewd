@@ -44,6 +44,14 @@ class _LoopThread:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result(timeout=timeout)
 
+    def schedule(self, coro) -> None:
+        """Fire-and-forget: run ``coro`` on the loop without blocking the caller.
+
+        Used for a non-blocking abort request from another thread (the control
+        poll) so it never waits on the SDK.
+        """
+        asyncio.run_coroutine_threadsafe(coro, self._loop)
+
     def close(self) -> None:
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
@@ -94,6 +102,10 @@ class SdkRoleRuntime(SdkOps):
         self._client = None  # copilot.CopilotClient
         self._session = None  # copilot.CopilotSession
         self._event_count = 0
+        # Guards single-issue of the SDK abort so an external cancel request and
+        # the state machine's confirming abort never double-escalate the runtime.
+        self._abort_lock = threading.Lock()
+        self._abort_issued = False
 
     # ── SdkOps ──
     def open(self, *, resume: bool) -> None:
@@ -153,12 +165,38 @@ class SdkRoleRuntime(SdkOps):
             raise SdkError(f"run failed: {e}") from e
         return RunSignal.IDLE
 
+    def request_abort(self) -> None:
+        """Non-blocking best-effort abort request (called from another thread).
+
+        Schedules ``session.abort()`` on the loop *without waiting*, so a blocked
+        :meth:`run` (an in-flight ``send_and_wait`` awaiting idle) unblocks. The
+        state machine's subsequent :meth:`abort` owns confirmation/escalation;
+        this only pokes the runtime once (idempotent via ``_abort_issued``).
+        """
+        if self._session is None or self._loop is None:
+            return
+        with self._abort_lock:
+            if self._abort_issued:
+                return
+            self._abort_issued = True
+        try:
+            # Fire-and-forget: schedule on the loop thread, do not block here.
+            self._loop.schedule(self._session.abort())
+        except Exception:
+            pass
+
     def abort(self, timeout: float) -> bool:
         assert self._session is not None and self._loop is not None
-        try:
-            self._loop.run(self._session.abort(), timeout=timeout)
-        except Exception as e:
-            raise SdkError(f"abort failed: {e}") from e
+        # Single abort owner: if a non-blocking request already scheduled the
+        # abort, don't issue a second one — just confirm. Otherwise issue it now.
+        with self._abort_lock:
+            need_issue = not self._abort_issued
+            self._abort_issued = True
+        if need_issue:
+            try:
+                self._loop.run(self._session.abort(), timeout=timeout)
+            except Exception as e:
+                raise SdkError(f"abort failed: {e}") from e
         # Confirm cancellation WITHOUT sending a new turn (an empty
         # send_and_wait would start a fresh turn, neither a read-only idle probe
         # nor proof the aborted turn settled). Instead, poll the durable event

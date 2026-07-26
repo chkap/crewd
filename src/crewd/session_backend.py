@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 
 # ─────────────────────────── outcomes & signals ───────────────────────────
@@ -46,6 +47,7 @@ class AttemptOutcome(str, Enum):
     IDLE_COMPLETED = "idle_completed"      # session reached idle within the wait bound
     SDK_ERROR = "sdk_error"                # SDK raised; session left connected, resumable
     ABORTED_CLEAN = "aborted_clean"        # wait timed out, abort() confirmed idle
+    CANCELLED_CLEAN = "cancelled_clean"    # external cancel, abort() confirmed idle
     TAINTED = "tainted"                    # abort unconfirmed → force_stop → unsafe to resume
 
     @property
@@ -78,6 +80,7 @@ class LifecyclePhase(str, Enum):
     ATTEMPT_STARTED = "attempt_started"
     SESSION_OPENED = "session_opened"
     WAIT_TIMED_OUT = "wait_timed_out"
+    CANCEL_REQUESTED = "cancel_requested"
     ABORT_REQUESTED = "abort_requested"
     ABORT_CONFIRMED = "abort_confirmed"
     ABORT_FAILED = "abort_failed"
@@ -203,6 +206,18 @@ class SdkOps(Protocol):
         """
         ...
 
+    def request_abort(self) -> None:
+        """Non-blocking request to abort the in-flight turn (best-effort).
+
+        Called from *another thread* (the orchestrator's control poll) to unblock
+        a :meth:`run` that is waiting on the session, so external cancellation can
+        interrupt work already in flight. Must return promptly and never raise;
+        confirmation/escalation is owned solely by the state machine's subsequent
+        :meth:`abort`. A no-op implementation is acceptable for fakes/transports
+        where :meth:`run` cannot block.
+        """
+        ...
+
     def drain_events(self) -> list[str]:
         """Return durable SDK session-event summaries produced this attempt.
 
@@ -218,6 +233,78 @@ class SdkOps(Protocol):
     def force_stop(self) -> None:
         """Exceptional: kill the owned runtime. The session becomes untrusted."""
         ...
+
+
+# ─────────────────────────── external cancellation ───────────────────────────
+class CancelToken:
+    """Thread-safe, single-owner external cancellation request for one attempt.
+
+    The design deliberately separates *requesting* cancellation from *escalating*
+    it, so a wait-timeout and an operator/signal cancellation share exactly one
+    escalation path (R5 — no double abort/force-stop):
+
+    * The orchestrator (main thread) calls :meth:`request` from its control/signal
+      poll while a role attempt runs on a worker thread. ``request`` only records
+      the first reason and pokes a bound *waker* so a blocked
+      :meth:`SdkOps.run` unblocks. It never aborts, confirms, or force-stops.
+    * :func:`run_attempt` (the worker thread) is the sole owner of the abort →
+      confirm → force-stop → taint escalation, which it runs at most once
+      regardless of how many times (or for how many reasons) cancellation was
+      requested.
+
+    Idempotent: the first reason wins; later requests are ignored. Async-signal
+    friendly: the signal handler need only flip a flag elsewhere — the poll loop,
+    not the handler, calls :meth:`request`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requested = False
+        self._reason: str | None = None
+        self._waker: "Callable[[], None] | None" = None
+
+    def bind_waker(self, waker: "Callable[[], None]") -> None:
+        """Register the callback that unblocks an in-flight :meth:`SdkOps.run`.
+
+        If cancellation was already requested before the waker was bound, it fires
+        immediately so a race (request before the attempt started waiting) still
+        interrupts the wait.
+        """
+        with self._lock:
+            self._waker = waker
+            fire = self._requested
+        if fire:
+            _safe_call(waker)
+
+    def request(self, reason: str) -> None:
+        """Request cancellation (idempotent; first reason wins)."""
+        with self._lock:
+            if self._requested:
+                return
+            self._requested = True
+            self._reason = reason
+            waker = self._waker
+        if waker is not None:
+            _safe_call(waker)
+
+    @property
+    def is_requested(self) -> bool:
+        with self._lock:
+            return self._requested
+
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+
+def _safe_call(fn: "Callable[[], None]") -> None:
+    try:
+        fn()
+    except Exception:
+        # A waker is best-effort: never let unblocking a wait raise into the
+        # requester (which may be a control poll or, indirectly, a signal path).
+        pass
 
 
 # ─────────────────────────── taint store ───────────────────────────
@@ -395,6 +482,7 @@ def run_attempt(
     resume: bool,
     config: AttemptConfig | None = None,
     allow_tainted_resume: bool = False,
+    cancel: "CancelToken | None" = None,
     clock=time.monotonic,
 ) -> AttemptResult:
     """Drive one role attempt through the lifecycle state machine.
@@ -402,7 +490,12 @@ def run_attempt(
     Guarantees:
       * exactly one terminal :class:`AttemptOutcome`;
       * a wait-timeout is never reported as a successful cancellation;
-      * an unconfirmed abort force-stops and taints the session id;
+      * an external cancellation that settles idle is reported as
+        :attr:`AttemptOutcome.CANCELLED_CLEAN`, never ``IDLE_COMPLETED``;
+      * an unconfirmed abort (timeout *or* cancel) force-stops and taints;
+      * a wait-timeout and an external cancel share exactly one abort/escalation
+        (this function is the single escalation owner; :class:`CancelToken` only
+        *requests*);
       * a tainted session id is refused for resume unless explicitly allowed;
       * timing is per-attempt (monotonic), never cumulative.
     """
@@ -478,19 +571,39 @@ def run_attempt(
     except SdkError as e:
         return finish(AttemptOutcome.SDK_ERROR, str(e))
 
-    # Run the prompt to idle, or hit the wait bound.
+    # Bind the cancellation waker so an external request can unblock an in-flight
+    # `run`. `request_abort` is best-effort/non-blocking (a no-op transport is
+    # fine); the confirmation + escalation below stays the single owner.
+    if cancel is not None:
+        cancel.bind_waker(lambda: _request_abort(ops))
+
+    # Run the prompt to idle, or hit the wait bound (or be unblocked by a cancel).
     try:
         signal = ops.run(prompt, cfg.wait_timeout)
     except SdkError as e:
         cleanup()
         return finish(AttemptOutcome.SDK_ERROR, str(e))
 
-    if signal is RunSignal.IDLE:
+    externally_cancelled = cancel is not None and cancel.is_requested
+
+    # Idle with no external cancel pending → genuine completion. An idle that
+    # arrives *because* an external abort settled the turn is NOT a completion.
+    if signal is RunSignal.IDLE and not externally_cancelled:
         cleanup()
         return finish(AttemptOutcome.IDLE_COMPLETED)
 
-    # Wait timed out — NOT a cancellation yet. Issue a bounded abort.
-    emit(LifecyclePhase.WAIT_TIMED_OUT, f"no idle within {cfg.wait_timeout:.0f}s")
+    # Single escalation owner: whether we got here via a wait-timeout or an
+    # external cancel (or both), we issue exactly one bounded abort + confirm.
+    if externally_cancelled:
+        reason = cancel.reason or "external"
+        emit(LifecyclePhase.CANCEL_REQUESTED, f"external cancel: {reason}")
+        clean_outcome = AttemptOutcome.CANCELLED_CLEAN
+        taint_detail = f"cancel ({reason}) abort unconfirmed; session tainted"
+    else:
+        emit(LifecyclePhase.WAIT_TIMED_OUT, f"no idle within {cfg.wait_timeout:.0f}s")
+        clean_outcome = AttemptOutcome.ABORTED_CLEAN
+        taint_detail = "wait timed out; abort unconfirmed; session tainted"
+
     emit(LifecyclePhase.ABORT_REQUESTED, f"abort bound {cfg.abort_timeout:.0f}s")
     try:
         confirmed = ops.abort(cfg.abort_timeout)
@@ -501,7 +614,7 @@ def run_attempt(
     if confirmed:
         emit(LifecyclePhase.ABORT_CONFIRMED, "session idle after abort")
         cleanup()
-        return finish(AttemptOutcome.ABORTED_CLEAN)
+        return finish(clean_outcome)
 
     # Abort could not be confirmed → force stop and taint.
     emit(LifecyclePhase.ABORT_FAILED, "abort not confirmed within bound")
@@ -517,7 +630,22 @@ def run_attempt(
         emit(LifecyclePhase.FORCE_STOPPED, "runtime force-stopped")
     taint_store.taint(session_id)
     emit(LifecyclePhase.SESSION_TAINTED, "session marked unsafe to resume")
-    return finish(AttemptOutcome.TAINTED, "wait timed out; abort unconfirmed; session tainted")
+    return finish(AttemptOutcome.TAINTED, taint_detail)
+
+
+def _request_abort(ops: SdkOps) -> None:
+    """Best-effort non-blocking abort request used as a :class:`CancelToken` waker.
+
+    Tolerates ops that predate the ``request_abort`` port method (older fakes):
+    such transports simply cannot be unblocked mid-``run``, which is acceptable.
+    """
+    fn = getattr(ops, "request_abort", None)
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception:
+        pass
 
 
 def _new_attempt_id(session_id: str, clock) -> str:
