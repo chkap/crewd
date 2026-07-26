@@ -135,5 +135,87 @@ def main() -> None:
     for k in sorted(per_stratum):
         print(f"  {k[0]}/{k[1]}: {per_stratum[k]}")
 
+    anchored_exception_census(root, pop)
+
+
+# --- Anchored exception census (§5): only markers a machine can pin exactly ---
+# These are NOT keyword mentions. Each is either a backend-emitted line at the
+# start of a log line, an exact footer, or a daemon.log exit record.
+BACKEND_MARKERS = {
+    "timeout_marker": re.compile(r"^\[crewd\] TIMEOUT after ", re.M),
+    "sigint_ignored": re.compile(r"^\[crewd\] SIGINT ignored", re.M),
+    "sigterm_ignored": re.compile(r"^\[crewd\] SIGTERM ignored", re.M),
+    "sigint_clean": re.compile(r"^\[crewd\] exited cleanly after SIGINT", re.M),
+    "sigterm_clean": re.compile(r"^\[crewd\] exited after SIGTERM", re.M),
+}
+ZERO_CREDIT = re.compile(r"^AI Credits 0 \(0s\)", re.M)
+DAEMON_EXIT = re.compile(r"^\s*(\w+) exited rc=(\d+)", re.M)
+
+def anchored_exception_census(root: Path, pop) -> None:
+    print("\n=== ANCHORED EXCEPTION CENSUS (§5) ===")
+    print("(backend markers + exact footers + daemon exits; NOT keyword mentions)")
+    # role-log anchored markers, per crew (aggregated over all roles)
+    expected = {
+        ("fin-crew", "timeout_marker"): 36,
+        ("fin-crew", "sigint_ignored"): 0,
+        ("fin-crew", "sigterm_ignored"): 0,
+        ("fin-crew", "sigint_clean"): 36,
+        ("fin-crew", "zero_credit"): 0,
+        ("legal-crew", "timeout_marker"): 13,
+        ("legal-crew", "sigint_ignored"): 1,
+        ("legal-crew", "sigterm_ignored"): 1,
+        ("legal-crew", "sigint_clean"): 12,
+        ("legal-crew", "zero_credit"): 4,
+    }
+    texts: dict[tuple[str, str, str, int], str] = {}
+    for crew, role, goal, cycle, path in pop:
+        texts[(crew, role, goal, cycle)] = path.read_text(errors="replace")
+    ok = True
+    for crew in CREWS:
+        counts = {k: 0 for k in BACKEND_MARKERS}
+        counts["zero_credit"] = 0
+        for (c, role, goal, cycle), t in texts.items():
+            if c != crew:
+                continue
+            for k, rx in BACKEND_MARKERS.items():
+                if rx.search(t):
+                    counts[k] += 1
+            if ZERO_CREDIT.search(t):
+                counts["zero_credit"] += 1
+        for k, v in counts.items():
+            exp = expected.get((crew, k))
+            flag = ""
+            if exp is not None and exp != v:
+                flag = f"  <<< MISMATCH expected {exp}"
+                ok = False
+            print(f"  {crew:11s} {k:16s} = {v}{flag}")
+    # daemon.log exit census
+    print("  -- daemon.log role exits --")
+    daemon_expected = {
+        ("fin-crew", "worker", 130): 33,
+        ("fin-crew", "verifier", 130): 3,
+        ("legal-crew", "worker", 130): 12,
+        ("legal-crew", "worker", 124): 1,
+    }
+    seen = {}
+    for crew in CREWS:
+        d = root / crew / "state" / "logs" / "daemon.log"
+        if not d.is_file():
+            continue
+        for role, rc in DAEMON_EXIT.findall(d.read_text(errors="replace")):
+            seen[(crew, role, int(rc))] = seen.get((crew, role, int(rc)), 0) + 1
+    for key, exp in daemon_expected.items():
+        got = seen.get(key, 0)
+        flag = "" if got == exp else f"  <<< MISMATCH expected {exp}"
+        if got != exp:
+            ok = False
+        print(f"  {key[0]:11s} {key[1]} rc={key[2]} = {got}{flag}")
+    # any unexpected daemon exits?
+    for key, got in sorted(seen.items()):
+        if key not in daemon_expected:
+            print(f"  {key[0]:11s} {key[1]} rc={key[2]} = {got}  (UNLISTED)")
+            ok = False
+    print(f"\nASSERTIONS: {'ALL PASS' if ok else 'FAILED — doc §5 must match'}")
+
 if __name__ == "__main__":
     main()

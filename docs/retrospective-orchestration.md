@@ -68,9 +68,13 @@ The regexes are literal string matches over narration and therefore miss paraphr
 "assigned Worker to #90" is not caught by `assigned #`); this is exactly why the numbers are
 treated as heuristic lower bounds, not measurements.
 
-**Stage B — exhaustive exception census.** Every timeout/SIGINT/SIGTERM/SIGKILL, cancellation,
-and log-numbering gap was enumerated and the boundary cycles read in full (see §5). Rare
-failures are reported as counts, never extrapolated to rates.
+**Stage B — anchored exception census.** Failure/lifecycle events are counted only from
+anchored signals a machine can pin exactly — backend-emitted `[crewd] …` markers at line
+start, exact footers (`AI Credits 0 (0s)`), and `daemon.log` exit records — **not** from
+transcript keyword mentions (which overstate real events; see §5). `docs/retrospective_analysis.py`
+emits every §5 row and asserts its expected value against the logs, so the census is
+regenerable and cannot silently drift. Rare failures are reported as counts, never
+extrapolated to rates.
 
 **Stage C — deterministic hand-validation spot-check (illustrative, underpowered).** The 16
 seeded paths above were hand-read to see how the heuristic behaves at the boundary. It is a
@@ -183,23 +187,43 @@ work for it.
 
 ## 5. Finding 2 — failure, cancellation, and stale-session behavior
 
-legal-crew (infra-heavy, real external calls) is where lifecycle behavior is visible.
-Exception census counts (Stage B, exact):
+legal-crew (infra-heavy, real external calls) is where lifecycle behavior is visible. **This
+section uses only anchored events, not keyword mentions** — backend-emitted `[crewd] ...`
+markers at line start, exact footers, and `daemon.log` exit records. Every row below is
+emitted and asserted by `docs/retrospective_analysis.py` ("ANCHORED EXCEPTION CENSUS"), so the
+counts cannot drift from the logs. (An earlier draft mixed transcript keyword *mentions* into
+this table — e.g. reporting a `cancel`-keyword count as a zero-credit-footer count; those
+mention counts overstate real events, per Advisory's reconciliation, and have been removed
+from this census. Transcript mention prevalence lives in §4's heuristic table and is not used
+for failure rates.)
 
-| Signal (log mentions) | legal worker (n=147) | fin worker (n=1,489) |
-|-----------------------|---------------------:|---------------------:|
-| timeout / rc=124 | 37 (25%) | 48 (3%) |
-| SIGINT/SIGTERM/SIGKILL | 14 (10%) | 33 (2%) |
-| cancel | 12 (8%) | 35 (2%) |
-| crash/killed/OOM terms | 22 (15%) | 5 (0%) |
-| error/exception/traceback | 44 (30%) | 62 (4%) |
-| `AI Credits 0 (0s)` cancelled-tick | 12 (8%) | 33 (2%) |
+**Anchored exception census (reproducible; assertions pass):**
 
-**Case study — legal goal-v1 cycle 77 (the decisive trace).**
+| Anchored event | fin (all roles) | legal (all roles) |
+|----------------|----------------:|------------------:|
+| `[crewd] TIMEOUT after …` backend marker | 36 | 13 |
+| → recovered cleanly via SIGINT (`exited cleanly after SIGINT`) | 36 | 12 |
+| → SIGINT ignored → escalated to SIGTERM | 0 | 1 |
+| → SIGTERM ignored → escalated to SIGKILL | 0 | 1 |
+| `AI Credits 0 (0s)` exact footer (cancelled/zero-work tick) | 0 | 4 |
+| `daemon.log` worker `exited rc=130` (SIGINT) | 33 | 12 |
+| `daemon.log` verifier `exited rc=130` (SIGINT) | 3 | 0 |
+| `daemon.log` worker `exited rc=124` (SIGKILL escalation) | 0 | 1 |
+
+These reconcile independently: fin's 36 timeout markers = 33 worker + 3 verifier daemon
+`rc=130` exits, all recovered via SIGINT, **zero** forced kills. legal's 13 worker timeout
+markers = 12 clean SIGINT (`rc=130`) + **exactly one** full escalation to SIGKILL (`rc=124`)
+— cycle 77 below. So timeouts were common but **almost always recovered gracefully**; the
+dangerous "session MAY corrupt" SIGKILL path fired exactly once in these histories. That single
+case is the strongest evidence for R4/R5, precisely because it is rare and its recovery was
+mishandled.
+
+**Case study — legal goal-v1 cycle 77 (the one SIGKILL, the decisive trace).**
 1. Worker ran the full budget and hit `[crewd] TIMEOUT after 1800s`; the backend escalated
    `SIGINT (grace 20s)` → *ignored* → `SIGTERM (grace 10s)` → *ignored* →
    `SIGKILL (session MAY corrupt)`. The tick never printed a footer (the one
-   footer-less log in the census).
+   footer-less log in the population), and `daemon.log` recorded this worker exit as `rc=124`
+   (the single such record across both histories).
 2. **Verifier cycle 77 still ran** in fixed order and reported an idle waiting state
    ("No open PRs … #21 remains open, waiting on Worker"). The next *useful* action after a
    forced-killed Worker was not "run Verifier"; it was to handle the failed attempt / return
@@ -220,7 +244,9 @@ terminal marker distinguishing "aborted" from "finished".
 
 **Conclusion (high confidence on lifecycle implications).** Forced termination and normal
 cancellation are today indistinguishable from a healthy resume; terminal/empty states are
-ambiguous; and a failed attempt does not return control to Lead. These are the recovery
+ambiguous; and a failed attempt does not return control to Lead. The anchored counts also show
+the failure profile is "many recoverable timeouts, one un-tainted forced kill", which is
+exactly the case distinct-outcome handling (R4/R5) must cover. These are the recovery
 requirements for #10/#11/#13.
 
 ---
@@ -326,7 +352,9 @@ than "whose turn is it":
 - **High confidence:** that the fixed loop produces avoidable no-op invocations in fin steady
   state — this rests on the exact schedule counts (§3), the cumulative-footer caveats, and the
   idle case studies (§6), not on the heuristic percentages. Also high on the lifecycle/recovery
-  gaps (complete exception census + the cy77 trace and the `backends.py` blind-resume code).
+  gaps: the §5 census is anchored (backend markers + daemon exits + exact footers, asserted by
+  the script and cross-reconciled) and the cy77 trace plus the `backends.py` blind-resume code
+  are directly cited.
 - **Medium / bounded confidence:** the exact idle *percentages* in §4. They are automated
   keyword-heuristic classifications; the Stage-C spot-check (§2) is underpowered and fin-v7-
   dominated, showed the `unclear` bucket is impure (leans idle but includes productive), and
@@ -341,9 +369,10 @@ than "whose turn is it":
 
 ### Reproduction notes
 - **Run it:** `python3 docs/retrospective_analysis.py --root <dir-containing-both-crews>`
-  regenerates the §1 census, the §4 table, the §5 exception counts, and the exact Stage-C
-  16-path sample. The script pins the population ordering and the classifier regexes so the
-  output is machine-independent.
+  regenerates the §1 census, the §4 table, the §5 anchored exception counts, and the exact
+  Stage-C 16-path sample. The script pins the population ordering and the classifier regexes,
+  and asserts every §5 anchored row (prints `ASSERTIONS: ALL PASS`), so the output is
+  machine-independent and the doc cannot drift from the logs.
 - Population: all `state/logs/goal-v*/<role>/*.log` under the two read-only crew workspaces
   (6,574 role logs total).
 - Stage-C: `random.Random(1729).sample(POPULATION, 16)` over the canonical ordering; the 16
