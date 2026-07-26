@@ -140,17 +140,21 @@ def test_classify_mapping():
 def test_max_work_reservation_is_not_refunded_by_crash(tmp_path):
     disp = _open(tmp_path, max_work=2)
     run = disp.start_or_resume_run("goal:v1")
-    d = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
-    # First slot: crash right after reservation (before start).
-    _drive(disp, run.id, d.dispatch.id, "worker", AttemptOutcome.IDLE_COMPLETED, stop_after="reserve")
+    d1 = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    # First slot: crash right after reservation (before terminal).
+    disp.reserve_attempt(run.id, d1.dispatch.id, "worker")
     disp.close()
 
     # Reopen: reserved slot persists, budget not refunded.
     disp2 = _open(tmp_path, max_work=2)
     assert disp2.get_run(run.id).reserved_slots == 1
-    disp2.reserve_attempt(run.id, d.dispatch.id, "worker")  # 2nd slot ok
+    disp2.reconcile_on_restart(run.id)  # returns authority to Lead
+    d2 = disp2.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    att2 = disp2.reserve_attempt(run.id, d2.dispatch.id, "worker")  # 2nd slot ok (==max)
+    disp2.record_terminal(att2, AttemptOutcome.IDLE_COMPLETED)
+    d3 = disp2.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
     with pytest.raises(BudgetExhausted):
-        disp2.reserve_attempt(run.id, d.dispatch.id, "worker")  # 3rd over budget
+        disp2.reserve_attempt(run.id, d3.dispatch.id, "worker")  # 3rd over budget
     assert disp2.get_run(run.id).status is RunStatus.EXHAUSTED
 
 
@@ -213,11 +217,13 @@ def test_ack_is_idempotent(tmp_path):
     _drive(disp, run.id, d.dispatch.id, "worker", AttemptOutcome.IDLE_COMPLETED)
     hid = disp.pending_handoffs(run.id)[0].id
 
-    disp.lead_decide(run.id, LeadDecision.dispatch("verifier", ack=(hid,)), configured_roles=ROLES)
+    d2 = disp.lead_decide(run.id, LeadDecision.dispatch("verifier", ack=(hid,)), configured_roles=ROLES)
     assert disp.pending_handoffs(run.id) == []
-    # Re-acking the already-consumed handoff is a no-op, not an error.
-    d3 = disp.lead_decide(run.id, LeadDecision.continue_lead(ack=(hid,)), configured_roles=ROLES)
-    assert d3.dispatch is not None
+    # Drive verifier to terminal so authority returns to Lead (new handoff hid2).
+    _drive(disp, run.id, d2.dispatch.id, "verifier", AttemptOutcome.IDLE_COMPLETED)
+    hid2 = disp.pending_handoffs(run.id)[0].id
+    # Re-acking the already-consumed hid is a no-op; hid2 is consumed normally.
+    disp.lead_decide(run.id, LeadDecision.continue_lead(ack=(hid, hid2)), configured_roles=ROLES)
     assert disp.pending_handoffs(run.id) == []
 
 
@@ -303,3 +309,128 @@ def test_no_progress_override_counts_as_unproductive(tmp_path):
     disp.record_terminal(att, AttemptOutcome.IDLE_COMPLETED, outcome_class=HandoffOutcome.NO_PROGRESS)
     assert disp.get_run(run.id).consecutive_unproductive == 1
     assert disp.pending_handoffs(run.id)[0].outcome_class is HandoffOutcome.NO_PROGRESS
+
+
+# ─────────── run-lifecycle guards (Verifier #16 blocking finding) ───────────
+def test_resume_does_not_create_second_active_run_after_pause(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    disp.lead_decide(r.id, LeadDecision.pause("human approval"), configured_roles=ROLES)
+    r2 = disp.start_or_resume_run("goal:v1")
+    # Same goal label must return the SAME durable (paused) run, not a fresh active one.
+    assert r2.id == r.id
+    assert r2.status is RunStatus.PAUSED
+
+
+def test_resume_does_not_create_second_run_after_finish(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    disp.lead_decide(r.id, LeadDecision.finish("done"), configured_roles=ROLES)
+    r2 = disp.start_or_resume_run("goal:v1")
+    assert r2.id == r.id
+    assert r2.status is RunStatus.FINISHED
+
+
+def test_dispatch_from_paused_run_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    disp.lead_decide(r.id, LeadDecision.pause("blocker"), configured_roles=ROLES)
+    with pytest.raises(DecisionError):
+        disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    assert disp.get_run(r.id).status is RunStatus.PAUSED
+
+
+def test_dispatch_from_finished_run_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    disp.lead_decide(r.id, LeadDecision.finish("done"), configured_roles=ROLES)
+    with pytest.raises(DecisionError):
+        disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+
+
+def test_explicit_resume_reactivates_and_resets_thrash(tmp_path):
+    disp = _open(tmp_path, max_edge_repeats=1, max_consecutive_unproductive=0)
+    r = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    _drive(disp, r.id, d.dispatch.id, "worker", AttemptOutcome.SDK_ERROR)
+    res = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    assert res.guard_tripped and disp.get_run(r.id).status is RunStatus.PAUSED
+    resumed = disp.resume_run(r.id)
+    assert resumed.status is RunStatus.ACTIVE
+    assert resumed.routing_authority == LEAD_PENDING
+    assert resumed.last_edge_repeats == 0
+    # After resume, Lead may dispatch again.
+    d2 = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    assert d2.dispatch is not None
+
+
+def test_resume_finished_run_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    disp.lead_decide(r.id, LeadDecision.finish("done"), configured_roles=ROLES)
+    with pytest.raises(DecisionError):
+        disp.resume_run(r.id)
+
+
+# ─────────── exclusive authority + attempt binding (Advisory finding) ───────────
+def test_overlapping_lead_decision_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    # Authority is held by the first dispatch; a second decision must be refused.
+    with pytest.raises(DecisionError):
+        disp.lead_decide(r.id, LeadDecision.dispatch("verifier"), configured_roles=ROLES)
+    # No second dispatch row created.
+    assert len(disp.export_run(r.id)["attempts"]) == 0
+
+
+def test_duplicate_reservation_per_dispatch_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    disp.reserve_attempt(r.id, d.dispatch.id, "worker")
+    before = disp.get_run(r.id).reserved_slots
+    with pytest.raises(DecisionError):
+        disp.reserve_attempt(r.id, d.dispatch.id, "worker")
+    # No extra slot consumed on the rejected duplicate.
+    assert disp.get_run(r.id).reserved_slots == before
+
+
+def test_wrong_role_reservation_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    with pytest.raises(DecisionError):
+        disp.reserve_attempt(r.id, d.dispatch.id, "verifier")
+    assert disp.get_run(r.id).reserved_slots == 0
+
+
+def test_cross_run_dispatch_reservation_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r1 = disp.start_or_resume_run("goal:v1")
+    d1 = disp.lead_decide(r1.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    r2 = disp.start_or_resume_run("goal:v2")
+    # Reserving an attempt in r2 that points at r1's dispatch must be refused.
+    with pytest.raises(DecisionError):
+        disp.reserve_attempt(r2.id, d1.dispatch.id, "worker")
+    assert disp.get_run(r2.id).reserved_slots == 0
+
+
+def test_reservation_without_authority_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    att = disp.reserve_attempt(r.id, d.dispatch.id, "worker")
+    disp.record_terminal(att, AttemptOutcome.IDLE_COMPLETED)  # authority back to Lead
+    # The old dispatch no longer owns authority; a late reservation is refused.
+    with pytest.raises(DecisionError):
+        disp.reserve_attempt(r.id, d.dispatch.id, "worker")
+
+
+def test_reserve_on_non_routing_dispatch_is_rejected(tmp_path):
+    disp = _open(tmp_path)
+    r = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(r.id, LeadDecision.wait("some condition"), configured_roles=ROLES)
+    # WAIT is recorded as a dispatch row but is not a routing decision.
+    with pytest.raises(DecisionError):
+        disp.reserve_attempt(r.id, d.dispatch.id, "lead")

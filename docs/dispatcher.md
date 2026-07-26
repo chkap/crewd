@@ -56,11 +56,25 @@ the in-flight dispatch otherwise.
    `wait(condition)`, `pause(blocker)`, `finish(acceptance)`. A `dispatch` to an
    unconfigured role fails and keeps authority with Lead. `wait`/`pause`/`finish`
    launch no role.
-7. **Deterministic thrash bounds.** Exceeding `max_consecutive_unproductive`, or
+7. **Exclusive routing authority.** `lead_decide` is accepted only when the run
+   is `active` **and** `routing_authority == lead_pending`. This forbids
+   overlapping dispatches while one attempt is in flight, and refuses to launch
+   work from a `paused`/`finished`/`exhausted`/`interrupted` run. Reviving a
+   non-active run requires the explicit `resume_run` transition; a plain
+   restart (`start_or_resume_run`) returns the existing durable run **as-is**
+   and never creates a second active run that bypasses a persisted pause/finish.
+8. **Attempts are bound to their dispatch.** `reserve_attempt` requires the
+   dispatch to exist, belong to the run, be a routing kind, match the role, and
+   currently own routing authority; at most one attempt per dispatch
+   (`UNIQUE(dispatch_id)` backstop). A stale caller after a crash therefore
+   cannot launch a second role while the journal says another dispatch owns
+   authority, nor bind an attempt to the wrong run/role.
+9. **Deterministic thrash bounds.** Exceeding `max_consecutive_unproductive`, or
    repeating an identical role edge more than `max_edge_repeats` times without an
    intervening productive handoff, emits one synthetic handoff and **pauses** the
-   run (`guard_tripped=True`) instead of recursively invoking Lead. Thresholds
-   are configurable pending #12's semantic progress token.
+   run (`guard_tripped=True`) instead of recursively invoking Lead. `resume_run`
+   clears the blocker and resets the thrash counters. Thresholds are configurable
+   pending #12's semantic progress token.
 
 ## Crash points covered by `tests/test_dispatcher.py`
 

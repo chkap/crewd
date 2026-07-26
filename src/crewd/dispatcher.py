@@ -278,7 +278,7 @@ CREATE TABLE IF NOT EXISTS dispatch (
 );
 CREATE TABLE IF NOT EXISTS attempt (
     id TEXT PRIMARY KEY,
-    dispatch_id TEXT NOT NULL REFERENCES dispatch(id),
+    dispatch_id TEXT NOT NULL UNIQUE REFERENCES dispatch(id),
     run_id TEXT NOT NULL REFERENCES goal_run(id),
     role TEXT NOT NULL,
     session_id TEXT,
@@ -353,16 +353,19 @@ class Dispatcher:
 
     # ── run lifecycle ────────────────────────────────────────────
     def start_or_resume_run(self, goal_label: str) -> RunView:
-        """Return the active run for ``goal_label``, creating one if absent.
+        """Return the run for ``goal_label``, creating one only if none exists.
 
-        A *new goal epoch* (different label with no active run) always creates a
-        fresh run — prior epochs are never resumed. Routing authority starts
-        with Lead, which makes the first decision.
+        A *new goal epoch* (a label with no prior run) creates a fresh active
+        run. For a label that already has a run, the existing run is returned
+        **as-is, in whatever durable state it holds** — a restart must never
+        silently create a second active run that bypasses a persisted
+        pause/finish/exhausted/interrupted state. Reviving a non-active run
+        requires the explicit :meth:`resume_run` transition.
         """
         with self._txn() as c:
             row = c.execute(
-                "SELECT * FROM goal_run WHERE goal_label = ? AND status = ? LIMIT 1",
-                (goal_label, RunStatus.ACTIVE.value),
+                "SELECT * FROM goal_run WHERE goal_label = ? ORDER BY created_at DESC LIMIT 1",
+                (goal_label,),
             ).fetchone()
             if row is None:
                 run_id = _new_id("run")
@@ -374,6 +377,39 @@ class Dispatcher:
                 row = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
         return _run_view(row)
 
+    def resume_run(self, run_id: str) -> RunView:
+        """Explicitly transition a paused/waiting/interrupted run back to active.
+
+        This is the *only* way a non-active run resumes launching work; it clears
+        the wake condition / human blocker and resets the thrash counters so the
+        run does not immediately re-trip a guard after human intervention.
+        Routing authority returns to Lead. ``finished`` and ``exhausted`` are
+        terminal and cannot be resumed (raises :class:`DecisionError`); resuming
+        an already-active run is a no-op.
+        """
+        resumable = {
+            RunStatus.PAUSED.value,
+            RunStatus.WAITING.value,
+            RunStatus.INTERRUPTED.value,
+            RunStatus.STOPPED.value,
+        }
+        with self._txn() as c:
+            run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(run_id)
+            if run["status"] == RunStatus.ACTIVE.value:
+                return _run_view(run)
+            if run["status"] not in resumable:
+                raise DecisionError(f"run {run_id} is {run['status']} and cannot be resumed")
+            c.execute(
+                "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = NULL, "
+                "human_blocker = NULL, consecutive_unproductive = 0, last_edge = NULL, "
+                "last_edge_repeats = 0 WHERE id = ?",
+                (RunStatus.ACTIVE.value, LEAD_PENDING, run_id),
+            )
+            run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+        return _run_view(run)
+
     def get_run(self, run_id: str) -> RunView:
         row = self._conn.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
         if row is None:
@@ -384,6 +420,14 @@ class Dispatcher:
     def reserve_attempt(self, run_id: str, dispatch_id: str, role: str) -> str:
         """Durably reserve a work slot BEFORE the executor is invoked.
 
+        The dispatch is the authority: ``dispatch_id`` must exist, belong to
+        ``run_id``, be a routing kind (``dispatch``/``continue_lead``), match
+        ``role``, and currently own the run's routing authority. At most one
+        attempt may be reserved per dispatch (also a ``UNIQUE`` DB backstop).
+        These guards stop a stale caller after a crash from launching a second
+        role while the journal says another dispatch owns authority, or from
+        binding an attempt to the wrong run/role.
+
         Raises :class:`BudgetExhausted` (marking the run EXHAUSTED) if the
         max-work budget would be exceeded. The reservation is counted whether or
         not the executor later starts, so a crash cannot refund the slot.
@@ -392,6 +436,28 @@ class Dispatcher:
             run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
             if run is None:
                 raise KeyError(run_id)
+            dsp = c.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+            if dsp is None:
+                raise DecisionError(f"unknown dispatch id {dispatch_id!r}")
+            if dsp["run_id"] != run_id:
+                raise DecisionError(f"dispatch {dispatch_id!r} belongs to a different run")
+            if dsp["kind"] not in (DecisionKind.DISPATCH.value, DecisionKind.CONTINUE_LEAD.value):
+                raise DecisionError(f"dispatch {dispatch_id!r} is not a routing decision")
+            if (dsp["role"] or "lead") != role:
+                raise DecisionError(
+                    f"role {role!r} does not match dispatch role {dsp['role']!r}"
+                )
+            if run["routing_authority"] != dispatch_id:
+                raise DecisionError(
+                    f"dispatch {dispatch_id!r} does not own routing authority "
+                    f"(current: {run['routing_authority']})"
+                )
+            existing = c.execute(
+                "SELECT id FROM attempt WHERE dispatch_id = ?", (dispatch_id,)
+            ).fetchone()
+            if existing is not None:
+                raise DecisionError(f"dispatch {dispatch_id!r} already has an attempt")
+
             limit = self.limits.max_work
             over_budget = bool(limit) and run["reserved_slots"] >= limit
             if over_budget:
@@ -408,9 +474,8 @@ class Dispatcher:
                     (attempt_id, dispatch_id, run_id, role, AttemptState.RESERVED.value, _now()),
                 )
                 c.execute(
-                    "UPDATE goal_run SET reserved_slots = reserved_slots + 1, routing_authority = ? "
-                    "WHERE id = ?",
-                    (dispatch_id, run_id),
+                    "UPDATE goal_run SET reserved_slots = reserved_slots + 1 WHERE id = ?",
+                    (run_id,),
                 )
         # Raise only after the EXHAUSTED status is durably committed, so a crash
         # cannot leave the run looking active with no remaining budget.
@@ -524,18 +589,32 @@ class Dispatcher:
         role.
 
         Invalid decisions raise :class:`DecisionError` and leave all state
-        unchanged (transaction rolls back). Thrash guard: exceeding
-        ``max_consecutive_unproductive``, or repeating an identical role edge more
-        than ``max_edge_repeats`` times without an intervening productive handoff,
-        does **not** dispatch; it emits one synthetic handoff, pauses the run, and
-        returns ``guard_tripped=True`` (the acks are not applied so Lead re-decides
-        after the human unblocks).
+        unchanged (transaction rolls back). A decision is only accepted when the
+        run is ``active`` **and** routing authority is ``lead_pending`` — this
+        enforces exclusive authority (no overlapping dispatches while one is
+        in-flight) and refuses to launch work from a paused/finished/exhausted/
+        interrupted run (revival requires :meth:`resume_run`). Thrash guard:
+        exceeding ``max_consecutive_unproductive``, or repeating an identical role
+        edge more than ``max_edge_repeats`` times without an intervening
+        productive handoff, does **not** dispatch; it emits one synthetic handoff,
+        pauses the run, and returns ``guard_tripped=True`` (the acks are not
+        applied so Lead re-decides after the human unblocks).
         """
         configured = set(configured_roles)
         with self._txn() as c:
             run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
             if run is None:
                 raise KeyError(run_id)
+
+            if run["status"] != RunStatus.ACTIVE.value:
+                raise DecisionError(
+                    f"run {run_id} is {run['status']}; resume it before deciding"
+                )
+            if run["routing_authority"] != LEAD_PENDING:
+                raise DecisionError(
+                    f"routing authority is held by {run['routing_authority']}, not Lead; "
+                    "the in-flight attempt must reach a terminal outcome first"
+                )
 
             if decision.kind is DecisionKind.DISPATCH:
                 if not decision.role or decision.role not in configured:
