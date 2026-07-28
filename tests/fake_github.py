@@ -79,7 +79,7 @@ class FakeGitHubClient:
         self._maybe_fault("list_issues")
         out = []
         for i in self.issues.values():
-            if state and i.state != state:
+            if state and state != "all" and i.state != state:
                 continue
             if label and label not in i.labels:
                 continue
@@ -96,7 +96,8 @@ class FakeGitHubClient:
 
     def list_pulls(self, state: str = "open") -> list[PullRef]:
         self._maybe_fault("list_pulls")
-        return [p for p in self.pulls.values() if not state or p.state == state]
+        return [p for p in self.pulls.values()
+                if not state or state == "all" or p.state == state]
 
     def list_comments(self, *, target: str, number: int) -> list[CommentRef]:
         self._maybe_fault("list_comments")

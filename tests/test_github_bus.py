@@ -324,3 +324,73 @@ def test_post_rejects_invalid_attribution_target():
 ])
 def test_classify_gh_stderr(stderr, expected):
     assert classify_gh_stderr(stderr, 1) is expected
+
+
+# ── typed reference resolution (public record → active identifiers) ──
+def test_resolve_active_task_single():
+    c = FakeGitHubClient(REPO)
+    _seed_goal(c)
+    c.add_issue(29, "task", labels=("crewd:task", GOAL))
+    c.add_comment("issue", 29, _lead_assignment_body())
+    out = _bus(c).resolve_active_task()
+    assert out.ok
+    assert out.refs["task"] == 29
+
+
+def test_resolve_active_task_none_assigned():
+    c = FakeGitHubClient(REPO)
+    _seed_goal(c)
+    c.add_issue(29, "task", labels=("crewd:task", GOAL))  # no assignment comment
+    out = _bus(c).resolve_active_task()
+    assert not out.ok
+    assert out.reason is RejectReason.NO_ASSIGNMENT
+
+
+def test_resolve_active_task_ambiguous():
+    c = FakeGitHubClient(REPO)
+    _seed_goal(c)
+    for n in (29, 28):
+        c.add_issue(n, "task", labels=("crewd:task", GOAL))
+        c.add_comment("issue", n, _lead_assignment_body())
+    out = _bus(c).resolve_active_task()
+    assert not out.ok
+    assert out.reason is RejectReason.MULTIPLE
+
+
+def test_resolve_active_task_ignores_other_goal():
+    c = FakeGitHubClient(REPO)
+    _seed_goal(c)
+    c.add_issue(29, "task", labels=("crewd:task", "goal:v1"))  # wrong goal
+    c.add_comment("issue", 29, _lead_assignment_body())
+    out = _bus(c).resolve_active_task()
+    assert not out.ok
+    assert out.reason is RejectReason.NO_ASSIGNMENT
+
+
+def test_resolve_active_task_propagates_goal_failure():
+    c = FakeGitHubClient(REPO)  # no umbrella at all
+    out = _bus(c).resolve_active_task()
+    assert not out.ok
+    assert out.reason is RejectReason.MISSING
+
+
+def test_resolve_acceptance_issue_finds_closed_umbrella():
+    c = FakeGitHubClient(REPO)
+    c.add_issue(30, "GOAL: x", state="closed", labels=(GOAL,))
+    out = _bus(c).resolve_acceptance_issue()
+    assert out.ok
+    assert out.refs["acceptance"] == 30
+
+
+def test_resolve_acceptance_issue_missing():
+    c = FakeGitHubClient(REPO)
+    out = _bus(c).resolve_acceptance_issue()
+    assert not out.ok
+    assert out.reason is RejectReason.MISSING
+
+
+def test_resolve_acceptance_issue_transient_waits():
+    c = FakeGitHubClient(REPO)
+    c.fail_once("list_issues", GitHubErrorKind.TIMEOUT, "deadline")
+    out = _bus(c).resolve_acceptance_issue()
+    assert out.route is Route.WAIT

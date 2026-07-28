@@ -448,6 +448,75 @@ class PublicBus:
                     return c
         return None
 
+    # -- typed reference resolution (public record → active identifiers) --
+    #
+    # The dispatcher journal is role-based and does not name a task/PR; the
+    # canonical identifiers therefore come from the public record itself rather
+    # than a hard-coded parameter. Ambiguity or absence resolves to a REJECT so a
+    # dispatch is never routed against a stale/unknown reference.
+    def resolve_active_task(self) -> PrereqOutcome:
+        """Derive the single active ``crewd:task`` from the public record.
+
+        The active task is the open ``crewd:task`` issue under the current goal
+        umbrella that carries a public Lead worker-assignment record (attributed
+        ``lead -> worker``) — i.e. the task the operator can see is active and
+        why. Zero such tasks rejects (``NO_ASSIGNMENT``); more than one rejects
+        (``MULTIPLE``) so an ambiguous record fails safe instead of guessing.
+        """
+        goal = self.verify_goal_prerequisite()
+        if not goal.ok:
+            return goal
+        try:
+            issues = self.client.list_issues(label=self.task_label, state="open")
+        except GitHubError as e:
+            return route_for_error(e)
+        active = [
+            i for i in issues
+            if _has_label(i, self.goal_label)
+            and self._find_lead_assignment(i.number) is not None
+        ]
+        if not active:
+            return PrereqOutcome.reject(
+                RejectReason.NO_ASSIGNMENT,
+                f"no open {self.task_label!r} issue under {self.goal_label!r} "
+                "with a public Lead assignment",
+            )
+        if len(active) > 1:
+            nums = sorted(i.number for i in active)
+            return PrereqOutcome.reject(
+                RejectReason.MULTIPLE,
+                f"multiple active {self.task_label!r} issues under "
+                f"{self.goal_label!r}: {nums}",
+            )
+        n = active[0].number
+        return PrereqOutcome.proceed(
+            f"active task #{n}", task=n, umbrella=goal.refs.get("umbrella")
+        )
+
+    def resolve_acceptance_issue(self) -> PrereqOutcome:
+        """Derive the final-acceptance issue: the umbrella GOAL issue for the
+        current goal label, resolved across *all* states so ``verify_finish`` can
+        require it closed. Absence/ambiguity rejects."""
+        try:
+            issues = self.client.list_issues(label=self.umbrella_label, state="all")
+        except GitHubError as e:
+            return route_for_error(e)
+        umbrellas = [i for i in issues if i.title.upper().startswith("GOAL")]
+        if not umbrellas:
+            return PrereqOutcome.reject(
+                RejectReason.MISSING,
+                f"no umbrella GOAL issue for {self.goal_label!r}",
+            )
+        if len(umbrellas) > 1:
+            nums = sorted(i.number for i in umbrellas)
+            return PrereqOutcome.reject(
+                RejectReason.MULTIPLE,
+                f"multiple umbrella GOAL issues for {self.goal_label!r}: {nums}",
+            )
+        return PrereqOutcome.proceed(
+            f"acceptance #{umbrellas[0].number}", acceptance=umbrellas[0].number
+        )
+
     # -- idempotent attributed post --
     def post(
         self,
@@ -532,22 +601,44 @@ class PublicBusGate:
     """Adapts :class:`PublicBus` prerequisite checks to the orchestrator seam.
 
     The orchestrator consults :meth:`evaluate` before it reserves a Worker or
-    Verifier attempt. A non-``PROCEED`` outcome halts the dispatch *without*
-    reserving the attempt or consuming any pending handoff, so authority never
-    advances on an invalid or unverifiable public record. ``task_number`` is the
-    active linked task issue for the current goal.
+    Verifier attempt, and :meth:`evaluate_finish` before it applies a Lead
+    ``finish`` decision. A non-``PROCEED`` outcome halts the transition *without*
+    reserving the attempt, consuming any pending handoff, or terminalising the
+    run, so authority never advances on an invalid or unverifiable public record.
+
+    ``task_number`` may be supplied to pin a specific task (used by focused unit
+    tests); when omitted the active task is derived from the public record via
+    :meth:`PublicBus.resolve_active_task`, so production never hard-codes an
+    identifier.
     """
 
-    def __init__(self, bus: PublicBus, *, task_number: int):
+    def __init__(self, bus: PublicBus, *, task_number: Optional[int] = None):
         self.bus = bus
-        self.task_number = task_number
+        self._fixed_task = task_number
+
+    def _resolve_task(self) -> PrereqOutcome:
+        if self._fixed_task is not None:
+            return PrereqOutcome.proceed(f"task #{self._fixed_task}", task=self._fixed_task)
+        return self.bus.resolve_active_task()
 
     def evaluate(self, role: str, dsp: object) -> Optional[PrereqOutcome]:
+        if role not in ("worker", "verifier"):
+            return None
+        task = self._resolve_task()
+        if not task.ok:
+            return task
+        number = task.refs["task"]
         if role == "worker":
-            return self.bus.verify_worker_dispatch(self.task_number)
-        if role == "verifier":
-            return self.bus.verify_verifier_dispatch(self.task_number)
-        return None
+            return self.bus.verify_worker_dispatch(number)
+        return self.bus.verify_verifier_dispatch(number)
+
+    def evaluate_finish(self) -> PrereqOutcome:
+        """Verify the finish prerequisite (closed final-acceptance issue + public
+        goal summary) before a Lead ``finish`` decision terminalises the run."""
+        acceptance = self.bus.resolve_acceptance_issue()
+        if not acceptance.ok:
+            return acceptance
+        return self.bus.verify_finish(acceptance.refs["acceptance"])
 
 
 # ── CLI client (production) ──────────────────────────────────────────────

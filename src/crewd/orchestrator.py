@@ -260,10 +260,25 @@ class Orchestrator:
                 req, on_started=self._on_started(sol.attempt_id), cancel=cancel
             )
         )
+        # Public-bus finish gate (issue #29): a Lead `finish` may not terminalise
+        # the goal run until the closed final-acceptance issue and public summary
+        # exist on the record. When the gate blocks, the candidate decision is
+        # dropped (passed as None) so `resolve_lead_solicitation` returns authority
+        # to Lead WITHOUT applying finish — no handoff acked, run not finished —
+        # and the run is then paused with the descriptive blocker below.
+        decision = turn.decision
+        finish_blocker = None
+        if (
+            decision is not None
+            and getattr(decision, "kind", None) is DecisionKind.FINISH
+        ):
+            finish_blocker = self._finish_gate_block()
+            if finish_blocker is not None:
+                decision = None
         result = self.disp.resolve_lead_solicitation(
             sol.attempt_id,
             outcome=turn.result.outcome,
-            decision=turn.decision,
+            decision=decision,
             configured_roles=self.configured_roles,
         )
         # Only archive the delivered operator inbox once the solicitation was
@@ -277,6 +292,14 @@ class Orchestrator:
             self._inbox.acknowledge("lead", sol.attempt_id)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
+        if finish_blocker is not None:
+            # The finish was refused: authority stayed with Lead (decision was not
+            # applied, so no handoff was acked and the run was not terminalised).
+            # Halt with a descriptive public-bus blocker so the operator sees why.
+            self._safe_mark(run_id, RunStatus.PAUSED, finish_blocker)
+            console.print(
+                f"[yellow]public-bus gate blocked finish: {finish_blocker}; run paused[/]"
+            )
         self._persist_cycle()
 
     def _dispatch_step(self, run_id: str, dispatch_id: str) -> None:
@@ -364,6 +387,28 @@ class Orchestrator:
             f"{outcome.detail}; run paused[/]"
         )
         return False
+
+    def _finish_gate_block(self) -> Optional[str]:
+        """Consult the public-bus gate for a Lead ``finish`` (if any).
+
+        Returns ``None`` to allow the finish, or a descriptive blocker string
+        when the final-acceptance record is missing/invalid/unverifiable. A gate
+        that lacks a finish check, or that has no gate at all, allows finish. A
+        gate that raises does not silently pass: the error becomes the blocker.
+        """
+        gate = self._bus_gate
+        if gate is None:
+            return None
+        evaluate_finish = getattr(gate, "evaluate_finish", None)
+        if evaluate_finish is None:
+            return None
+        try:
+            outcome = evaluate_finish()
+        except Exception as exc:  # boundary bug must not fake success
+            return f"public-bus finish gate error: {exc}"
+        if outcome is None or outcome.route is Route.PROCEED:
+            return None
+        return f"public-bus {outcome.route.value}: {outcome.detail}"
 
     def _on_started(self, attempt_id: str):
         """Return the pre-send journaling callback for an in-flight attempt.
