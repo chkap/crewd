@@ -1,7 +1,12 @@
 ## Inbox protocol
-`state/inbox/<your-role>.md` may contain messages. Each message line is prefixed:
-- `[OVERRIDE]` — human or supervisor override; READ FIRST, takes precedence over GOAL.md and your prior session memory.
+Pending operator messages are **delivered to you by the host**, not fetched by you:
+when present they are injected inline at the top of your prompt inside an
+`OPERATOR INBOX` banner, ordered highest priority first. Each message is tagged:
+- `[OVERRIDE]` — human or supervisor override; takes precedence over GOAL.md and your prior session memory. Act on it first.
 - `[ADVICE]` — peer advice; consider but you may push back with reason.
 - `[INFO]` — fyi only; no action required.
 
-After reading, MOVE the inbox file to `state/inbox/<your-role>.processed.<unix-ts>.md` (don't just clear it — preserve audit trail).
+You do **not** read or clear `state/inbox/<your-role>.md` yourself — the orchestrator
+consumes it, attaches it to exactly one of your attempts, and archives it to
+`state/inbox/<your-role>.processed.<ts>.md` (audit trail) only after that attempt
+finishes. If no `OPERATOR INBOX` banner is present, there are no pending messages.

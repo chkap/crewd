@@ -77,7 +77,7 @@ uv --directory ~/crewd run crewd stop -w "$(pwd)"             # graceful stop (S
 ├── state/cycle.txt        ← legacy mirror
 ├── state/goal.json        ← {version, label, goal_md_sha256, cycles}
 ├── state/exit-reason      ← written on graceful exit
-├── state/inbox/<role>.md  ← operator → role messages (consumed + moved to .processed by role)
+├── state/inbox/<role>.md  ← operator → role messages (host-consumed; archived to .processed after delivery)
 ├── state/logs/<role>/NNNN.log  ← per-attempt output
 └── repo/              ← target repo clone (main branch; per-role worktrees in cfg/)
 ```
@@ -94,7 +94,7 @@ crewd inbox advisory ADVICE "investigate https://example.com/postmortem"
 crewd inbox verifier INFO "expect a doc-only PR shortly"
 ```
 
-Priorities: `OVERRIDE > ADVICE > INFO`. The role consumes the inbox at the start of its next run (when it is next dispatched) and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (audit trail), so messages don't pile up.
+Priorities: `OVERRIDE > ADVICE > INFO`. The **host** consumes the inbox when it builds the role's next dispatched prompt — it injects the messages inline (highest priority first) and moves the file to `state/inbox/<role>.processed.<ts>.md` (audit trail) only after that attempt finishes, so messages don't pile up and an `OVERRIDE` can't be silently skipped by the model.
 
 ## Goal lifecycle (epochs)
 
@@ -124,7 +124,7 @@ Skip `new-goal` and the resumed lead session will see the old `PASS` and write `
 crewd doctor -w "$(pwd)"
 ```
 
-It prints: roles table (models / families / agent.md freshness / session-state / last-log), state table (STOPPED, PAUSED/reason, cycle), inbox table (pending count + last sender per role), recent activity, and a `suggestions:` list. Anything tagged `ERROR` blocks `run` (rc=1).
+It prints: roles table (models / families / agent.md freshness / session-state / last-log), state table (STOPPED, PAUSED/reason, cycle), inbox table (pending / delivering / processed counts per role), recent activity, and a `suggestions:` list. Anything tagged `ERROR` blocks `run` (rc=1).
 
 ## Recovery cookbook
 
