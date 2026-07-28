@@ -617,6 +617,22 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             "[bold]crewd doctor[/]."
         )
         return 2
+
+    # External context gate (issue #28): unsupported external `extra_add_dirs`
+    # (paths — including symlink targets — outside the workspace root) are a
+    # distinct non-runnable state because the Copilot SDK cannot mount them. This
+    # is validated *before* backend selection and `backend.doctor()` so it is
+    # never masked by (or reordered behind) a missing-SDK error, and refused
+    # before any dispatch, attempt reservation, handoff consumption, or SDK
+    # session — with secret-safe copied/sanitized-context guidance — so authority
+    # never advances on a workspace that cannot actually run. Missing entries stay
+    # non-fatal (skipped at run time).
+    ext_block = _external_context_block(ws, cfg)
+    if ext_block:
+        for msg in ext_block:
+            console.print(f"[red]extra_add_dirs:[/] {msg}")
+        return 2
+
     try:
         backend = get_backend(cfg.backend)
     except ValueError as e:
@@ -629,17 +645,9 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             console.print(f"[red]backend:[/] {e}")
         return 2
 
-    # External context declared via extra_add_dirs is a distinct non-runnable
-    # state (#28): the SDK cannot mount paths outside the workspace, so the
-    # executor would refuse mid-run. Refuse here *before* any dispatch, attempt
-    # reservation, handoff consumption, or SDK session — with secret-safe
-    # copied/sanitized-context guidance — so authority never advances on a
-    # workspace that cannot actually run. Missing entries remain non-fatal.
-    ext_block = _external_context_block(ws, cfg)
-    if ext_block:
-        for msg in ext_block:
-            console.print(f"[red]extra_add_dirs:[/] {msg}")
-        return 2
+    # Non-fatal extra_add_dirs advisories (e.g. a missing/stale entry that is
+    # simply skipped at run time). Any external-context blocker already returned
+    # above, so only warnings remain here.
     for _sev, msg in _extra_dir_advisories(ws, cfg):
         console.print(f"[yellow]extra_add_dirs:[/] {msg}")
 

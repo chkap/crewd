@@ -624,3 +624,70 @@ def test_preflight_allows_internal_extra_add_dirs(tmp_ws: Workspace, monkeypatch
     monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
     result = commands._preflight(tmp_ws.root, auto_render=False)
     assert isinstance(result, tuple)
+
+
+def test_preflight_external_context_checked_before_backend_selection(
+    tmp_ws: Workspace, monkeypatch, tmp_path
+):
+    """External context must be validated before get_backend/backend.doctor (#28).
+
+    Ordering regression: an unsupported external `extra_add_dirs` must block the
+    run without ever selecting or doctoring a backend, so it can never be masked
+    by (or reordered behind) a missing-SDK error.
+    """
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+
+    calls: dict[str, int] = {"get_backend": 0, "doctor": 0}
+
+    class _SpyBackend:
+        name = "spy"
+        def doctor(self):
+            calls["doctor"] += 1
+            return ["SDK not importable (should never be reached)"]
+
+    def _spy_get_backend(_name):
+        calls["get_backend"] += 1
+        return _SpyBackend()
+
+    monkeypatch.setattr(commands, "get_backend", _spy_get_backend)
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    assert result == 2
+    assert calls == {"get_backend": 0, "doctor": 0}
+
+
+def test_preflight_external_context_blocker_survives_unavailable_sdk(
+    tmp_ws: Workspace, capsys, monkeypatch, tmp_path
+):
+    """External-context guidance stays the reported blocker even with no SDK (#28).
+
+    When the SDK is unavailable, the backend doctor would report a missing-SDK
+    error — but because external context is checked first, the operator sees the
+    external-context guidance, not the SDK error.
+    """
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+
+    def _unavailable_backend(_name):
+        return _StubBackend(healthy=False)  # doctor() -> ["... forced unhealthy"]
+
+    monkeypatch.setattr(commands, "get_backend", _unavailable_backend)
+    # Also force the real SDK probe unavailable in case selection is reached.
+    import crewd.sdk_adapter as sdk
+    monkeypatch.setattr(sdk, "sdk_available", lambda: False)
+
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    out = capsys.readouterr().out
+    assert result == 2
+    # The external-context guidance is what's reported…
+    assert "resolves outside the workspace" in out
+    assert "Copy or sanitize" in out
+    # …and the missing-SDK / unhealthy-backend error is NOT surfaced.
+    assert "forced unhealthy" not in out
+    assert "not importable" not in out
