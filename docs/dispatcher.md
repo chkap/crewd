@@ -1,10 +1,11 @@
-# Durable dispatch kernel (issue #11, slice A)
+# Durable dispatch kernel (issue #11)
 
-Status: **kernel landed, not yet wired into the loop.** This slice introduces
-`crewd.dispatcher` and its tests only. Replacing the round-robin
-`_LoopController`, routing real SDK attempts, and rejecting the legacy
-`backend: copilot` transport are **slice B** (a separate issue) — they are where
-operator-visible behavior changes.
+Status: **wired into production.** `crewd.dispatcher` is the live routing kernel:
+it has replaced the round-robin `_LoopController`, routes real Copilot SDK
+attempts, journals every Lead decision and role handoff to a durable SQLite run
+log, and rejects the retired `backend: copilot` transport (a migration error —
+see `crewd refresh`). Normal `crewd run` drives Lead-directed dispatch through
+this kernel behind the host-verified public bus.
 
 ## Why a kernel, and why SQLite
 

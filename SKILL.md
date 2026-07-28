@@ -36,6 +36,17 @@ Trigger if the user asks to:
 4. Reusing an existing workspace for a brand-new goal: **always run `crewd new-goal --from GOAL.md`**. Manually editing `GOAL.md` and rerunning is rejected (`run` exits with sha-mismatch). Even if you delete `goal.json`, the resumed copilot session still remembers the old PASS — `new-goal` is the only path that closes prior issues, resets cycles, queues an `[OVERRIDE]` inbox notice, and re-renders agents.
 5. Human/operator blockers use `state/PAUSED`, never repeated idle cycles. Lead must post the exact requested action, pause in the same tick, and leave goal/task issues open.
 
+## Public bus — how roles coordinate on GitHub
+
+Inter-role coordination is **public-first and host-verified**, not model best-effort. Every material message is a real attributed GitHub artifact the host publishes and verifies before authority advances:
+
+- **Attribution.** Every crew-authored comment/PR body starts with one parseable line: `> **[crewd:<role> -> <target>]** <crew-name>`. A body missing/malforming this line is rejected before posting. When you post as a role, keep this exact first line.
+- **Idempotency.** Each write carries an invisible `<!-- crewd:correlation:<id> -->` marker. The host reserves a durable intent under `state/public_writes/`, searches for the marker before writing (so a crashed/ambiguous retry never double-posts), writes, then verifies the URL. Intents are `reserved` (post attempted, not yet verified) or `verified`.
+- **Restart reconciliation.** Each `crewd run` reconciles reserved-but-unverified intents first — re-scanning for the marker or re-posting idempotently. A landed write is never duplicated; an unreachable GitHub leaves the intent `reserved` and surfaces in `doctor`/`status`, it does not abort the run.
+- **Material-before-consume.** A material role handoff (`completed`, or a `no_progress` carrying evidence/changed/remaining/disagreement/blocker) must be a verified public artifact before Lead consumes it; a genuinely empty `no_progress` stays private. Likewise a Lead decision that dispatches Worker/Verifier is published before authority transfers.
+- **Prerequisite gating.** Before dispatching Worker/Verifier or before Lead `finish`, the host validates the required GitHub record (active linked `crewd:task`; for finish a closed `crewd:acceptance` + public goal summary). A missing/invalid/unverifiable prerequisite rejects the transition **without** reserving an attempt, consuming a pending handoff, or terminalising — authority never advances on an unverified record.
+- **Offline escape hatch.** `CREWD_DISABLE_PUBLIC_BUS=1` runs the dispatcher without the bus (local recovery only); normal attached runs keep it on.
+
 ## Standard invocation pattern
 
 ```bash
@@ -77,6 +88,7 @@ uv --directory ~/crewd run crewd stop -w "$(pwd)"             # graceful stop (S
 ├── state/cycle.txt        ← legacy mirror
 ├── state/goal.json        ← {version, label, goal_md_sha256, cycles}
 ├── state/exit-reason      ← written on graceful exit
+├── state/public_writes/   ← durable public-bus intents (reserve→post→verify→reconcile; survive restarts)
 ├── state/inbox/<role>.md  ← operator → role messages (host-consumed; archived to .processed after delivery)
 ├── state/logs/<role>/NNNN.log  ← per-attempt output
 └── repo/              ← target repo clone (main branch; per-role worktrees in cfg/)
@@ -94,7 +106,7 @@ crewd inbox advisory ADVICE "investigate https://example.com/postmortem"
 crewd inbox verifier INFO "expect a doc-only PR shortly"
 ```
 
-Priorities: `OVERRIDE > ADVICE > INFO`. The **host** consumes the inbox when it builds the role's next dispatched prompt — it injects the messages inline (highest priority first) and moves the file to `state/inbox/<role>.processed.<ts>.md` (audit trail) only after that attempt finishes, so messages don't pile up and an `OVERRIDE` can't be silently skipped by the model.
+Priorities: `OVERRIDE > ADVICE > INFO`. The **host** consumes the inbox when it builds the role's next dispatched prompt — it stages the live `<role>.md` (plus any orphaned staging from a crashed prior attempt) to `<role>.delivering.<attempt>.md`, injects the messages inline (highest priority first), and archives to `state/inbox/<role>.processed.<ts>.md` only **after that attempt durably terminalises**. A crash before acknowledgement retains the message for redelivery to the next attempt, so messages don't pile up and an `OVERRIDE` can't be lost or silently skipped by the model.
 
 ## Goal lifecycle (epochs)
 
@@ -124,7 +136,7 @@ Skip `new-goal` and the resumed lead session will see the old `PASS` and write `
 crewd doctor -w "$(pwd)"
 ```
 
-It prints: roles table (models / families / agent.md freshness / session-state / last-log), state table (STOPPED, PAUSED/reason, cycle), inbox table (pending / delivering / processed counts per role), recent activity, and a `suggestions:` list. Anything tagged `ERROR` blocks `run` (rc=1).
+It prints: roles table (models / families / agent.md freshness / session-state / last-log), state table (STOPPED, PAUSED/reason, cycle), inbox table (pending / delivering / processed counts per role), a public-writes table (verified / reserved-unverified intents; warns that `crewd run` reconciles pending ones once GitHub is reachable), recent activity, and a `suggestions:` list. Anything tagged `ERROR` blocks `run` (rc=1).
 
 ## Recovery cookbook
 
@@ -138,6 +150,9 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 | Lead writes `STOPPED` immediately after restart with new GOAL    | You forgot `new-goal`. Run it; confirm `state/inbox/lead.md` ends with `[OVERRIDE]`.                    |
 | `PAUSED` with `human-blocked:` reason                            | Resolve the stated action, then run `crewd resume` and restart the daemon.                              |
 | Want to kill the loop cleanly                                    | `crewd stop` (writes STOPPED + sends SIGINT to daemon). `crewd stop --force` sends SIGKILL.             |
+| `backend: migration required` / `backend: copilot ... removed`   | Legacy workspace on the retired subprocess backend. `crewd refresh` migrates `crew.yaml` to `backend: copilot-sdk` (preserving unknown config keys + STOPPED/PAUSED/goal.json/session-state/public_writes), then `crewd doctor`. Idempotent. |
+| `extra_add_dirs entry ... resolves outside the workspace`        | External/symlink-to-external context is a non-runnable blocker (SDK has no `--add-dir`; single working_directory). `doctor` errors and `run` pre-flight refuses (rc=2) **before** any backend/dispatch/SDK work. Copy/sanitize only the needed context into the workspace and repoint `extra_add_dirs` at that in-workspace path. |
+| `public write(s) reserved but unverified` (doctor/status)        | A crash left a public-bus intent mid-post. `crewd run` reconciles it against GitHub (idempotent — no duplicate comment) once GitHub is reachable. If it persists, check GitHub auth/connectivity; do not hand-edit `state/public_writes/`. |
 
 ## Graceful shutdown semantics
 

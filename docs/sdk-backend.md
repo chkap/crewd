@@ -184,6 +184,12 @@ attempt** (`PRE-EXECUTION ERROR`, exit code 1) and names the offending paths.
 Fix: move the path under the workspace root. (There is no `backend: copilot`
 fallback for cross-dir roles — that backend is retired.)
 
+> Defense in depth: `crewd run` pre-flight and `crewd doctor` also detect an
+> external (or symlink-to-external) `extra_add_dirs` entry and refuse **before**
+> backend selection/`doctor` probing (run exits rc=2), so the executor's
+> fail-closed guard is a last line rather than the first. Recovery is the same:
+> copy/sanitize the needed context into the workspace and repoint the entry.
+
 > Verified live (see live-smoke below): `working_directory = workspace root` +
 > `config_directory = role config dir` auto-loads only the intended role
 > `AGENTS.md`/instructions and preserves role write isolation. We do **not**

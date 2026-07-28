@@ -18,14 +18,20 @@ tick or another Lead turn) executes through the typed `AttemptExecutor` seam
 
 ## One `crewd run` invocation
 
-`Orchestrator.run(once)` advances the goal run until it leaves `active`:
+`Orchestrator.run(once, resume=False)` advances the goal run until it leaves `active`:
 
-1. `start_or_resume_run`; if the run is resumable (paused/waiting/interrupted/
-   stopped) `resume_run` revives it — an explicit `crewd run` is intent to make
-   progress, mirroring the workspace-sentinel clear the command layer performs.
+1. `start_or_resume_run` (never auto-revives): if the run is already `active` it
+   continues; if it holds a durable non-active state (paused/waiting/interrupted/
+   stopped) it is revived **only** when this invocation is an explicit resume
+   (`Orchestrator.run(..., resume=True)` → `Dispatcher.resume_run`, the `crewd
+   resume` workflow). A plain `crewd run` does **not** revive it — it returns the
+   mapped exit reason (see below). This matches the sentinel policy: a plain run
+   never clears a durable blocker.
 2. `reconcile_on_restart` recovers any attempt orphaned by a crash **before**
    new work (never replays it; bumps the solicitation nonce so a lost in-memory
-   Lead candidate can never be applied).
+   Lead candidate can never be applied), then reconciles reserved-but-unverified
+   public-bus intents idempotently (best-effort; a still-unreachable GitHub
+   leaves the intent reserved for `status`/`doctor` rather than aborting).
 3. Loop: `_check_controls` (interrupt/stop/pause → persist status + exit reason)
    → if run status ≠ `active` return the mapped exit reason → `_step`.
 
