@@ -57,6 +57,7 @@ from .dispatcher import (
     RunStatus,
 )
 from .executor import AttemptExecutor, AttemptRequest, resolve_role_terminal
+from .github_bus import Route
 from .inbox import InboxService
 from .session_backend import CancelToken
 from .workspace import Workspace
@@ -100,6 +101,7 @@ class Orchestrator:
         taint_orphan: Optional[Callable[[str, int, str], None]] = None,
         prompt_policy: object | None = None,
         inbox: InboxService | None = None,
+        bus_gate: object | None = None,
     ):
         self.ws = ws
         self.cfg = cfg
@@ -109,6 +111,11 @@ class Orchestrator:
         # model best effort, reads/attaches/archives operator messages so an
         # OVERRIDE cannot be silently skipped. Injectable for deterministic tests.
         self._inbox = inbox or InboxService.for_workspace(ws)
+        # Public-bus transaction boundary (issue #29): an optional gate that must
+        # verify GitHub prerequisites before a Worker/Verifier attempt is
+        # reserved. Default None keeps production inert until a client is wired,
+        # so authority routing is unchanged when no boundary is configured.
+        self._bus_gate = bus_gate
         # Gated, test-only seam (default None → fully inert in production). When a
         # live-smoke policy is injected it may append a bounded instruction suffix
         # to the *production-rendered* role/Lead prompts and observe (not replace)
@@ -253,10 +260,24 @@ class Orchestrator:
                 req, on_started=self._on_started(sol.attempt_id), cancel=cancel
             )
         )
+        # Public-bus pre-application gate (issue #29): a Lead decision that would
+        # advance authority (dispatch to Worker/Verifier, or finish) may not be
+        # applied until the required GitHub artifacts are verified. Validation
+        # happens BEFORE `resolve_lead_solicitation` applies the decision, so a
+        # blocked transition never acks the decision's pending handoffs or
+        # transfers authority (GOAL.md: invalid references fail without consuming
+        # handoffs or transferring authority). When blocked, the candidate
+        # decision is dropped (passed as None) — the dispatcher then returns
+        # authority to Lead with the same pending handoffs intact — and the run is
+        # paused with the descriptive blocker below.
+        decision = turn.decision
+        gate_blocker = self._decision_gate_block(decision)
+        if gate_blocker is not None:
+            decision = None
         result = self.disp.resolve_lead_solicitation(
             sol.attempt_id,
             outcome=turn.result.outcome,
-            decision=turn.decision,
+            decision=decision,
             configured_roles=self.configured_roles,
         )
         # Only archive the delivered operator inbox once the solicitation was
@@ -270,6 +291,15 @@ class Orchestrator:
             self._inbox.acknowledge("lead", sol.attempt_id)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
+        if gate_blocker is not None:
+            # The transition was refused: authority stayed with Lead (decision was
+            # not applied, so no handoff was acked and the run was not
+            # terminalised/dispatched). Halt with a descriptive public-bus blocker
+            # so the operator sees why.
+            self._safe_mark(run_id, RunStatus.PAUSED, gate_blocker)
+            console.print(
+                f"[yellow]public-bus gate blocked Lead decision: {gate_blocker}; run paused[/]"
+            )
         self._persist_cycle()
 
     def _dispatch_step(self, run_id: str, dispatch_id: str) -> None:
@@ -279,6 +309,13 @@ class Orchestrator:
             # A dispatch to an unconfigured role can only arise from a corrupt
             # journal; refuse to launch and let restart reconciliation handle it.
             console.print(f"[red]dispatch targets unconfigured role {role!r}; skipping[/]")
+            return
+        # Public-bus prerequisite gate (issue #29): before reserving the attempt,
+        # verify the GitHub record satisfies the invariant for routing this role.
+        # A non-PROCEED outcome halts the run (durable PAUSE with a descriptive
+        # public-bus blocker) WITHOUT reserving the attempt or consuming a pending
+        # handoff — authority never advances on an invalid/unverifiable record.
+        if not self._bus_gate_ok(run_id, role, dsp):
             return
         try:
             attempt_id = self.disp.reserve_attempt(run_id, dispatch_id, role)
@@ -321,6 +358,84 @@ class Orchestrator:
         # Attempt is durably terminal → archive the delivered operator inbox.
         self._inbox.acknowledge(role, attempt_id)
         self._persist_cycle()
+
+    def _bus_gate_ok(self, run_id: str, role: str, dsp: object) -> bool:
+        """Consult the public-bus gate (if any) before reserving an attempt.
+
+        Defense-in-depth for a dispatch resurrected from the journal after a
+        restart (the normal path is already gated before the dispatch is created;
+        see :meth:`_decision_gate_block`). Returns True to proceed. On a
+        non-``PROCEED`` outcome it marks the run PAUSED with a descriptive
+        public-bus blocker and returns False, so no attempt is reserved.
+        """
+        blocker = self._dispatch_gate_block(role)
+        if blocker is None:
+            return True
+        self._safe_mark(run_id, RunStatus.PAUSED, blocker)
+        console.print(
+            f"[yellow]public-bus gate blocked {role} dispatch: {blocker}; run paused[/]"
+        )
+        return False
+
+    def _decision_gate_block(self, decision: object) -> Optional[str]:
+        """Return a public-bus blocker for a Lead decision that would advance
+        authority, or ``None`` to allow it.
+
+        Called BEFORE the decision is applied, so a blocked dispatch/finish never
+        acks the decision's pending handoffs or transfers authority. A dispatch to
+        Worker/Verifier is validated against the record; a ``finish`` is validated
+        against the final-acceptance record. All other decisions (continue-lead,
+        wait, pause, dispatch to other roles) are unrelated to the public-bus
+        prerequisite and always allowed.
+        """
+        if decision is None:
+            return None
+        kind = getattr(decision, "kind", None)
+        if kind is DecisionKind.DISPATCH:
+            return self._dispatch_gate_block(getattr(decision, "role", None) or "")
+        if kind is DecisionKind.FINISH:
+            return self._finish_gate_block()
+        return None
+
+    def _dispatch_gate_block(self, role: str) -> Optional[str]:
+        """Consult the public-bus gate for a Worker/Verifier dispatch (if any).
+
+        Returns ``None`` to allow the dispatch, or a descriptive blocker string
+        when the record fails the invariant. A gate that raises does not silently
+        pass: the error becomes the blocker.
+        """
+        gate = self._bus_gate
+        if gate is None:
+            return None
+        try:
+            outcome = gate.evaluate(role, None)
+        except Exception as exc:  # boundary bug must not fake success
+            return f"public-bus gate error: {exc}"
+        if outcome is None or outcome.route is Route.PROCEED:
+            return None
+        return f"public-bus {outcome.route.value}: {outcome.detail}"
+
+    def _finish_gate_block(self) -> Optional[str]:
+        """Consult the public-bus gate for a Lead ``finish`` (if any).
+
+        Returns ``None`` to allow the finish, or a descriptive blocker string
+        when the final-acceptance record is missing/invalid/unverifiable. A gate
+        that lacks a finish check, or that has no gate at all, allows finish. A
+        gate that raises does not silently pass: the error becomes the blocker.
+        """
+        gate = self._bus_gate
+        if gate is None:
+            return None
+        evaluate_finish = getattr(gate, "evaluate_finish", None)
+        if evaluate_finish is None:
+            return None
+        try:
+            outcome = evaluate_finish()
+        except Exception as exc:  # boundary bug must not fake success
+            return f"public-bus finish gate error: {exc}"
+        if outcome is None or outcome.route is Route.PROCEED:
+            return None
+        return f"public-bus {outcome.route.value}: {outcome.detail}"
 
     def _on_started(self, attempt_id: str):
         """Return the pre-send journaling callback for an in-flight attempt.

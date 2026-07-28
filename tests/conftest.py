@@ -7,6 +7,20 @@ from crewd.workspace import Workspace
 from crewd.config import default_config
 
 
+@pytest.fixture(autouse=True)
+def _disable_public_bus_by_default(monkeypatch):
+    """Disable the default-on public-bus gate for the general test suite.
+
+    A normal ``crewd run`` now wires a real ``CliGitHubClient`` public-bus gate
+    (issue #29), which would reach the network. The vast majority of tests
+    exercise dispatcher/orchestrator mechanics unrelated to that boundary and set
+    up no GitHub record, so they run with the kill-switch set. Tests that assert
+    the production enforcement explicitly ``monkeypatch.delenv`` this and inject a
+    deterministic fake GitHub client via ``commands._make_github_client``.
+    """
+    monkeypatch.setenv("CREWD_DISABLE_PUBLIC_BUS", "1")
+
+
 @pytest.fixture
 def tmp_ws(tmp_path: Path) -> Workspace:
     """Initialized workspace at tmp_path/ws with target attached."""

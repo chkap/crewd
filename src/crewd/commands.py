@@ -523,6 +523,47 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
     return ws, cfg, backend, goal_state
 
 
+def _make_github_client(cfg: CrewConfig):
+    """Production GitHub effect seam for the public bus (patchable in tests).
+
+    Returns a :class:`~crewd.github_bus.CliGitHubClient` bound to the target
+    remote, or ``None`` when no remote is configured (nothing to validate).
+    """
+    remote = cfg.target.remote
+    if not remote:
+        return None
+    from .github_bus import CliGitHubClient
+
+    return CliGitHubClient(remote)
+
+
+def _build_bus_gate(cfg: CrewConfig, goal_state: GoalState):
+    """Construct the default-on public-bus gate for a normal run.
+
+    Wires ``CliGitHubClient`` → ``PublicBus`` → ``PublicBusGate`` so a plain
+    ``crewd run`` enforces the public issue-bus invariant (issue #29): Lead cannot
+    route Worker/Verifier or finish the goal until the required GitHub artifacts
+    are verified. The active task and final-acceptance references are derived from
+    the public record, not hard-coded. Returns ``None`` (inert) only when the
+    workspace is not yet attached to a remote or an operator explicitly disables
+    the bus via ``CREWD_DISABLE_PUBLIC_BUS`` (e.g. offline recovery).
+    """
+    if os.environ.get("CREWD_DISABLE_PUBLIC_BUS"):
+        return None
+    client = _make_github_client(cfg)
+    if client is None:
+        return None
+    from .github_bus import PublicBus, PublicBusGate
+
+    bus = PublicBus(
+        client,
+        crew=cfg.name,
+        expected_repo=cfg.target.remote,
+        goal_label=goal_state.label or "goal:v1",
+    )
+    return PublicBusGate(bus)
+
+
 def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
     from .orchestrator import Orchestrator
 
@@ -536,7 +577,10 @@ def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
         from ._smoke import SmokePromptPolicy
 
         prompt_policy = SmokePromptPolicy.from_env()
-    return Orchestrator(ws, cfg, executor, goal_state, prompt_policy=prompt_policy)
+    bus_gate = _build_bus_gate(cfg, goal_state)
+    return Orchestrator(
+        ws, cfg, executor, goal_state, prompt_policy=prompt_policy, bus_gate=bus_gate
+    )
 
 
 def cmd_run(workspace: Path, once: bool, role: str | None, auto_render: bool = True) -> int:
