@@ -105,11 +105,20 @@ def _extra_dir_advisories(ws: Workspace, cfg: CrewConfig) -> list[tuple[str, str
     """Classify configured ``extra_add_dirs`` into (severity, message) advisories.
 
     Shared by ``doctor`` (issues table), ``refresh`` and run pre-flight so every
-    surface reports the same migration-relevant facts about external context
-    (#28): a *missing* entry is skipped at run time (warn), an *external* entry
-    exposes host files outside the crew by their canonical path (warn + secret-
-    safe guidance, and an explicit note when a symlink was followed rather than
-    claiming the raw symlink is mounted). Internal entries produce no advisory.
+    surface reports the same facts about external context (#28) with identical
+    wording:
+
+      - a *missing* entry is skipped at run time → ``warn`` (non-fatal);
+      - an *external* entry (including a symlink whose canonical target is
+        outside the workspace) is a run **blocker** → ``error``. The Copilot SDK
+        exposes only a single ``working_directory`` and has no ``--add-dir``
+        equivalent, so a path outside the workspace root cannot be mounted; the
+        executor refuses to launch a role with such a path. We therefore surface
+        it as a non-runnable state *before* any work starts, with secret-safe
+        copied/sanitized-context guidance, rather than claiming the canonical
+        path is mounted and then failing mid-run.
+
+    Internal entries produce no advisory.
     """
     out: list[tuple[str, str]] = []
     for info in ws.classify_extra_dirs(cfg.extra_add_dirs):
@@ -122,18 +131,31 @@ def _extra_dir_advisories(ws: Workspace, cfg: CrewConfig) -> list[tuple[str, str
             ))
         elif info.status == "external":
             sym = (
-                " The entry is a symlink; its canonical target is mounted, not "
-                "the link itself." if info.is_symlink else ""
+                f" The entry is a symlink whose canonical target ({info.canonical}) "
+                "is outside the workspace."
+                if info.is_symlink else ""
             )
             out.append((
-                "warn",
+                "error",
                 f"extra_add_dirs entry '{info.entry}' resolves outside the "
-                f"workspace to {info.canonical}; roles get read access to that "
-                f"host path.{sym} Prefer copying/sanitizing only the needed "
-                "context into the workspace so secrets outside the crew are not "
-                "exposed.",
+                f"workspace to {info.canonical}, which the Copilot SDK cannot "
+                f"mount (it has no `--add-dir` equivalent — only a single "
+                f"working_directory).{sym} This blocks the run. Copy or sanitize "
+                "only the needed context into the workspace and point "
+                "extra_add_dirs at that in-workspace path, so secrets outside the "
+                "crew are never exposed.",
             ))
     return out
+
+
+def _external_context_block(ws: Workspace, cfg: CrewConfig) -> list[str]:
+    """Return the external-context blocker messages (``error`` advisories) only.
+
+    Used by run pre-flight to refuse a workspace whose ``extra_add_dirs`` point
+    outside the workspace (unmountable by the SDK) *before* any backend probe,
+    dispatch, attempt reservation, or SDK session is started (#28).
+    """
+    return [msg for sev, msg in _extra_dir_advisories(ws, cfg) if sev == "error"]
 
 
 # ─────────────────────────── refresh ───────────────────────────
@@ -607,8 +629,17 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             console.print(f"[red]backend:[/] {e}")
         return 2
 
-    # External context declared via extra_add_dirs is non-fatal but surfaced
-    # before the run so an operator sees exactly what host paths are exposed.
+    # External context declared via extra_add_dirs is a distinct non-runnable
+    # state (#28): the SDK cannot mount paths outside the workspace, so the
+    # executor would refuse mid-run. Refuse here *before* any dispatch, attempt
+    # reservation, handoff consumption, or SDK session — with secret-safe
+    # copied/sanitized-context guidance — so authority never advances on a
+    # workspace that cannot actually run. Missing entries remain non-fatal.
+    ext_block = _external_context_block(ws, cfg)
+    if ext_block:
+        for msg in ext_block:
+            console.print(f"[red]extra_add_dirs:[/] {msg}")
+        return 2
     for _sev, msg in _extra_dir_advisories(ws, cfg):
         console.print(f"[yellow]extra_add_dirs:[/] {msg}")
 

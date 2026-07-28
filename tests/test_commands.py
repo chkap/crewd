@@ -516,7 +516,7 @@ def test_run_migration_required_refuses_with_action(tmp_ws: Workspace, capsys):
     assert "migration required" in out and "crewd refresh" in out
 
 
-def test_doctor_warns_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
+def test_doctor_flags_external_extra_add_dirs_as_error(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
     outside = tmp_path / "secrets"
     outside.mkdir()
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
@@ -525,13 +525,16 @@ def test_doctor_warns_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeyp
     commands._render_agent_files(tmp_ws, cfg)
     monkeypatch.setattr(commands, "get_backend", lambda _n: _StubBackend(healthy=True))
     monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
-    commands.cmd_doctor(tmp_ws.root)
+    rc = commands.cmd_doctor(tmp_ws.root)
     out = capsys.readouterr().out
+    # External context is a non-runnable blocker → ERROR → doctor exits 1.
+    assert rc == 1
     assert "resolves outside the workspace" in out
-    assert "copying/sanitizing" in out
+    assert "cannot" in out and "mount" in out
+    assert "Copy or sanitize" in out
 
 
-def test_run_preflight_warns_on_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
+def test_preflight_blocks_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
     outside = tmp_path / "extern"
     outside.mkdir()
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
@@ -540,6 +543,84 @@ def test_run_preflight_warns_on_external_extra_add_dirs(tmp_ws: Workspace, capsy
     monkeypatch.setattr(commands, "get_backend", lambda _n: _StubBackend(healthy=True))
     result = commands._preflight(tmp_ws.root, auto_render=False)
     out = capsys.readouterr().out
-    # non-fatal: preflight still succeeds but the advisory is printed
-    assert isinstance(result, tuple)
+    # Non-runnable: preflight refuses with rc=2 (not a success tuple).
+    assert result == 2
     assert "extra_add_dirs" in out and "resolves outside the workspace" in out
+
+
+def test_run_role_blocked_by_external_extra_add_dirs_no_sdk_work(tmp_ws: Workspace, monkeypatch, tmp_path):
+    """`crewd run --role worker` must refuse before any SDK session (#28).
+
+    The SDK cannot mount an external path, so the manual single-tick path must be
+    stopped at pre-flight (rc=2) with zero backend invocations — never launched
+    and failed mid-tick.
+    """
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    backend = _StubBackend(healthy=True)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+    rc = commands.cmd_run(tmp_ws.root, once=False, role="worker")
+    assert rc == 2
+    assert backend.calls == []                     # no SDK role attempt
+    assert tmp_ws.read_cycle() == 0                # no cycle advance
+    # No role log was written (the tick never started).
+    assert not (tmp_ws.state_dir / "logs").exists() or not any(
+        (tmp_ws.state_dir / "logs").rglob("*.log")
+    )
+
+
+def test_dispatcher_run_blocked_by_external_extra_add_dirs_no_authority_advance(
+    tmp_ws: Workspace, monkeypatch, tmp_path
+):
+    """A normal dispatcher `crewd run` must refuse before any dispatch (#28).
+
+    With an unmountable external extra_add_dir, pre-flight fails (rc=2) before the
+    orchestrator is even built, so the executor sees no Lead or role attempt, no
+    handoff is consumed, no attempt is reserved, and routing authority never
+    advances (cycle stays 0).
+    """
+    from fakes import FakeExecutor, dispatch_to, finish
+
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    fake = FakeExecutor(lead_script=[dispatch_to("worker"), finish()])
+    _use_fake(monkeypatch, fake)
+    rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
+    assert rc == 2
+    assert fake.lead_calls == []                   # authority never solicited
+    assert fake.role_calls == []                   # no role attempt reserved/run
+    assert tmp_ws.read_cycle() == 0                # no authority advance
+    assert not tmp_ws.exit_reason_file.exists()    # no terminal routing recorded
+
+
+def test_preflight_blocks_symlink_to_external_extra_add_dirs(tmp_ws: Workspace, monkeypatch, tmp_path):
+    """A symlink whose canonical target is external is equally non-runnable (#28)."""
+    outside = tmp_path / "real_external"
+    outside.mkdir()
+    link = tmp_ws.root / "linked_ctx"
+    link.symlink_to(outside)
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = ["./linked_ctx"]
+    cfg.save(tmp_ws.crew_yaml)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    assert result == 2
+
+
+def test_preflight_allows_internal_extra_add_dirs(tmp_ws: Workspace, monkeypatch):
+    """An in-workspace extra_add_dir is mountable and must NOT block the run (#28)."""
+    (tmp_ws.root / "in_ctx").mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = ["./in_ctx"]
+    cfg.save(tmp_ws.crew_yaml)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    assert isinstance(result, tuple)
