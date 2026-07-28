@@ -38,6 +38,15 @@ import re
 
 
 @dataclass
+class ExtraDirInfo:
+    """A classified ``extra_add_dirs`` entry (see ``Workspace.classify_extra_dirs``)."""
+    entry: str          # raw config entry as written
+    canonical: Path     # resolved real path (symlinks followed)
+    status: str         # "missing" | "internal" | "external"
+    is_symlink: bool    # raw entry (or an ancestor) is a symlink
+
+
+@dataclass
 class Workspace:
     root: Path
 
@@ -106,7 +115,9 @@ class Workspace:
 
         Relative entries resolve against the workspace root; absolute paths are
         used as-is. Non-existent paths are skipped so a stale config entry can't
-        break a tick. Order is preserved and duplicates are removed.
+        break a tick. Order is preserved and duplicates are removed. Symlinks are
+        followed to their canonical real path via ``resolve()`` — that canonical
+        path (not the link) is what the backend actually mounts.
         """
         out: list[Path] = []
         seen: set[Path] = set()
@@ -120,6 +131,49 @@ class Workspace:
                 seen.add(resolved)
                 out.append(resolved)
         return out
+
+    def classify_extra_dirs(self, entries: list[str]) -> list["ExtraDirInfo"]:
+        """Classify each configured extra_add_dir for doctor/run diagnostics (#28).
+
+        For every raw entry, report where it resolves and whether it is safe to
+        mount as-is. ``status`` is one of:
+
+          - ``missing``  — the path does not resolve to an existing directory;
+            it is silently skipped at run time (a stale entry can't break a tick).
+          - ``internal`` — the canonical path is inside the workspace root; always
+            mountable and secret-safe.
+          - ``external`` — the canonical path is outside the workspace root; it is
+            mounted by its *canonical* path (symlinks are followed, so there is no
+            claim that a raw symlink mount works), but the agent then has read
+            access to host files outside the crew — prefer copying/sanitizing the
+            needed context in instead of exposing secrets wholesale.
+
+        ``is_symlink`` records whether the raw entry (or an ancestor) was a
+        symlink, so guidance can be explicit that the real target is what is
+        exposed. Order matches ``entries``; duplicates are preserved so an
+        operator sees every declared entry.
+        """
+        infos: list[ExtraDirInfo] = []
+        root = self.root.resolve()
+        for entry in entries:
+            p = Path(entry)
+            raw = p if p.is_absolute() else (self.root / p)
+            is_symlink = False
+            try:
+                is_symlink = raw.is_symlink() or any(a.is_symlink() for a in raw.parents)
+            except OSError:
+                pass
+            canonical = raw.resolve()
+            if not canonical.is_dir():
+                status = "missing"
+            elif canonical == root or root in canonical.parents:
+                status = "internal"
+            else:
+                status = "external"
+            infos.append(ExtraDirInfo(
+                entry=entry, canonical=canonical, status=status, is_symlink=is_symlink,
+            ))
+        return infos
 
     def ensure_skeleton(self) -> None:
         for d in [self.state_dir, self.state_dir / "logs", self.cfg_dir]:

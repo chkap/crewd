@@ -106,3 +106,41 @@ def test_resolve_extra_dirs_dedupes_and_skips_files(tmp_path: Path):
 def test_resolve_extra_dirs_empty(tmp_path: Path):
     ws = Workspace(tmp_path / "ws")
     assert ws.resolve_extra_dirs([]) == []
+
+
+# ─── #28: extra_add_dirs classification (external-context detection) ───
+def test_classify_extra_dirs_internal_external_missing_and_symlink(tmp_path: Path):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    ws = Workspace(ws_root)
+
+    # internal: a dir inside the workspace
+    (ws_root / "data").mkdir()
+    # external: a real dir outside the workspace
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    # symlink inside workspace pointing outside
+    link = ws_root / "linked"
+    link.symlink_to(outside)
+
+    infos = ws.classify_extra_dirs(["./data", str(outside), "./linked", "./nope"])
+    by_entry = {i.entry: i for i in infos}
+
+    assert by_entry["./data"].status == "internal"
+    assert by_entry[str(outside)].status == "external"
+    assert by_entry[str(outside)].is_symlink is False
+    # a symlink is followed to its canonical (external) target — reported external
+    assert by_entry["./linked"].status == "external"
+    assert by_entry["./linked"].is_symlink is True
+    assert by_entry["./linked"].canonical == outside.resolve()
+    # missing entry is flagged, never silently mounted
+    assert by_entry["./nope"].status == "missing"
+
+
+def test_resolve_extra_dirs_skips_missing_and_dedups(tmp_path: Path):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    ws = Workspace(ws_root)
+    (ws_root / "data").mkdir()
+    resolved = ws.resolve_extra_dirs(["./data", "./data", "./missing"])
+    assert resolved == [(ws_root / "data").resolve()]

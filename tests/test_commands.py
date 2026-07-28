@@ -417,3 +417,277 @@ def test_cmd_refresh_migrates_checkout_to_repo(tmp_ws: Workspace):
     assert reloaded.target.repo == "./repo"             # was under `checkout:` key
     assert (tmp_ws.root / "repo").exists()
     assert not (tmp_ws.root / "checkout").exists()
+
+
+# ─── #28: legacy-backend refresh/doctor/run migration end-to-end ───
+def _make_legacy(tmp_ws: Workspace, *, unknown: bool = True) -> dict:
+    """Downgrade tmp_ws crew.yaml to the retired backend + unknown user keys."""
+    import yaml
+    raw = yaml.safe_load(tmp_ws.crew_yaml.read_text())
+    raw["backend"] = "copilot"
+    if unknown:
+        raw["notify_webhook"] = "https://example/hook"
+        raw["custom_block"] = {"k": [1, 2, 3]}
+    tmp_ws.crew_yaml.write_text(yaml.safe_dump(raw, sort_keys=False))
+    return raw
+
+
+def test_refresh_migrates_retired_backend_preserving_state(tmp_ws: Workspace):
+    import yaml
+    _make_legacy(tmp_ws)
+    # Realistic workspace state that must survive a refresh untouched:
+    from crewd.config import GoalState
+    GoalState(version=2, label="goal:v2", cycles=5, goal_md_sha256="deadbeef").save(tmp_ws.goal_json)
+    tmp_ws.stop("completed")                       # STOPPED sentinel
+    (tmp_ws.role_cfg_dir("worker") / "session-state").mkdir(parents=True, exist_ok=True)
+    (tmp_ws.role_cfg_dir("worker") / "session-state" / "s.json").write_text("{}")
+    # Dispatcher / public-bus durable state lives under state/ — must be preserved.
+    marker = tmp_ws.state_dir / "public_writes" / "journal.jsonl"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"intent":"x"}\n')
+
+    rc = commands.cmd_refresh(tmp_ws.root)
+    assert rc == 0
+
+    out = yaml.safe_load(tmp_ws.crew_yaml.read_text())
+    assert out["backend"] == "copilot-sdk"                       # migrated
+    assert out["notify_webhook"] == "https://example/hook"       # unknown preserved
+    assert out["custom_block"] == {"k": [1, 2, 3]}
+    # workspace/dispatcher state untouched
+    assert tmp_ws.is_stopped()
+    reloaded_goal = GoalState.load(tmp_ws.goal_json)
+    assert reloaded_goal.cycles == 5 and reloaded_goal.label == "goal:v2"
+    assert (tmp_ws.role_cfg_dir("worker") / "session-state" / "s.json").exists()
+    assert marker.read_text() == '{"intent":"x"}\n'
+
+
+def test_refresh_is_idempotent_on_current_workspace(tmp_ws: Workspace, capsys):
+    _make_legacy(tmp_ws, unknown=False)
+    assert commands.cmd_refresh(tmp_ws.root) == 0
+    capsys.readouterr()
+    # second refresh: already-current, no migration note emitted
+    assert commands.cmd_refresh(tmp_ws.root) == 0
+    out = capsys.readouterr().out
+    assert "backend: copilot → copilot-sdk" not in out
+    import yaml
+    assert yaml.safe_load(tmp_ws.crew_yaml.read_text())["backend"] == "copilot-sdk"
+
+
+def test_refresh_preserves_paused_state(tmp_ws: Workspace):
+    _make_legacy(tmp_ws, unknown=False)
+    tmp_ws.pause("waiting on operator")
+    assert commands.cmd_refresh(tmp_ws.root) == 0
+    assert tmp_ws.is_paused()
+    assert tmp_ws.pause_reason().strip() == "waiting on operator"
+
+
+def test_doctor_migration_required_message(tmp_ws: Workspace, capsys, monkeypatch):
+    _make_legacy(tmp_ws, unknown=False)
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
+    commands.cmd_doctor(tmp_ws.root)
+    out = capsys.readouterr().out
+    assert "migration required" in out
+    assert "crewd refresh" in out
+    # must NOT be mis-reported as a missing-SDK problem
+    assert "not importable" not in out
+
+
+def test_doctor_reports_missing_sdk_distinctly(tmp_ws: Workspace, capsys, monkeypatch):
+    # Backend is already current; the SDK import is what's missing.
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
+    import crewd.sdk_adapter as sdk
+    monkeypatch.setattr(sdk, "sdk_available", lambda: False)
+    rc = commands.cmd_doctor(tmp_ws.root)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "not importable" in out            # missing-SDK message
+    assert "migration required" not in out    # distinct from migration state
+
+
+def test_run_migration_required_refuses_with_action(tmp_ws: Workspace, capsys):
+    _make_legacy(tmp_ws, unknown=False)
+    rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "migration required" in out and "crewd refresh" in out
+
+
+def test_doctor_flags_external_extra_add_dirs_as_error(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
+    outside = tmp_path / "secrets"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    monkeypatch.setattr(commands, "get_backend", lambda _n: _StubBackend(healthy=True))
+    monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
+    rc = commands.cmd_doctor(tmp_ws.root)
+    out = capsys.readouterr().out
+    # External context is a non-runnable blocker → ERROR → doctor exits 1.
+    assert rc == 1
+    assert "resolves outside the workspace" in out
+    assert "cannot" in out and "mount" in out
+    assert "Copy or sanitize" in out
+
+
+def test_preflight_blocks_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    monkeypatch.setattr(commands, "get_backend", lambda _n: _StubBackend(healthy=True))
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    out = capsys.readouterr().out
+    # Non-runnable: preflight refuses with rc=2 (not a success tuple).
+    assert result == 2
+    assert "extra_add_dirs" in out and "resolves outside the workspace" in out
+
+
+def test_run_role_blocked_by_external_extra_add_dirs_no_sdk_work(tmp_ws: Workspace, monkeypatch, tmp_path):
+    """`crewd run --role worker` must refuse before any SDK session (#28).
+
+    The SDK cannot mount an external path, so the manual single-tick path must be
+    stopped at pre-flight (rc=2) with zero backend invocations — never launched
+    and failed mid-tick.
+    """
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    backend = _StubBackend(healthy=True)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: backend)
+    rc = commands.cmd_run(tmp_ws.root, once=False, role="worker")
+    assert rc == 2
+    assert backend.calls == []                     # no SDK role attempt
+    assert tmp_ws.read_cycle() == 0                # no cycle advance
+    # No role log was written (the tick never started).
+    assert not (tmp_ws.state_dir / "logs").exists() or not any(
+        (tmp_ws.state_dir / "logs").rglob("*.log")
+    )
+
+
+def test_dispatcher_run_blocked_by_external_extra_add_dirs_no_authority_advance(
+    tmp_ws: Workspace, monkeypatch, tmp_path
+):
+    """A normal dispatcher `crewd run` must refuse before any dispatch (#28).
+
+    With an unmountable external extra_add_dir, pre-flight fails (rc=2) before the
+    orchestrator is even built, so the executor sees no Lead or role attempt, no
+    handoff is consumed, no attempt is reserved, and routing authority never
+    advances (cycle stays 0).
+    """
+    from fakes import FakeExecutor, dispatch_to, finish
+
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    fake = FakeExecutor(lead_script=[dispatch_to("worker"), finish()])
+    _use_fake(monkeypatch, fake)
+    rc = commands.cmd_run(tmp_ws.root, once=False, role=None)
+    assert rc == 2
+    assert fake.lead_calls == []                   # authority never solicited
+    assert fake.role_calls == []                   # no role attempt reserved/run
+    assert tmp_ws.read_cycle() == 0                # no authority advance
+    assert not tmp_ws.exit_reason_file.exists()    # no terminal routing recorded
+
+
+def test_preflight_blocks_symlink_to_external_extra_add_dirs(tmp_ws: Workspace, monkeypatch, tmp_path):
+    """A symlink whose canonical target is external is equally non-runnable (#28)."""
+    outside = tmp_path / "real_external"
+    outside.mkdir()
+    link = tmp_ws.root / "linked_ctx"
+    link.symlink_to(outside)
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = ["./linked_ctx"]
+    cfg.save(tmp_ws.crew_yaml)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    assert result == 2
+
+
+def test_preflight_allows_internal_extra_add_dirs(tmp_ws: Workspace, monkeypatch):
+    """An in-workspace extra_add_dir is mountable and must NOT block the run (#28)."""
+    (tmp_ws.root / "in_ctx").mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = ["./in_ctx"]
+    cfg.save(tmp_ws.crew_yaml)
+    monkeypatch.setattr(commands, "get_backend", lambda _name: _StubBackend(healthy=True))
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    assert isinstance(result, tuple)
+
+
+def test_preflight_external_context_checked_before_backend_selection(
+    tmp_ws: Workspace, monkeypatch, tmp_path
+):
+    """External context must be validated before get_backend/backend.doctor (#28).
+
+    Ordering regression: an unsupported external `extra_add_dirs` must block the
+    run without ever selecting or doctoring a backend, so it can never be masked
+    by (or reordered behind) a missing-SDK error.
+    """
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+
+    calls: dict[str, int] = {"get_backend": 0, "doctor": 0}
+
+    class _SpyBackend:
+        name = "spy"
+        def doctor(self):
+            calls["doctor"] += 1
+            return ["SDK not importable (should never be reached)"]
+
+    def _spy_get_backend(_name):
+        calls["get_backend"] += 1
+        return _SpyBackend()
+
+    monkeypatch.setattr(commands, "get_backend", _spy_get_backend)
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    assert result == 2
+    assert calls == {"get_backend": 0, "doctor": 0}
+
+
+def test_preflight_external_context_blocker_survives_unavailable_sdk(
+    tmp_ws: Workspace, capsys, monkeypatch, tmp_path
+):
+    """External-context guidance stays the reported blocker even with no SDK (#28).
+
+    When the SDK is unavailable, the backend doctor would report a missing-SDK
+    error — but because external context is checked first, the operator sees the
+    external-context guidance, not the SDK error.
+    """
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+
+    def _unavailable_backend(_name):
+        return _StubBackend(healthy=False)  # doctor() -> ["... forced unhealthy"]
+
+    monkeypatch.setattr(commands, "get_backend", _unavailable_backend)
+    # Also force the real SDK probe unavailable in case selection is reached.
+    import crewd.sdk_adapter as sdk
+    monkeypatch.setattr(sdk, "sdk_available", lambda: False)
+
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    out = capsys.readouterr().out
+    assert result == 2
+    # The external-context guidance is what's reported…
+    assert "resolves outside the workspace" in out
+    assert "Copy or sanitize" in out
+    # …and the missing-SDK / unhealthy-backend error is NOT surfaced.
+    assert "forced unhealthy" not in out
+    assert "not importable" not in out

@@ -7,13 +7,24 @@ import json
 import uuid
 from datetime import datetime, timezone
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 ROLES = ("lead", "advisory", "worker", "verifier")
 
 
+# The retired ``copilot -p`` subprocess transport (issue #17); a legacy workspace
+# still carrying it must be migrated to the SDK backend by ``crewd refresh``.
+RETIRED_BACKEND = "copilot"
+CURRENT_BACKEND = "copilot-sdk"
+
+
 class RoleConfig(BaseModel):
+    # ``extra="allow"`` preserves unknown user keys across a load→save roundtrip
+    # (issue #28): a refresh/migration must never silently drop configuration it
+    # does not recognise.
+    model_config = ConfigDict(extra="allow")
+
     model: str
     family: str  # e.g. "claude", "gpt" — used to enforce worker≠verifier family
     per_tick_timeout: int | None = None  # override loop.per_tick_timeout for this role
@@ -34,6 +45,8 @@ class TargetConfig(BaseModel):
     not a local path). Avoid local clone paths shaped like ``sub/dir`` to
     sidestep this edge case — prefer ``./sub/dir``.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     remote: str | None = None           # "owner/name", None until attached
     branch: str = "main"
@@ -69,17 +82,27 @@ class TargetConfig(BaseModel):
         return d
 
 class LoopConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     sleep_secs: int = 60
     per_tick_timeout: int = 900
     max_cycles: int = 0  # 0 = forever
 
 
 class CrewConfig(BaseModel):
+    # ``extra="allow"`` preserves unknown top-level user keys (e.g. custom
+    # tooling/notification settings) across a refresh/migration roundtrip so the
+    # upgrade never destroys configuration crewd does not itself consume (#28).
+    model_config = ConfigDict(extra="allow")
+
     name: str
     target: TargetConfig = Field(default_factory=TargetConfig)
     goal_file: str = "./GOAL.md"
     roles: dict[str, RoleConfig]
     loop: LoopConfig = Field(default_factory=LoopConfig)
+    # A retired ``copilot`` value is still *accepted on load* so a legacy
+    # workspace parses and can be migrated by ``crewd refresh``; it is rejected at
+    # run pre-flight until migrated.
     backend: Literal["copilot", "copilot-sdk"] = "copilot-sdk"
     # Extra host directories (beyond the workspace + role worktree) that every
     # role's agent is granted file access to via the backend's --add-dir flag.
@@ -103,6 +126,38 @@ class CrewConfig(BaseModel):
                 sort_keys=False,
                 default_flow_style=False,
             )
+
+    def pending_migrations(self) -> list[str]:
+        """Describe schema migrations this config still needs, without mutating.
+
+        Used by ``crewd doctor``/run pre-flight to report a *migration-required*
+        state distinctly from a healthy or missing-SDK one (#28). An empty list
+        means the schema is current.
+        """
+        pending: list[str] = []
+        if self.backend == RETIRED_BACKEND:
+            pending.append(
+                f"backend: {RETIRED_BACKEND} (the retired `copilot -p` subprocess "
+                f"transport) → {CURRENT_BACKEND}"
+            )
+        return pending
+
+    def apply_migrations(self) -> list[str]:
+        """Mutate this config in place to the current schema.
+
+        Returns a list of human-readable notes for each migration performed
+        (empty when already current). Idempotent: a second call after a save is a
+        no-op. Unknown user keys are preserved by ``extra="allow"`` and are never
+        touched here.
+        """
+        applied: list[str] = []
+        if self.backend == RETIRED_BACKEND:
+            self.backend = CURRENT_BACKEND
+            applied.append(
+                f"backend: {RETIRED_BACKEND} → {CURRENT_BACKEND} "
+                "(retired subprocess transport migrated to the Copilot SDK)"
+            )
+        return applied
 
     def validate_families(self) -> list[str]:
         """Return list of error messages, empty if OK."""
