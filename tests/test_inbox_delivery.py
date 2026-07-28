@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from crewd.config import CrewConfig, GoalState
+from crewd.dispatcher import Dispatcher, DispatcherLimits
 from crewd.orchestrator import Orchestrator
 from crewd.workspace import Workspace
 
@@ -187,3 +188,40 @@ def test_orchestrator_retains_inbox_across_crash_then_delivers(tmp_ws: Workspace
     assert not _inbox(tmp_ws, "worker").exists()
     assert list((tmp_ws.state_dir / "inbox").glob("worker.processed.*"))
 
+
+def test_invalid_lead_decision_retains_override_for_retry(tmp_ws: Workspace):
+    """Regression (#29 inbox retry invariant): an operator OVERRIDE delivered to
+    a Lead solicitation whose decision is INVALID must be retained and
+    redelivered on the next (retry) Lead attempt — never archived before a valid
+    terminal step consumes it.
+
+    Repro shape from the PR #31 rejection: queue a lead OVERRIDE, script Lead to
+    first return an invalid decision (dispatch to an unconfigured role), then a
+    valid finish. With the bug the first invalid solicitation archived the
+    OVERRIDE, so the retry prompt lost it (second_has_override=False)."""
+    _inbox(tmp_ws, "lead").write_text("[OVERRIDE] t retry-me\n")
+
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.loop.max_cycles = 0
+    gs = GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="x")
+    gs.save(tmp_ws.goal_json)
+    disp = Dispatcher(
+        tmp_ws.state_dir / "dispatch.db",
+        limits=DispatcherLimits(max_invalid_solicitations=5),
+    )
+    fake = FakeExecutor(lead_script=[dispatch_to("nonrole"), finish("done")])
+    orch = Orchestrator(tmp_ws, cfg, fake, gs, dispatcher=disp, max_steps=50)
+    orch.run(once=False)
+
+    # First (invalid) and second (retry) Lead solicitations both carry the OVERRIDE.
+    assert len(fake.lead_calls) >= 2, "expected an invalid solicitation then a retry"
+    first_has_override = "retry-me" in fake.lead_calls[0].prompt
+    second_has_override = "retry-me" in fake.lead_calls[1].prompt
+    assert first_has_override, "OVERRIDE was not delivered to the first Lead attempt"
+    assert second_has_override, "OVERRIDE was dropped on the invalid-decision retry"
+
+    # It is archived exactly once, only after the valid (finish) terminal step.
+    inbox_dir = tmp_ws.state_dir / "inbox"
+    assert not (inbox_dir / "lead.md").exists()
+    assert not list(inbox_dir.glob("lead.delivering.*")), "staging must be cleared after valid ack"
+    assert len(list(inbox_dir.glob("lead.processed.*"))) == 1

@@ -253,14 +253,21 @@ class Orchestrator:
                 req, on_started=self._on_started(sol.attempt_id), cancel=cancel
             )
         )
-        self.disp.resolve_lead_solicitation(
+        result = self.disp.resolve_lead_solicitation(
             sol.attempt_id,
             outcome=turn.result.outcome,
             decision=turn.decision,
             configured_roles=self.configured_roles,
         )
-        # Attempt is durably terminal → archive the delivered operator inbox.
-        self._inbox.acknowledge("lead", sol.attempt_id)
+        # Only archive the delivered operator inbox once the solicitation was
+        # accepted as a valid terminal step. An invalid Lead decision returns
+        # authority to Lead for a retry (dispatcher.resolve_lead_solicitation with
+        # solicitation_invalid=True), so the message must NOT be archived here —
+        # leaving the attempt's staging file in place lets the next Lead
+        # solicitation's deliver() re-absorb it, retaining the OVERRIDE across the
+        # retry (GOAL.md inbox retry invariant, issue #29).
+        if not result.solicitation_invalid:
+            self._inbox.acknowledge("lead", sol.attempt_id)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
         self._persist_cycle()
