@@ -260,21 +260,20 @@ class Orchestrator:
                 req, on_started=self._on_started(sol.attempt_id), cancel=cancel
             )
         )
-        # Public-bus finish gate (issue #29): a Lead `finish` may not terminalise
-        # the goal run until the closed final-acceptance issue and public summary
-        # exist on the record. When the gate blocks, the candidate decision is
-        # dropped (passed as None) so `resolve_lead_solicitation` returns authority
-        # to Lead WITHOUT applying finish — no handoff acked, run not finished —
-        # and the run is then paused with the descriptive blocker below.
+        # Public-bus pre-application gate (issue #29): a Lead decision that would
+        # advance authority (dispatch to Worker/Verifier, or finish) may not be
+        # applied until the required GitHub artifacts are verified. Validation
+        # happens BEFORE `resolve_lead_solicitation` applies the decision, so a
+        # blocked transition never acks the decision's pending handoffs or
+        # transfers authority (GOAL.md: invalid references fail without consuming
+        # handoffs or transferring authority). When blocked, the candidate
+        # decision is dropped (passed as None) — the dispatcher then returns
+        # authority to Lead with the same pending handoffs intact — and the run is
+        # paused with the descriptive blocker below.
         decision = turn.decision
-        finish_blocker = None
-        if (
-            decision is not None
-            and getattr(decision, "kind", None) is DecisionKind.FINISH
-        ):
-            finish_blocker = self._finish_gate_block()
-            if finish_blocker is not None:
-                decision = None
+        gate_blocker = self._decision_gate_block(decision)
+        if gate_blocker is not None:
+            decision = None
         result = self.disp.resolve_lead_solicitation(
             sol.attempt_id,
             outcome=turn.result.outcome,
@@ -292,13 +291,14 @@ class Orchestrator:
             self._inbox.acknowledge("lead", sol.attempt_id)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
-        if finish_blocker is not None:
-            # The finish was refused: authority stayed with Lead (decision was not
-            # applied, so no handoff was acked and the run was not terminalised).
-            # Halt with a descriptive public-bus blocker so the operator sees why.
-            self._safe_mark(run_id, RunStatus.PAUSED, finish_blocker)
+        if gate_blocker is not None:
+            # The transition was refused: authority stayed with Lead (decision was
+            # not applied, so no handoff was acked and the run was not
+            # terminalised/dispatched). Halt with a descriptive public-bus blocker
+            # so the operator sees why.
+            self._safe_mark(run_id, RunStatus.PAUSED, gate_blocker)
             console.print(
-                f"[yellow]public-bus gate blocked finish: {finish_blocker}; run paused[/]"
+                f"[yellow]public-bus gate blocked Lead decision: {gate_blocker}; run paused[/]"
             )
         self._persist_cycle()
 
@@ -362,31 +362,58 @@ class Orchestrator:
     def _bus_gate_ok(self, run_id: str, role: str, dsp: object) -> bool:
         """Consult the public-bus gate (if any) before reserving an attempt.
 
-        Returns True to proceed with the dispatch. On a non-``PROCEED`` outcome it
-        marks the run PAUSED with a descriptive public-bus blocker (preserving the
-        wait/reject/permission distinction operationally) and returns False, so no
-        attempt is reserved and no handoff is consumed. A gate that raises does
-        not silently pass: the run pauses with the error so the failure is
-        operator-visible rather than internal-only.
+        Defense-in-depth for a dispatch resurrected from the journal after a
+        restart (the normal path is already gated before the dispatch is created;
+        see :meth:`_decision_gate_block`). Returns True to proceed. On a
+        non-``PROCEED`` outcome it marks the run PAUSED with a descriptive
+        public-bus blocker and returns False, so no attempt is reserved.
+        """
+        blocker = self._dispatch_gate_block(role)
+        if blocker is None:
+            return True
+        self._safe_mark(run_id, RunStatus.PAUSED, blocker)
+        console.print(
+            f"[yellow]public-bus gate blocked {role} dispatch: {blocker}; run paused[/]"
+        )
+        return False
+
+    def _decision_gate_block(self, decision: object) -> Optional[str]:
+        """Return a public-bus blocker for a Lead decision that would advance
+        authority, or ``None`` to allow it.
+
+        Called BEFORE the decision is applied, so a blocked dispatch/finish never
+        acks the decision's pending handoffs or transfers authority. A dispatch to
+        Worker/Verifier is validated against the record; a ``finish`` is validated
+        against the final-acceptance record. All other decisions (continue-lead,
+        wait, pause, dispatch to other roles) are unrelated to the public-bus
+        prerequisite and always allowed.
+        """
+        if decision is None:
+            return None
+        kind = getattr(decision, "kind", None)
+        if kind is DecisionKind.DISPATCH:
+            return self._dispatch_gate_block(getattr(decision, "role", None) or "")
+        if kind is DecisionKind.FINISH:
+            return self._finish_gate_block()
+        return None
+
+    def _dispatch_gate_block(self, role: str) -> Optional[str]:
+        """Consult the public-bus gate for a Worker/Verifier dispatch (if any).
+
+        Returns ``None`` to allow the dispatch, or a descriptive blocker string
+        when the record fails the invariant. A gate that raises does not silently
+        pass: the error becomes the blocker.
         """
         gate = self._bus_gate
         if gate is None:
-            return True
+            return None
         try:
-            outcome = gate.evaluate(role, dsp)
+            outcome = gate.evaluate(role, None)
         except Exception as exc:  # boundary bug must not fake success
-            self._safe_mark(run_id, RunStatus.PAUSED, f"public-bus gate error: {exc}")
-            console.print(f"[red]public-bus gate raised for {role}: {exc}; run paused[/]")
-            return False
+            return f"public-bus gate error: {exc}"
         if outcome is None or outcome.route is Route.PROCEED:
-            return True
-        blocker = f"public-bus {outcome.route.value}: {outcome.detail}"
-        self._safe_mark(run_id, RunStatus.PAUSED, blocker)
-        console.print(
-            f"[yellow]public-bus gate blocked {role} dispatch ({outcome.route.value}): "
-            f"{outcome.detail}; run paused[/]"
-        )
-        return False
+            return None
+        return f"public-bus {outcome.route.value}: {outcome.detail}"
 
     def _finish_gate_block(self) -> Optional[str]:
         """Consult the public-bus gate for a Lead ``finish`` (if any).

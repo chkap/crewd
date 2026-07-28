@@ -260,3 +260,71 @@ def test_resolver_gate_allows_verifier_with_pr_and_readiness(tmp_ws: Workspace):
     orch.run(once=False)
 
     assert [r.role for r in fake.role_calls] == ["verifier"]
+
+
+# ── atomicity: a blocked dispatch must NOT consume the acked handoff ──
+def _seed_pending_worker_handoff(disp) -> tuple[str, str]:
+    """Drive a real completed Worker attempt so a handoff is pending Lead ack.
+
+    Returns (run_id, handoff_id). Uses the dispatcher directly (bypassing the
+    orchestrator gate) purely to establish prior pending state.
+    """
+    from crewd.dispatcher import LeadDecision, HandoffOutcome
+    from crewd.session_backend import AttemptOutcome
+    from crewd.config import ROLES
+
+    run = disp.start_or_resume_run(GOAL)
+    d0 = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    att = disp.reserve_attempt(run.id, d0.dispatch.id, "worker")
+    disp.mark_started(att, session_id="sess-seed", generation=0)
+    disp.record_terminal(
+        att, AttemptOutcome.IDLE_COMPLETED,
+        outcome_class=HandoffOutcome.COMPLETED, evidence="PR #1",
+    )
+    pend = disp.pending_handoffs(run.id)
+    assert len(pend) == 1
+    return run.id, pend[0].id
+
+
+def test_blocked_worker_dispatch_preserves_pending_handoff(tmp_ws: Workspace):
+    """Regression (Verifier PR #32): a Worker dispatch blocked by the public-bus
+    gate must not ack the handoff its decision acknowledges, nor reserve an
+    attempt. The handoff stays pending for Lead's retry."""
+    c = FakeGitHubClient(REPO)
+    c.add_issue(30, "GOAL: x", labels=(GOAL,))  # umbrella only; no assigned task
+    gate = PublicBusGate(_bus(c))
+
+    fake = FakeExecutor(lead_script=[])
+    orch, disp = _orch(tmp_ws, fake, gate)
+    run_id, hid = _seed_pending_worker_handoff(disp)
+
+    # Lead dispatches Worker again, acking the pending handoff, but the record has
+    # no assigned task → the gate blocks BEFORE the decision is applied.
+    fake._lead_script = [dispatch_to("worker")]
+    orch._lead_step(run_id)
+
+    assert [h.id for h in disp.pending_handoffs(run_id)] == [hid]  # not consumed
+    assert fake.role_calls == []                                   # no attempt reserved
+    assert RunStatus(disp.get_run(run_id).status) is RunStatus.PAUSED
+    assert "public-bus" in (disp.get_run(run_id).human_blocker or "")
+
+
+def test_blocked_verifier_dispatch_preserves_pending_handoff(tmp_ws: Workspace):
+    """Same atomicity guarantee for a Verifier dispatch blocked by a missing
+    linked PR / readiness record."""
+    c = FakeGitHubClient(REPO)
+    c.add_issue(30, "GOAL: x", labels=(GOAL,))
+    c.add_issue(TASK, "task", labels=("crewd:task", GOAL))
+    _assign(c, TASK)  # worker prereqs ok, but no PR / readiness → verifier blocked
+    gate = PublicBusGate(_bus(c))
+
+    fake = FakeExecutor(lead_script=[])
+    orch, disp = _orch(tmp_ws, fake, gate)
+    run_id, hid = _seed_pending_worker_handoff(disp)
+
+    fake._lead_script = [dispatch_to("verifier")]
+    orch._lead_step(run_id)
+
+    assert [h.id for h in disp.pending_handoffs(run_id)] == [hid]
+    assert fake.role_calls == []
+    assert RunStatus(disp.get_run(run_id).status) is RunStatus.PAUSED
