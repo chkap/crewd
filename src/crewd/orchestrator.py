@@ -57,6 +57,7 @@ from .dispatcher import (
     RunStatus,
 )
 from .executor import AttemptExecutor, AttemptRequest, resolve_role_terminal
+from .inbox import InboxService
 from .session_backend import CancelToken
 from .workspace import Workspace
 
@@ -98,11 +99,16 @@ class Orchestrator:
         poll_interval: float = 0.05,
         taint_orphan: Optional[Callable[[str, int, str], None]] = None,
         prompt_policy: object | None = None,
+        inbox: InboxService | None = None,
     ):
         self.ws = ws
         self.cfg = cfg
         self.executor = executor
         self.goal_state = goal_state
+        # Host-owned operator inbox delivery (issue #29): the orchestrator, not
+        # model best effort, reads/attaches/archives operator messages so an
+        # OVERRIDE cannot be silently skipped. Injectable for deterministic tests.
+        self._inbox = inbox or InboxService.for_workspace(ws)
         # Gated, test-only seam (default None → fully inert in production). When a
         # live-smoke policy is injected it may append a bounded instruction suffix
         # to the *production-rendered* role/Lead prompts and observe (not replace)
@@ -235,7 +241,8 @@ class Orchestrator:
             return  # run marked exhausted; the loop exits on the next iteration
         pending = self.disp.pending_handoffs(run_id)
         self._cycle += 1
-        req = self._request("lead", self._lead_prompt(pending))
+        prompt = self._deliver_inbox("lead", sol.attempt_id, self._lead_prompt(pending))
+        req = self._request("lead", prompt)
         console.print(f"  [magenta]lead[/] ({self.cfg.roles.get('lead', _NoModel()).model}) solicitation → {req.log_path}")
         # Journal the Lead session identity durably BEFORE any SDK send, via the
         # executor's on_started hook. Persistence failure is NOT swallowed: it
@@ -252,6 +259,8 @@ class Orchestrator:
             decision=turn.decision,
             configured_roles=self.configured_roles,
         )
+        # Attempt is durably terminal → archive the delivered operator inbox.
+        self._inbox.acknowledge("lead", sol.attempt_id)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
         self._persist_cycle()
@@ -269,7 +278,8 @@ class Orchestrator:
         except BudgetExhausted:
             return
         self._cycle += 1
-        req = self._request(role, self._role_prompt(role, dsp))
+        prompt = self._deliver_inbox(role, attempt_id, self._role_prompt(role, dsp))
+        req = self._request(role, prompt)
         console.print(f"  [magenta]{role}[/] ({self.cfg.roles[role].model}) → {req.log_path}")
         # Journal session identity BEFORE the SDK send (see _lead_step). This is
         # what makes the deferred taint/orphan-recovery follow-up safe: an attempt
@@ -301,6 +311,8 @@ class Orchestrator:
             disagreement=terminal.disagreement,
             blocker=terminal.blocker,
         )
+        # Attempt is durably terminal → archive the delivered operator inbox.
+        self._inbox.acknowledge(role, attempt_id)
         self._persist_cycle()
 
     def _on_started(self, attempt_id: str):
@@ -386,6 +398,18 @@ class Orchestrator:
         )
 
     # ── request/prompt construction ──
+    def _deliver_inbox(self, role: str, attempt_id: str, base_prompt: str) -> str:
+        """Prepend host-delivered operator inbox messages (if any) to a prompt.
+
+        The host stages the role's live inbox against this attempt so the payload
+        is attached by the runtime — not fetched by the model — and archived only
+        after the attempt terminalizes (see :class:`crewd.inbox.InboxService`).
+        """
+        payload = self._inbox.deliver(role, attempt_id)
+        if not payload:
+            return base_prompt
+        return f"{payload}\n\n{base_prompt}"
+
     def _request(self, role: str, prompt: str) -> AttemptRequest:
         cfg_dir = self.ws.role_cfg_dir(role)
         wt = self.ws.role_worktree(role)
@@ -431,9 +455,11 @@ class Orchestrator:
             f"You are the `{role}` role, dispatched by Lead for ONE attempt on "
             f"`{self.cfg.target.remote}`. GOAL.md is at `{self.ws.goal_md}`.\n"
             f"{delta}"
-            f"If `{self.ws.state_dir / 'inbox' / (role + '.md')}` exists, read its "
-            f"messages from the human operator FIRST, then move it aside per the "
-            f"inbox protocol. Use the dispatch context to check only what changed "
+            f"Any pending operator messages are delivered inline by the host at "
+            f"the top of this prompt under an `OPERATOR INBOX` banner (you do not "
+            f"read or clear inbox files yourself); honor them first, and treat an "
+            f"`[OVERRIDE]` as taking precedence over GOAL.md and prior memory. Use "
+            f"the dispatch context to check only what changed "
             f"since the triggering handoff (delta discovery); fall back to a full "
             f"review only if that context is stale or insufficient. Do your role's "
             f"work for this one attempt, then return control to Lead by calling "

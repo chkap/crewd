@@ -219,21 +219,20 @@ def cmd_attach(workspace: Path, repo: str, branch: str | None, clone: bool) -> i
 
 
 # ─────────────────────────── doctor ───────────────────────────
-def _inbox_summary(ws: Workspace, role: str) -> tuple[int, str | None]:
-    """Return (count, last_sender) for a role's inbox file. Best-effort parse."""
-    inbox = ws.state_dir / "inbox" / f"{role}.md"
-    if not inbox.exists():
-        return 0, None
+def _inbox_summary(ws: Workspace, role: str) -> tuple[int, int, int]:
+    """Return (pending, delivering, processed) counts for a role's inbox.
+
+    Uses the host-owned :class:`~crewd.inbox.InboxService` so both message
+    formats are counted and in-flight (attached-but-unacked) deliveries and the
+    processed audit trail are visible — without surfacing message content.
+    """
+    from .inbox import InboxService
+
     try:
-        body = inbox.read_text(errors="replace")
+        c = InboxService.for_workspace(ws).counts(role)
+        return c["pending"], c["delivering"], c["processed"]
     except Exception:
-        return 0, None
-    headers = [ln for ln in body.splitlines() if ln.startswith("## [")]
-    last = None
-    if headers:
-        h = headers[-1].lstrip("# ").strip("[] ")
-        last = h.split("@", 1)[0].strip() or None
-    return len(headers), last
+        return 0, 0, 0
 
 
 def _read_goal_cycle(ws: Workspace) -> int | None:
@@ -354,12 +353,12 @@ def cmd_doctor(workspace: Path) -> int:
 
     # Inbox table
     in_tbl = Table(title="inbox")
-    in_tbl.add_column("role"); in_tbl.add_column("pending"); in_tbl.add_column("last sender")
+    in_tbl.add_column("role"); in_tbl.add_column("pending"); in_tbl.add_column("delivering"); in_tbl.add_column("processed")
     for role in ROLES:
         if role not in cfg.roles:
             continue
-        cnt, sender = _inbox_summary(ws, role)
-        in_tbl.add_row(role, str(cnt), sender or "—")
+        pending, delivering, processed = _inbox_summary(ws, role)
+        in_tbl.add_row(role, str(pending), str(delivering), str(processed))
     console.print(in_tbl)
 
     # Recent activity
@@ -662,14 +661,25 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
     cwd = ws.role_cfg_dir(role)
     wt = ws.role_worktree(role)
 
-    prompt = (
+    # Host-owned operator inbox delivery (issue #29): the debug/manual tick path
+    # also attaches operator messages via the host and archives them afterwards,
+    # rather than instructing the model to read/clear its own inbox file.
+    from .inbox import InboxService
+
+    inbox = InboxService.for_workspace(ws)
+    manual_attempt = f"manual-{goal_label}-{cycle}"
+    inbox_payload = inbox.deliver(role, manual_attempt)
+
+    base_prompt = (
         f"This is cycle {cycle}. Read the latest GitHub issues + comments in "
         f"`{cfg.target.remote}` and execute your role's responsibilities. "
         f"GOAL.md is at `{ws.goal_md}`. "
-        f"If `{ws.state_dir / 'inbox' / (role + '.md')}` exists, read its messages "
-        f"from the human operator FIRST, then truncate that file to empty. "
+        f"Any pending operator messages are delivered inline by the host at the "
+        f"top of this prompt under an `OPERATOR INBOX` banner (honor them first; "
+        f"an `[OVERRIDE]` takes precedence over GOAL.md). "
         f"Do one tick and stop."
     )
+    prompt = f"{inbox_payload}\n\n{base_prompt}" if inbox_payload else base_prompt
     add_dirs = [ws.root]  # workspace as readable context
     if wt.exists():
         add_dirs.append(wt)
@@ -691,6 +701,8 @@ def _tick_role(ws: Workspace, cfg: CrewConfig, backend, role: str, cycle: int) -
     )
     if rc != 0:
         console.print(f"    [yellow]{role} exited rc={rc}[/]")
+    # The manual tick has completed → archive any delivered operator inbox.
+    inbox.acknowledge(role, manual_attempt)
     return rc
 
 

@@ -208,7 +208,7 @@ crewd talk worker "small PRs only — split #42 into 3 PRs"
 crewd inbox lead OVERRIDE "drop feature X, focus on auth bug"
 ```
 
-The role consumes its inbox file at the start of its next run (when it is next dispatched) and moves it to `state/inbox/<role>.processed.<unix-ts>.md` (preserving an audit trail). `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
+The host (orchestrator) consumes the role's inbox file when it constructs that role's next dispatched prompt — it injects the messages inline under an `OPERATOR INBOX` banner (highest priority first) and moves the file to `state/inbox/<role>.processed.<ts>.md` (preserving an audit trail) only after that attempt finishes. The role does not read or clear the file itself, so an operator `OVERRIDE` cannot be silently skipped. `OVERRIDE` outranks the role's own plan; `ADVICE` is treated as a strong suggestion; `INFO` is context only.
 
 **Start a new goal on the same workspace**
 
