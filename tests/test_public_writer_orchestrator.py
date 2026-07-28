@@ -3,22 +3,28 @@
 Proves the orchestrator, wired with a :class:`crewd.public_writer.PublicWriter`
 over a deterministic fake GitHub boundary:
 
-* publishes a material role handoff as a verified attributed artifact at the
-  role's terminal, keyed by the durable handoff id;
+* **Pre-application Lead-dispatch gate** — a Lead dispatch decision's public
+  artifact is reserved/posted/verified BEFORE ``resolve_lead_solicitation`` applies
+  it; on an outage the candidate decision is dropped, so routing authority stays
+  ``lead_pending``, no role dispatch is created/consumed, and a reserved intent is
+  reconciled idempotently on a later run (no duplicate) before the decision applies
+  (GOAL.md: material Lead routing is public before internal progress; an unverified
+  write is never proof).
+* publishes a material role handoff as a verified attributed artifact at the role's
+  terminal, keyed by the durable handoff id;
 * refuses to *consume* (ack) a material handoff whose public artifact is not yet
-  verified — the handoff stays pending and the run pauses, so a crashed/unavailable
-  public write never becomes a silently-completed handoff (GOAL #2/#5);
-* reconciles a reserved-but-unverified intent on the next run once GitHub recovers;
-* treats a private ``no_progress`` handoff as non-material (no artifact required).
+  verified — the handoff stays pending and the run pauses;
+* treats a genuinely empty ``no_progress`` handoff as non-material (no artifact),
+  but a ``no_progress`` with changed/remaining state as material.
 
 No SDK, no network.
 """
 from __future__ import annotations
 
 from crewd.config import CrewConfig, GoalState
-from crewd.dispatcher import Dispatcher, RunStatus
+from crewd.dispatcher import Dispatcher, LEAD_PENDING, RunStatus
 from crewd.executor import RoleHandoff
-from crewd.github_bus import GitHubErrorKind, PublicBus
+from crewd.github_bus import GitHubError, GitHubErrorKind, PublicBus
 from crewd.orchestrator import Orchestrator
 from crewd.public_writer import IntentStore, PublicWriter, WriteState
 from crewd.workspace import Workspace
@@ -64,12 +70,18 @@ def _crew_posts(c: FakeGitHubClient):
             if "crewd:correlation:" in x.body]
 
 
-def test_material_handoff_published_at_terminal(tmp_ws: Workspace):
-    """A dispatched Worker's material handoff is published + verified at terminal."""
+def _lead_dispatch_posts(c: FakeGitHubClient):
+    return [p for p in _crew_posts(c) if "Lead decision" in p.body]
+
+
+# ── happy path ──────────────────────────────────────────────────────────
+def test_lead_dispatch_and_handoff_published_and_verified(tmp_ws: Workspace):
+    """Valid record + healthy bus: the Lead dispatch artifact is published before
+    the decision applies, the Worker runs, its material handoff is published +
+    verified, and the wait consumes it."""
     c = FakeGitHubClient(REPO)
     _valid_worker_record(c)
     pub = _writer(tmp_ws, c)
-    # Lead dispatches worker, then waits (acking the worker handoff once verified).
     fake = FakeExecutor(
         lead_script=[dispatch_to("worker"), wait("external")],
         role_handoff=_material_handoff,
@@ -78,19 +90,22 @@ def test_material_handoff_published_at_terminal(tmp_ws: Workspace):
     orch.run(once=False)
 
     assert [r.role for r in fake.role_calls] == ["worker"]
-    posts = _crew_posts(c)
-    # worker->verifier readiness present and verified in the durable journal.
-    assert any("worker \u2192 verifier" in p.body for p in posts)
-    assert pub.counts()["pending"] == 0 and pub.counts()["verified"] >= 1
+    # Both artifacts present + verified: the Lead dispatch decision and the worker
+    # readiness handoff (worker -> verifier).
+    assert len(_lead_dispatch_posts(c)) == 1
+    assert any("worker \u2192 verifier" in p.body for p in _crew_posts(c))
+    assert pub.counts()["pending"] == 0 and pub.counts()["verified"] >= 2
     assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
 
 
-def test_consume_blocked_when_public_write_unverified(tmp_ws: Workspace):
-    """A sustained GitHub outage leaves the Worker handoff unpublished; Lead may
-    not consume it — the run pauses and the handoff stays pending (no ack)."""
+# ── pre-application Lead-dispatch gate (the Verifier repro) ──────────────
+def test_lead_dispatch_blocked_when_write_unverified(tmp_ws: Workspace):
+    """A sustained write outage means the Lead dispatch decision cannot be
+    published; the decision must NOT be applied — routing authority stays
+    ``lead_pending``, no role dispatch is created/consumed, and the reserved
+    intent is left for reconciliation."""
     c = FakeGitHubClient(REPO)
     _valid_worker_record(c)
-    # Sustained outage on writes only (reads still validate the dispatch prereq).
     c.always_fail("create_comment", GitHubErrorKind.TIMEOUT, "outage")
     pub = _writer(tmp_ws, c)
     fake = FakeExecutor(
@@ -100,63 +115,102 @@ def test_consume_blocked_when_public_write_unverified(tmp_ws: Workspace):
     orch, disp = _orch(tmp_ws, fake, pub)
     orch.run(once=False)
 
-    # Worker ran and produced a handoff, but the write never verified.
-    assert [r.role for r in fake.role_calls] == ["worker"]
+    # No role ever ran and no dispatch artifact verified.
+    assert fake.role_calls == []
     assert _crew_posts(c) == []
-    # The consume was refused: run paused with a public-bus write blocker, and the
-    # worker handoff remains pending (unconsumed) with a reserved durable intent.
+    run = disp.start_or_resume_run(GOAL)
+    # Authority stayed with Lead; the run paused with the descriptive blocker.
+    assert run.routing_authority == LEAD_PENDING
+    assert RunStatus(run.status) is RunStatus.PAUSED
+    assert "lead dispatch decision unverified" in (run.human_blocker or "")
+    # A durable reserved intent exists for the Lead dispatch, unverified.
+    pending = pub.store.list_pending()
+    assert len(pending) == 1
+    assert pending[0].role == "lead" and pending[0].state == WriteState.RESERVED.value
+    assert pub.counts()["verified"] == 0
+    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+
+
+def test_lead_dispatch_reconciled_without_duplicate_then_applied(tmp_ws: Workspace):
+    """Once the outage clears, the reserved Lead-dispatch intent reconciles on the
+    next run (exactly one post, no duplicate) and the decision then applies."""
+    c = FakeGitHubClient(REPO)
+    _valid_worker_record(c)
+    c.always_fail("create_comment", GitHubErrorKind.TIMEOUT, "outage")
+    pub = _writer(tmp_ws, c)
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), wait("external")],
+        role_handoff=_material_handoff,
+    )
+    orch, disp = _orch(tmp_ws, fake, pub)
+    orch.run(once=False)
+    assert pub.counts()["verified"] == 0  # blocked/paused above
+    assert c.create_calls >= 1            # at least one failed write was attempted
+    disp.close()
+
+    # Outage clears; a fresh run over the same durable state reconciles the reserved
+    # Lead-dispatch intent on start (idempotent marker → no duplicate), then Lead
+    # re-decides dispatch(worker) with the SAME stable correlation id → deduped →
+    # verified → the decision applies and the Worker runs.
+    c.persistent_faults.clear()
+    creates_before = c.create_calls
+    pub2 = _writer(tmp_ws, c)
+    fake2 = FakeExecutor(
+        lead_script=[dispatch_to("worker"), wait("external")],
+        role_handoff=_material_handoff,
+    )
+    disp2 = Dispatcher(tmp_ws.state_dir / "dispatch.db")
+    orch2, _ = _orch(tmp_ws, fake2, pub2, disp=disp2)
+    orch2.run(once=False, resume=True)
+
+    # Exactly one Lead-dispatch artifact exists (reconcile + re-decide did not
+    # double-post), the worker ran, and its handoff is verified too.
+    assert len(_lead_dispatch_posts(c)) == 1
+    assert [r.role for r in fake2.role_calls] == ["worker"]
+    assert pub2.counts()["pending"] == 0
+    run = disp2.start_or_resume_run(GOAL)
+    assert [h.role for h in disp2.pending_handoffs(run.id)] == []
+
+
+# ── role-handoff consume gate (outage begins AFTER the dispatch write) ───
+def test_consume_blocked_when_handoff_write_unverified(tmp_ws: Workspace):
+    """The Lead dispatch artifact publishes (call 1), then the bus goes down so the
+    Worker's material handoff cannot verify; Lead may not consume it — the run
+    pauses and the worker handoff stays pending."""
+    c = FakeGitHubClient(REPO)
+    _valid_worker_record(c)
+    # First create (the Lead dispatch artifact) succeeds; every later write fails.
+    c.create_fail_after = 1
+    c.create_fail_error = GitHubError(GitHubErrorKind.TIMEOUT, "outage")
+    pub = _writer(tmp_ws, c)
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), wait("external")],
+        role_handoff=_material_handoff,
+    )
+    orch, disp = _orch(tmp_ws, fake, pub)
+    orch.run(once=False)
+
+    # The dispatch published, so the Worker DID run; its handoff write never verified.
+    assert [r.role for r in fake.role_calls] == ["worker"]
+    assert len(_lead_dispatch_posts(c)) == 1
     run = disp.start_or_resume_run(GOAL)
     assert RunStatus(run.status) is RunStatus.PAUSED
     assert "public-bus write unverified" in (run.human_blocker or "")
     pending = disp.pending_handoffs(run.id)
     assert [h.role for h in pending] == ["worker"]
-    # The worker handoff's own durable intent is reserved (unverified), never
-    # silently marked done.
-    intent = pub.store.get(pending[0].id)
-    assert intent is not None and intent.state == WriteState.RESERVED.value
-    assert pub.counts()["verified"] == 0
+    worker_intent = pub.store.get(pending[0].id)
+    assert worker_intent is not None and worker_intent.state == WriteState.RESERVED.value
     assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
 
 
-def test_reconcile_on_restart_then_consume_allowed(tmp_ws: Workspace):
-    """After the outage clears, the next run reconciles the reserved intent and
-    Lead can then consume the handoff."""
+# ── materiality: bare no_progress private; changed/remaining material ────
+def test_bare_no_progress_needs_no_artifact(tmp_ws: Workspace):
+    """A genuinely empty ``no_progress`` is non-material: the dispatch publishes,
+    the Worker returns bare no-progress (no reserved artifact), and Lead consumes
+    it even though later writes would fail."""
     c = FakeGitHubClient(REPO)
     _valid_worker_record(c)
-    c.always_fail("create_comment", GitHubErrorKind.TIMEOUT, "outage")
-    pub = _writer(tmp_ws, c)
-    fake = FakeExecutor(
-        lead_script=[dispatch_to("worker"), wait("external")],
-        role_handoff=_material_handoff,
-    )
-    orch, disp = _orch(tmp_ws, fake, pub)
-    orch.run(once=False)
-    assert pub.counts()["verified"] == 0  # blocked/paused, nothing verified
-    disp.close()
-
-    # Outage clears; a fresh run over the same durable state reconciles the
-    # reserved intent on start, then Lead's retried wait consumes the handoff.
-    c.persistent_faults.clear()
-    pub2 = _writer(tmp_ws, c)
-    fake2 = FakeExecutor(lead_script=[wait("external")])
-    # Resume the paused run explicitly (mirrors the operator `resume` workflow).
-    disp2 = Dispatcher(tmp_ws.state_dir / "dispatch.db")
-    orch2, _ = _orch(tmp_ws, fake2, pub2, disp=disp2)
-    orch2.run(once=False, resume=True)
-
-    assert pub2.counts()["pending"] == 0 and pub2.counts()["verified"] >= 1
-    assert len(_crew_posts(c)) >= 1
-    run = disp2.start_or_resume_run(GOAL)
-    # The worker handoff is now consumed (no longer pending).
-    assert [h.role for h in disp2.pending_handoffs(run.id)] == []
-
-
-def test_private_no_progress_not_published(tmp_ws: Workspace):
-    """A bare private ``no_progress`` handoff is not material: no artifact is
-    required and Lead may consume it even with the bus otherwise unavailable."""
-    c = FakeGitHubClient(REPO)
-    _valid_worker_record(c)
-    c.always_fail("create_comment", GitHubErrorKind.TIMEOUT, "outage")
+    c.create_fail_after = 1  # only the Lead dispatch write may succeed
     pub = _writer(tmp_ws, c)
 
     def _bare(role, req):
@@ -169,10 +223,40 @@ def test_private_no_progress_not_published(tmp_ws: Workspace):
     orch, disp = _orch(tmp_ws, fake, pub)
     orch.run(once=False)
 
-    # The worker's bare no_progress required no artifact: no worker-role intent was
-    # ever reserved, and the wait consumed the handoff despite the write outage.
-    worker_intents = [i for i in pub.store.list_pending() if i.role == "worker"]
-    assert worker_intents == []
+    assert [r.role for r in fake.role_calls] == ["worker"]
+    # No worker artifact was ever reserved (non-material), and the wait consumed it.
+    assert [i for i in pub.store.list_pending() if i.role == "worker"] == []
     assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
     run = disp.start_or_resume_run(GOAL)
     assert [h.role for h in disp.pending_handoffs(run.id)] == []
+
+
+def test_material_no_progress_requires_artifact(tmp_ws: Workspace):
+    """A ``no_progress`` that reports changed/remaining state IS material: with the
+    bus down after the dispatch write, its consume is blocked and it stays
+    pending — a material no-progress is not hidden as private."""
+    c = FakeGitHubClient(REPO)
+    _valid_worker_record(c)
+    c.create_fail_after = 1  # dispatch write ok; the handoff write fails
+    pub = _writer(tmp_ws, c)
+
+    def _material_np(role, req):
+        return RoleHandoff(outcome_class="no_progress",
+                           reason="blocked mid-way",
+                           changed="left a partial migration on disk",
+                           remaining="finish the migration")
+
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker"), wait("external")],
+        role_handoff=_material_np,
+    )
+    orch, disp = _orch(tmp_ws, fake, pub)
+    orch.run(once=False)
+
+    run = disp.start_or_resume_run(GOAL)
+    assert RunStatus(run.status) is RunStatus.PAUSED
+    assert "public-bus write unverified" in (run.human_blocker or "")
+    pending = disp.pending_handoffs(run.id)
+    assert [h.role for h in pending] == ["worker"]
+    # A durable worker intent was reserved (materiality forced a required artifact).
+    assert pub.store.get(pending[0].id) is not None

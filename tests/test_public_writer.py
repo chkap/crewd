@@ -58,12 +58,19 @@ def test_material_completed_always():
 
 def test_material_no_progress_bare_is_private():
     assert not is_material_handoff("no_progress")
+    # A return reason alone does not make a no-progress material (every one has
+    # one), and explicit no-op sentinels do not either.
+    assert not is_material_handoff("no_progress", changed="none", remaining="n/a")
+    assert not is_material_handoff("no_progress", changed="", remaining="  ")
 
 
-def test_material_no_progress_with_blocker_is_material():
+def test_material_no_progress_with_material_fields():
     assert is_material_handoff("no_progress", blocker="needs human key")
     assert is_material_handoff("no_progress", evidence="found a bug")
     assert is_material_handoff("no_progress", disagreement="disagree with lead")
+    # Changed state or material remaining work must NOT be hidden as private.
+    assert is_material_handoff("no_progress", changed="modified state")
+    assert is_material_handoff("no_progress", remaining="follow-up needed")
 
 
 # ── core publish / verify ───────────────────────────────────────────────

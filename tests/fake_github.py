@@ -37,6 +37,12 @@ class FakeGitHubClient:
         # (models an ambiguous write that actually landed).
         self.ambiguous_but_landed = False
         self.create_calls = 0
+        # When set to k, create_comment succeeds for the first k calls then raises
+        # ``create_fail_error`` on every later call — models an outage that begins
+        # *after* an initial successful write (e.g. the Lead dispatch artifact
+        # lands, then the boundary goes down before the role handoff write).
+        self.create_fail_after: Optional[int] = None
+        self.create_fail_error = GitHubError(GitHubErrorKind.TIMEOUT, "outage")
 
     # -- programming helpers --
     def add_issue(self, number: int, title: str, *, state: str = "open",
@@ -134,4 +140,6 @@ class FakeGitHubClient:
         persistent = self.persistent_faults.get("create_comment")
         if persistent is not None:
             raise persistent
+        if self.create_fail_after is not None and self.create_calls > self.create_fail_after:
+            raise self.create_fail_error
         return self._store_comment(target, number, body)

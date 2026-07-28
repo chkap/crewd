@@ -47,6 +47,17 @@ from .inbox import redact_secrets
 
 
 # ── materiality ─────────────────────────────────────────────────────────
+def _has_content(value: str) -> bool:
+    """Whether a handoff field carries genuinely material content.
+
+    An empty field, or an explicit no-op sentinel (``none``/``n/a``/``-``), is not
+    material — so a Verifier approval's ``changed: none`` and a bare no-progress
+    return do not, by themselves, force a public artifact.
+    """
+    v = (value or "").strip().lower()
+    return bool(v) and v not in ("none", "n/a", "na", "-", "n.a.")
+
+
 def is_material_handoff(
     outcome_class: str,
     *,
@@ -60,14 +71,18 @@ def is_material_handoff(
 
     Every ``completed`` and ``uncertain`` handoff is material. The single narrow
     exception (GOAL: "all-role material handoff enforcement with the narrow
-    private ``no_progress`` exception") is a *private* ``no_progress`` return that
-    carries no evidence, disagreement, or blocker — a bare "nothing changed, try
-    again" that does not itself advance the public record. Any ``no_progress`` that
-    reports concrete evidence, a disagreement, or a blocker IS material.
+    private ``no_progress`` exception") is a *genuinely empty* ``no_progress``
+    return — a bare "nothing changed, try again" that carries no changed state, no
+    material remaining work, no evidence, no disagreement, and no blocker. A
+    ``no_progress`` that reports concrete evidence, a *changed* state, material
+    *remaining* work, a disagreement, or a blocker IS material and must be
+    published. The return ``reason`` alone does not make a no-progress material
+    (every no-progress carries one), so it is intentionally excluded here.
     """
     oc = (outcome_class or "").lower()
     if oc == "no_progress":
-        return bool(evidence.strip() or disagreement.strip() or blocker.strip())
+        return any(_has_content(f) for f in (evidence, changed, remaining,
+                                             disagreement, blocker))
     return True
 
 

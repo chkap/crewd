@@ -290,6 +290,18 @@ class Orchestrator:
         # paused with the descriptive blocker below.
         decision = turn.decision
         gate_blocker = self._decision_gate_block(decision, pending)
+        # Pre-application publication gate for a material Lead *routing* decision
+        # (dispatch): the decision's public artifact must be reserved, posted, and
+        # verified BEFORE `resolve_lead_solicitation` applies it, so authority
+        # never advances to the dispatched role while the routing decision has no
+        # verified public record (GOAL.md: material Lead routing is public before
+        # internal progress; an unverified write is never proof). On WAIT/PAUSE/
+        # REJECT the candidate decision is dropped, leaving authority with Lead and
+        # the pending handoffs intact; the durable reserved intent is reconciled on
+        # a later run (idempotently — the correlation id is stable for this
+        # authority epoch, so a retry never double-posts).
+        if gate_blocker is None:
+            gate_blocker = self._lead_decision_publish_block(decision, run_id, pending)
         if gate_blocker is not None:
             decision = None
         result = self.disp.resolve_lead_solicitation(
@@ -307,12 +319,6 @@ class Orchestrator:
         # retry (GOAL.md inbox retry invariant, issue #29).
         if not result.solicitation_invalid:
             self._inbox.acknowledge("lead", sol.attempt_id)
-            # Publish the applied Lead routing decision as an attributed artifact
-            # (issue #29, GOAL #2). Best-effort/observability: a failure leaves a
-            # durable reserved intent for reconciliation and never rolls back the
-            # already-applied decision.
-            if gate_blocker is None:
-                self._publish_lead_decision(decision, result)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
         if gate_blocker is not None:
@@ -390,30 +396,49 @@ class Orchestrator:
         self._inbox.acknowledge(role, attempt_id)
         self._persist_cycle()
 
-    def _publish_lead_decision(self, decision: object, result: object) -> None:
-        """Publish an applied Lead *dispatch* decision as an attributed artifact.
+    def _lead_decision_publish_block(self, decision: object, run_id: str, pending: list) -> Optional[str]:
+        """Reserve/post/verify a material Lead *dispatch* decision artifact BEFORE
+        it is applied; return a blocker to drop the decision, or ``None`` to allow.
 
-        Only a dispatch (Lead → a role) is a material inter-role communication;
-        continue-lead/wait/pause/finish are Lead-internal or handled by the
-        finish-prerequisite record. Best-effort and non-blocking.
+        Only a dispatch (Lead → a role) is a material inter-role routing decision
+        that must be public before authority advances; continue-lead/wait/pause are
+        Lead-internal and finish is governed by the finish-prerequisite record.
+
+        The correlation id is stable for *this logical decision* across pause/resume
+        retries: it is derived from the run, the exact set of pending handoff ids
+        the decision consumes, and the target role. A blocked decision consumes
+        nothing (the pending set is unchanged on the retried solicitation), so the
+        reserved intent reconciles under the *same* marker and the re-decided
+        publish deduplicates to it — never a double-post. (``authority_seq`` is
+        deliberately NOT used: a pause bumps it, so it is not stable across a
+        retry.) Once the decision is applied the pending handoffs are consumed, so
+        the next decision derives a distinct id.
+
+        Returns ``None`` when no publisher is wired (production-inert) or the
+        decision is not a dispatch. A publish that does not verify (WAIT/PAUSE from
+        an outage, or REJECT from a bad record) returns a descriptive blocker.
         """
         publisher = self._publisher
         if publisher is None or decision is None:
-            return
+            return None
         if getattr(decision, "kind", None) is not DecisionKind.DISPATCH:
-            return
-        dispatch = getattr(result, "dispatch", None)
-        decision_id = getattr(dispatch, "id", None)
-        if not decision_id:
-            return
+            return None
+        target_role = getattr(decision, "role", "") or ""
+        pending_ids = "+".join(sorted(h.id for h in (pending or [])))
+        correlation_id = f"lead-dispatch:{run_id}:{pending_ids}:{target_role}"
         try:
-            publisher.publish_lead_decision(
-                decision_id=decision_id, kind="dispatch",
-                target_role=getattr(decision, "role", "") or "",
+            outcome = publisher.publish_lead_decision(
+                decision_id=correlation_id, kind="dispatch",
+                target_role=target_role,
                 reason=getattr(decision, "reason", "") or "",
             )
-        except Exception as exc:  # a publish bug must not abort the run
-            console.print(f"[yellow]public-write lead decision error: {exc}[/]")
+        except Exception as exc:  # a publish bug must not fake a verified write
+            return f"public-bus lead decision publish error: {exc}"
+        if outcome is not None and outcome.verified:
+            return None
+        detail = outcome.detail if outcome is not None else "not published"
+        return (f"public-bus lead dispatch decision unverified "
+                f"(-> {target_role or 'role'}): {detail}")
 
     def _reconcile_public_writes(self) -> None:
         """Finish any durable public-write intents left reserved by a crash."""
