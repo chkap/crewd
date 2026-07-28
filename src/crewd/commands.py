@@ -100,6 +100,42 @@ def check_and_render(ws: Workspace, cfg: CrewConfig) -> bool:
     return needs
 
 
+# ─────────────────────────── extra_add_dirs advisory ───────────────────────────
+def _extra_dir_advisories(ws: Workspace, cfg: CrewConfig) -> list[tuple[str, str]]:
+    """Classify configured ``extra_add_dirs`` into (severity, message) advisories.
+
+    Shared by ``doctor`` (issues table), ``refresh`` and run pre-flight so every
+    surface reports the same migration-relevant facts about external context
+    (#28): a *missing* entry is skipped at run time (warn), an *external* entry
+    exposes host files outside the crew by their canonical path (warn + secret-
+    safe guidance, and an explicit note when a symlink was followed rather than
+    claiming the raw symlink is mounted). Internal entries produce no advisory.
+    """
+    out: list[tuple[str, str]] = []
+    for info in ws.classify_extra_dirs(cfg.extra_add_dirs):
+        if info.status == "missing":
+            out.append((
+                "warn",
+                f"extra_add_dirs entry '{info.entry}' does not resolve to a "
+                f"directory (looked at {info.canonical}) — it is skipped at run "
+                "time. Remove it or fix the path.",
+            ))
+        elif info.status == "external":
+            sym = (
+                " The entry is a symlink; its canonical target is mounted, not "
+                "the link itself." if info.is_symlink else ""
+            )
+            out.append((
+                "warn",
+                f"extra_add_dirs entry '{info.entry}' resolves outside the "
+                f"workspace to {info.canonical}; roles get read access to that "
+                f"host path.{sym} Prefer copying/sanitizing only the needed "
+                "context into the workspace so secrets outside the crew are not "
+                "exposed.",
+            ))
+    return out
+
+
 # ─────────────────────────── refresh ───────────────────────────
 def cmd_refresh(workspace: Path) -> int:
     """Force re-render agents/*.agent.md + AGENTS.md from templates + crew.yaml.
@@ -115,6 +151,14 @@ def cmd_refresh(workspace: Path) -> int:
         console.print(f"[red]no workspace at[/] {workspace}")
         return 1
     cfg = CrewConfig.load(ws.crew_yaml)
+    cfg_dirty = False
+
+    # ── migrate: retired crew.yaml schema (backend etc.) ──
+    # Unknown user keys are preserved across this save (config models allow
+    # extras), so the upgrade is non-destructive (#28).
+    for note in cfg.apply_migrations():
+        console.print(f"[blue]ℹ[/] {note}")
+        cfg_dirty = True
 
     # ── migrate: checkout/ → repo/ ──
     old_co = (ws.root / "checkout").resolve()
@@ -124,10 +168,12 @@ def cmd_refresh(workspace: Path) -> int:
         console.print(f"[blue]ℹ[/] migrated checkout/ → repo/")
     if cfg.target.repo == "./checkout":
         cfg.target.repo = "./repo"
-        cfg.save(ws.crew_yaml)
+        cfg_dirty = True
         console.print(f"[blue]ℹ[/] updated crew.yaml target.repo → ./repo")
     elif (ws.root / "repo").exists() or cfg.target.remote:
         # Touch-save once to canonicalize legacy keys (checkout→repo, repo→remote)
+        cfg_dirty = True
+    if cfg_dirty:
         cfg.save(ws.crew_yaml)
 
     # ── create worktrees if repo exists but worktrees don't ──
@@ -148,6 +194,9 @@ def cmd_refresh(workspace: Path) -> int:
     for role in ROLES:
         if role in cfg.roles:
             console.print(f"  [green]✓[/] {ws.role_cfg_dir(role) / 'AGENTS.md'}")
+    for sev, msg in _extra_dir_advisories(ws, cfg):
+        tag = "[yellow]warn[/]" if sev == "warn" else "[red]ERROR[/]"
+        console.print(f"  {tag} {msg}")
     console.print(f"[green]✓[/] refreshed")
     return 0
 
@@ -271,6 +320,27 @@ def cmd_doctor(workspace: Path) -> int:
         f"[green]✓[/] crew.yaml valid  ([bold]{cfg.name}[/], "
         f"backend=[cyan]{cfg.backend}[/], target=[cyan]{cfg.target.remote or '(unset)'}[/])"
     )
+
+    # Backend migration / SDK readiness (issue #28): distinguish a
+    # migration-required legacy workspace from a missing-SDK install from a
+    # runnable one. A pending schema migration is actionable via `crewd refresh`;
+    # only once the backend is the current SDK do we probe that the SDK imports.
+    pending = cfg.pending_migrations()
+    if pending:
+        for note in pending:
+            issues.append(("error", f"migration required — run `crewd refresh` ({note})"))
+    else:
+        try:
+            backend = get_backend(cfg.backend)
+        except ValueError as e:
+            issues.append(("error", str(e)))
+        else:
+            for e in backend.doctor():
+                issues.append(("error", e))
+
+    # External context declared via extra_add_dirs (issue #28).
+    for sev, msg in _extra_dir_advisories(ws, cfg):
+        issues.append((sev, msg))
 
     # Roles table
     roles_tbl = Table(title="roles", show_lines=False)
@@ -514,11 +584,21 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
             console.print(f"[red]family check:[/] {e}")
         return 2
 
+    # Backend / migration gate (issue #28): a legacy `backend: copilot` workspace
+    # is migration-required — refuse before any work with the exact action rather
+    # than a generic unknown-backend error.
+    if cfg.pending_migrations():
+        console.print(
+            "[red]backend: migration required[/] — this workspace still uses the "
+            "retired `backend: copilot` subprocess transport. Run "
+            "[bold]crewd refresh[/] to migrate to `copilot-sdk`, then "
+            "[bold]crewd doctor[/]."
+        )
+        return 2
     try:
         backend = get_backend(cfg.backend)
     except ValueError as e:
-        # Legacy `backend: copilot` (the retired subprocess transport) or an
-        # unknown backend: refuse before any work with a migration diagnostic.
+        # Unknown backend: refuse before any work with a diagnostic.
         console.print(f"[red]backend:[/] {e}")
         return 2
     bd_errs = backend.doctor()
@@ -526,6 +606,11 @@ def _preflight(workspace: Path, auto_render: bool) -> tuple[Workspace, CrewConfi
         for e in bd_errs:
             console.print(f"[red]backend:[/] {e}")
         return 2
+
+    # External context declared via extra_add_dirs is non-fatal but surfaced
+    # before the run so an operator sees exactly what host paths are exposed.
+    for _sev, msg in _extra_dir_advisories(ws, cfg):
+        console.print(f"[yellow]extra_add_dirs:[/] {msg}")
 
     co = ws.repo_dir(cfg.target.repo)
     if not co.exists():

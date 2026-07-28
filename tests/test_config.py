@@ -405,3 +405,60 @@ def test_get_backend_unknown_still_raises():
 
     with pytest.raises(ValueError):
         get_backend("nope")
+
+
+# ─── #28: retired-backend migration + unknown-key preservation ───
+def test_pending_migrations_flags_retired_backend():
+    cfg = default_config("demo", "acme/widget")
+    cfg.backend = "copilot"
+    pending = cfg.pending_migrations()
+    assert len(pending) == 1 and "copilot-sdk" in pending[0]
+    # current schema → nothing pending
+    cfg.backend = "copilot-sdk"
+    assert cfg.pending_migrations() == []
+
+
+def test_apply_migrations_upgrades_retired_backend_idempotently():
+    cfg = default_config("demo", "acme/widget")
+    cfg.backend = "copilot"
+    applied = cfg.apply_migrations()
+    assert cfg.backend == "copilot-sdk"
+    assert len(applied) == 1
+    # idempotent: a second application is a no-op
+    assert cfg.apply_migrations() == []
+    assert cfg.backend == "copilot-sdk"
+
+
+def test_unknown_user_keys_survive_save_load_roundtrip(tmp_path: Path):
+    cfg = default_config("demo", "acme/widget")
+    # Attach unknown top-level + nested keys as a real legacy workspace might.
+    import yaml
+    p = tmp_path / "crew.yaml"
+    cfg.save(p)
+    raw = yaml.safe_load(p.read_text())
+    raw["notify_webhook"] = "https://example/hook"
+    raw["custom"] = {"a": 1, "b": [2, 3]}
+    raw["target"]["legacy_note"] = "keep me"
+    p.write_text(yaml.safe_dump(raw))
+
+    reloaded = CrewConfig.load(p)
+    reloaded.apply_migrations()   # a migration must not drop unknown data
+    reloaded.save(p)
+    out = yaml.safe_load(p.read_text())
+    assert out["notify_webhook"] == "https://example/hook"
+    assert out["custom"] == {"a": 1, "b": [2, 3]}
+    assert out["target"]["legacy_note"] == "keep me"
+
+
+def test_retired_backend_still_loads_for_migration(tmp_path: Path):
+    import yaml
+    cfg = default_config("demo", "acme/widget")
+    p = tmp_path / "crew.yaml"
+    cfg.save(p)
+    raw = yaml.safe_load(p.read_text())
+    raw["backend"] = "copilot"
+    p.write_text(yaml.safe_dump(raw))
+    # Must parse (not reject) so refresh can migrate it.
+    loaded = CrewConfig.load(p)
+    assert loaded.backend == "copilot"
+    assert loaded.pending_migrations()

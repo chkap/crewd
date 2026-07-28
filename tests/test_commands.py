@@ -417,3 +417,129 @@ def test_cmd_refresh_migrates_checkout_to_repo(tmp_ws: Workspace):
     assert reloaded.target.repo == "./repo"             # was under `checkout:` key
     assert (tmp_ws.root / "repo").exists()
     assert not (tmp_ws.root / "checkout").exists()
+
+
+# ─── #28: legacy-backend refresh/doctor/run migration end-to-end ───
+def _make_legacy(tmp_ws: Workspace, *, unknown: bool = True) -> dict:
+    """Downgrade tmp_ws crew.yaml to the retired backend + unknown user keys."""
+    import yaml
+    raw = yaml.safe_load(tmp_ws.crew_yaml.read_text())
+    raw["backend"] = "copilot"
+    if unknown:
+        raw["notify_webhook"] = "https://example/hook"
+        raw["custom_block"] = {"k": [1, 2, 3]}
+    tmp_ws.crew_yaml.write_text(yaml.safe_dump(raw, sort_keys=False))
+    return raw
+
+
+def test_refresh_migrates_retired_backend_preserving_state(tmp_ws: Workspace):
+    import yaml
+    _make_legacy(tmp_ws)
+    # Realistic workspace state that must survive a refresh untouched:
+    from crewd.config import GoalState
+    GoalState(version=2, label="goal:v2", cycles=5, goal_md_sha256="deadbeef").save(tmp_ws.goal_json)
+    tmp_ws.stop("completed")                       # STOPPED sentinel
+    (tmp_ws.role_cfg_dir("worker") / "session-state").mkdir(parents=True, exist_ok=True)
+    (tmp_ws.role_cfg_dir("worker") / "session-state" / "s.json").write_text("{}")
+    # Dispatcher / public-bus durable state lives under state/ — must be preserved.
+    marker = tmp_ws.state_dir / "public_writes" / "journal.jsonl"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"intent":"x"}\n')
+
+    rc = commands.cmd_refresh(tmp_ws.root)
+    assert rc == 0
+
+    out = yaml.safe_load(tmp_ws.crew_yaml.read_text())
+    assert out["backend"] == "copilot-sdk"                       # migrated
+    assert out["notify_webhook"] == "https://example/hook"       # unknown preserved
+    assert out["custom_block"] == {"k": [1, 2, 3]}
+    # workspace/dispatcher state untouched
+    assert tmp_ws.is_stopped()
+    reloaded_goal = GoalState.load(tmp_ws.goal_json)
+    assert reloaded_goal.cycles == 5 and reloaded_goal.label == "goal:v2"
+    assert (tmp_ws.role_cfg_dir("worker") / "session-state" / "s.json").exists()
+    assert marker.read_text() == '{"intent":"x"}\n'
+
+
+def test_refresh_is_idempotent_on_current_workspace(tmp_ws: Workspace, capsys):
+    _make_legacy(tmp_ws, unknown=False)
+    assert commands.cmd_refresh(tmp_ws.root) == 0
+    capsys.readouterr()
+    # second refresh: already-current, no migration note emitted
+    assert commands.cmd_refresh(tmp_ws.root) == 0
+    out = capsys.readouterr().out
+    assert "backend: copilot → copilot-sdk" not in out
+    import yaml
+    assert yaml.safe_load(tmp_ws.crew_yaml.read_text())["backend"] == "copilot-sdk"
+
+
+def test_refresh_preserves_paused_state(tmp_ws: Workspace):
+    _make_legacy(tmp_ws, unknown=False)
+    tmp_ws.pause("waiting on operator")
+    assert commands.cmd_refresh(tmp_ws.root) == 0
+    assert tmp_ws.is_paused()
+    assert tmp_ws.pause_reason().strip() == "waiting on operator"
+
+
+def test_doctor_migration_required_message(tmp_ws: Workspace, capsys, monkeypatch):
+    _make_legacy(tmp_ws, unknown=False)
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
+    commands.cmd_doctor(tmp_ws.root)
+    out = capsys.readouterr().out
+    assert "migration required" in out
+    assert "crewd refresh" in out
+    # must NOT be mis-reported as a missing-SDK problem
+    assert "not importable" not in out
+
+
+def test_doctor_reports_missing_sdk_distinctly(tmp_ws: Workspace, capsys, monkeypatch):
+    # Backend is already current; the SDK import is what's missing.
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
+    import crewd.sdk_adapter as sdk
+    monkeypatch.setattr(sdk, "sdk_available", lambda: False)
+    rc = commands.cmd_doctor(tmp_ws.root)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "not importable" in out            # missing-SDK message
+    assert "migration required" not in out    # distinct from migration state
+
+
+def test_run_migration_required_refuses_with_action(tmp_ws: Workspace, capsys):
+    _make_legacy(tmp_ws, unknown=False)
+    rc = commands.cmd_run(tmp_ws.root, once=True, role=None)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "migration required" in out and "crewd refresh" in out
+
+
+def test_doctor_warns_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
+    outside = tmp_path / "secrets"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    commands._render_agent_files(tmp_ws, cfg)
+    monkeypatch.setattr(commands, "get_backend", lambda _n: _StubBackend(healthy=True))
+    monkeypatch.setattr(commands.subprocess, "run", _fake_gh_ok)
+    commands.cmd_doctor(tmp_ws.root)
+    out = capsys.readouterr().out
+    assert "resolves outside the workspace" in out
+    assert "copying/sanitizing" in out
+
+
+def test_run_preflight_warns_on_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
+    outside = tmp_path / "extern"
+    outside.mkdir()
+    cfg = CrewConfig.load(tmp_ws.crew_yaml)
+    cfg.extra_add_dirs = [str(outside)]
+    cfg.save(tmp_ws.crew_yaml)
+    monkeypatch.setattr(commands, "get_backend", lambda _n: _StubBackend(healthy=True))
+    result = commands._preflight(tmp_ws.root, auto_render=False)
+    out = capsys.readouterr().out
+    # non-fatal: preflight still succeeds but the advisory is printed
+    assert isinstance(result, tuple)
+    assert "extra_add_dirs" in out and "resolves outside the workspace" in out
