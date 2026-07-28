@@ -30,10 +30,19 @@ class FakeGitHubClient:
         # Fault injection: map method name -> list of GitHubError to raise (popped
         # per call, so you can script "fail once then succeed" retry sequences).
         self.faults: dict[str, list[GitHubError]] = {}
+        # Persistent faults: method name -> a GitHubError raised on EVERY call
+        # (models a sustained outage), checked after the one-shot ``faults`` queue.
+        self.persistent_faults: dict[str, GitHubError] = {}
         # When set, create_comment appends the comment to storage BUT still raises
         # (models an ambiguous write that actually landed).
         self.ambiguous_but_landed = False
         self.create_calls = 0
+        # When set to k, create_comment succeeds for the first k calls then raises
+        # ``create_fail_error`` on every later call — models an outage that begins
+        # *after* an initial successful write (e.g. the Lead dispatch artifact
+        # lands, then the boundary goes down before the role handoff write).
+        self.create_fail_after: Optional[int] = None
+        self.create_fail_error = GitHubError(GitHubErrorKind.TIMEOUT, "outage")
 
     # -- programming helpers --
     def add_issue(self, number: int, title: str, *, state: str = "open",
@@ -58,11 +67,18 @@ class FakeGitHubClient:
     def fail_once(self, method: str, kind: GitHubErrorKind, detail: str = "x") -> None:
         self.faults.setdefault(method, []).append(GitHubError(kind, detail))
 
+    def always_fail(self, method: str, kind: GitHubErrorKind, detail: str = "x") -> None:
+        """Persistently fail ``method`` on every call (models a sustained outage)."""
+        self.persistent_faults[method] = GitHubError(kind, detail)
+
     # -- internal --
     def _maybe_fault(self, method: str) -> None:
         queue = self.faults.get(method)
         if queue:
             raise queue.pop(0)
+        persistent = self.persistent_faults.get(method)
+        if persistent is not None:
+            raise persistent
 
     def _store_comment(self, target: str, number: int, body: str) -> CommentRef:
         cid = self._next_comment_id
@@ -121,4 +137,9 @@ class FakeGitHubClient:
                 self._store_comment(target, number, body)
             queue.pop(0)
             raise err
+        persistent = self.persistent_faults.get("create_comment")
+        if persistent is not None:
+            raise persistent
+        if self.create_fail_after is not None and self.create_calls > self.create_fail_after:
+            raise self.create_fail_error
         return self._store_comment(target, number, body)

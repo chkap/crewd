@@ -142,6 +142,11 @@ class DiagnosticSnapshot:
     exit_reason: Optional[str] = None
     current_session_tainted: bool = False
 
+    # public-write durability + operator inbox delivery (issue #29 observability)
+    public_writes: Optional[dict] = None             # {'pending': n, 'verified': n, 'pending_ids': [...]}
+    inbox: Optional[dict] = None                     # per-role {'pending','delivering','processed'}
+    recovery_action: Optional[str] = None            # operator-facing recovery hint, if any
+
     # derived
     contradictions: list[str] = field(default_factory=list)
     next_action: NextAction = NextAction.NO_JOURNAL
@@ -168,6 +173,9 @@ class DiagnosticSnapshot:
             "current_attempt": self.current_attempt,
             "latest_handoff": self.latest_handoff,
             "latest_decision": self.latest_decision,
+            "public_writes": self.public_writes,
+            "inbox": self.inbox,
+            "recovery_action": self.recovery_action,
             "controls": {
                 "daemon_pid": self.daemon_pid,
                 "daemon_alive": self.daemon_alive,
@@ -271,6 +279,61 @@ def _derive_next_action(diag: RunDiagnostics, *, daemon_alive: bool, tainted: bo
     return (NextAction.DOCTOR, f"Unrecognized run status {status!r} — run `crewd doctor`.")
 
 
+def _public_write_state(ws: Workspace) -> Optional[dict]:
+    """Durable public-write journal counts (offline; reads state, no GitHub)."""
+    try:
+        from .public_writer import IntentStore
+
+        store = IntentStore.for_workspace(ws)
+        counts = store.counts()
+        if counts["pending"] == 0 and counts["verified"] == 0:
+            return None
+        pending_ids = [i.correlation_id for i in store.list_pending()]
+        return {
+            "pending": counts["pending"],
+            "verified": counts["verified"],
+            "pending_ids": pending_ids,
+        }
+    except Exception:
+        return None
+
+
+def _inbox_state(ws: Workspace) -> Optional[dict]:
+    """Per-role operator-inbox delivery counts (content never surfaced)."""
+    try:
+        from .github_bus import ROLES
+        from .inbox import InboxService
+
+        svc = InboxService.for_workspace(ws)
+        out = {}
+        for role in ROLES:
+            counts = svc.counts(role)
+            if any(counts.values()):
+                out[role] = counts
+        return out or None
+    except Exception:
+        return None
+
+
+def _recovery_hint(public_writes: Optional[dict], inbox: Optional[dict]) -> Optional[str]:
+    """A single operator-facing recovery hint derived from durable side-channels."""
+    hints = []
+    if public_writes and public_writes.get("pending"):
+        n = public_writes["pending"]
+        hints.append(
+            f"{n} public write(s) reserved but unverified — a `crewd run` "
+            "reconciles them once GitHub is reachable."
+        )
+    if inbox:
+        delivering = sum(v.get("delivering", 0) for v in inbox.values())
+        if delivering:
+            hints.append(
+                f"{delivering} operator message(s) staged for an in-flight attempt "
+                "— they will be archived once the attempt terminalises."
+            )
+    return " ".join(hints) or None
+
+
 def build_snapshot(ws: Workspace, *, crew_name: str, backend: str,
                    goal_label: Optional[str]) -> DiagnosticSnapshot:
     """Build the operator diagnostic snapshot. Never mutates any state."""
@@ -292,7 +355,10 @@ def build_snapshot(ws: Workspace, *, crew_name: str, backend: str,
         stopped=stopped,
         paused_reason=paused_reason,
         exit_reason=exit_reason,
+        public_writes=_public_write_state(ws),
+        inbox=_inbox_state(ws),
     )
+    base["recovery_action"] = _recovery_hint(base["public_writes"], base["inbox"])
 
     diag = _read_run_diagnostics(ws, goal_label)
     if diag is None:
