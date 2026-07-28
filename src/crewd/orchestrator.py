@@ -57,6 +57,7 @@ from .dispatcher import (
     RunStatus,
 )
 from .executor import AttemptExecutor, AttemptRequest, resolve_role_terminal
+from .github_bus import Route
 from .inbox import InboxService
 from .session_backend import CancelToken
 from .workspace import Workspace
@@ -100,6 +101,7 @@ class Orchestrator:
         taint_orphan: Optional[Callable[[str, int, str], None]] = None,
         prompt_policy: object | None = None,
         inbox: InboxService | None = None,
+        bus_gate: object | None = None,
     ):
         self.ws = ws
         self.cfg = cfg
@@ -109,6 +111,11 @@ class Orchestrator:
         # model best effort, reads/attaches/archives operator messages so an
         # OVERRIDE cannot be silently skipped. Injectable for deterministic tests.
         self._inbox = inbox or InboxService.for_workspace(ws)
+        # Public-bus transaction boundary (issue #29): an optional gate that must
+        # verify GitHub prerequisites before a Worker/Verifier attempt is
+        # reserved. Default None keeps production inert until a client is wired,
+        # so authority routing is unchanged when no boundary is configured.
+        self._bus_gate = bus_gate
         # Gated, test-only seam (default None → fully inert in production). When a
         # live-smoke policy is injected it may append a bounded instruction suffix
         # to the *production-rendered* role/Lead prompts and observe (not replace)
@@ -280,6 +287,13 @@ class Orchestrator:
             # journal; refuse to launch and let restart reconciliation handle it.
             console.print(f"[red]dispatch targets unconfigured role {role!r}; skipping[/]")
             return
+        # Public-bus prerequisite gate (issue #29): before reserving the attempt,
+        # verify the GitHub record satisfies the invariant for routing this role.
+        # A non-PROCEED outcome halts the run (durable PAUSE with a descriptive
+        # public-bus blocker) WITHOUT reserving the attempt or consuming a pending
+        # handoff — authority never advances on an invalid/unverifiable record.
+        if not self._bus_gate_ok(run_id, role, dsp):
+            return
         try:
             attempt_id = self.disp.reserve_attempt(run_id, dispatch_id, role)
         except BudgetExhausted:
@@ -321,6 +335,35 @@ class Orchestrator:
         # Attempt is durably terminal → archive the delivered operator inbox.
         self._inbox.acknowledge(role, attempt_id)
         self._persist_cycle()
+
+    def _bus_gate_ok(self, run_id: str, role: str, dsp: object) -> bool:
+        """Consult the public-bus gate (if any) before reserving an attempt.
+
+        Returns True to proceed with the dispatch. On a non-``PROCEED`` outcome it
+        marks the run PAUSED with a descriptive public-bus blocker (preserving the
+        wait/reject/permission distinction operationally) and returns False, so no
+        attempt is reserved and no handoff is consumed. A gate that raises does
+        not silently pass: the run pauses with the error so the failure is
+        operator-visible rather than internal-only.
+        """
+        gate = self._bus_gate
+        if gate is None:
+            return True
+        try:
+            outcome = gate.evaluate(role, dsp)
+        except Exception as exc:  # boundary bug must not fake success
+            self._safe_mark(run_id, RunStatus.PAUSED, f"public-bus gate error: {exc}")
+            console.print(f"[red]public-bus gate raised for {role}: {exc}; run paused[/]")
+            return False
+        if outcome is None or outcome.route is Route.PROCEED:
+            return True
+        blocker = f"public-bus {outcome.route.value}: {outcome.detail}"
+        self._safe_mark(run_id, RunStatus.PAUSED, blocker)
+        console.print(
+            f"[yellow]public-bus gate blocked {role} dispatch ({outcome.route.value}): "
+            f"{outcome.detail}; run paused[/]"
+        )
+        return False
 
     def _on_started(self, attempt_id: str):
         """Return the pre-send journaling callback for an in-flight attempt.
