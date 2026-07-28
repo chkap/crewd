@@ -408,3 +408,31 @@ def test_build_snapshot_does_not_clear_stale_pid(tmp_ws):
     assert snap.daemon_alive is False
     # read-only: the stale PID file must survive a status projection
     assert tmp_ws.read_pid() == 999999
+
+
+# ───────────────── public-write / inbox observability (#29) ─────────────────
+def test_snapshot_surfaces_pending_public_write(tmp_ws):
+    """A reserved-but-unverified public write intent surfaces in the snapshot with
+    a recovery hint, without leaking body content."""
+    _label(tmp_ws)
+    from crewd.public_writer import IntentStore, WriteIntent
+
+    store = IntentStore.for_workspace(tmp_ws)
+    store.reserve(WriteIntent(
+        correlation_id="h1", role="worker", target_role="verifier",
+        target="issue", number=29, body="secret readiness body",
+    ))
+    snap = _snap(tmp_ws)
+    assert snap.public_writes == {"pending": 1, "verified": 0, "pending_ids": ["h1"]}
+    assert snap.recovery_action and "public write" in snap.recovery_action
+    # to_dict is stable and never carries the write body.
+    d = snap.to_dict()
+    assert d["public_writes"]["pending"] == 1
+    assert "secret readiness body" not in str(d)
+
+
+def test_snapshot_public_write_none_when_empty(tmp_ws):
+    _label(tmp_ws)
+    snap = _snap(tmp_ws)
+    assert snap.public_writes is None
+    assert snap.recovery_action is None

@@ -361,6 +361,29 @@ def cmd_doctor(workspace: Path) -> int:
         in_tbl.add_row(role, str(pending), str(delivering), str(processed))
     console.print(in_tbl)
 
+    # Public-write durability table (issue #29): reserved-but-unverified intents
+    # are recoverable side effects a `crewd run` reconciles; surface them so an
+    # operator can see a stuck/offline write without reading the journal by hand.
+    try:
+        from .public_writer import IntentStore
+
+        store = IntentStore.for_workspace(ws)
+        counts = store.counts()
+        if counts["pending"] or counts["verified"]:
+            pw_tbl = Table(title="public writes")
+            pw_tbl.add_column("state"); pw_tbl.add_column("count")
+            pw_tbl.add_row("verified", str(counts["verified"]))
+            pw_tbl.add_row("reserved (unverified)", str(counts["pending"]))
+            console.print(pw_tbl)
+            if counts["pending"]:
+                issues.append((
+                    "warn",
+                    f"{counts['pending']} public write(s) reserved but unverified — "
+                    "`crewd run` reconciles them once GitHub is reachable.",
+                ))
+    except Exception:
+        pass
+
     # Recent activity
     logs_root = ws.state_dir / "logs"
     recent: list[tuple[Path, float]] = []
@@ -564,6 +587,32 @@ def _build_bus_gate(cfg: CrewConfig, goal_state: GoalState):
     return PublicBusGate(bus)
 
 
+def _build_publisher(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
+    """Construct the default-on durable public-write publisher for a normal run.
+
+    Wires ``CliGitHubClient`` → ``PublicBus`` → ``PublicWriter`` with a durable
+    intent journal under ``state/public_writes`` so a plain ``crewd run`` publishes
+    every material role handoff / Lead decision as a verified GitHub artifact
+    exactly once, reconciling on restart (issue #29). Inert under the same guard as
+    the gate: no remote, or ``CREWD_DISABLE_PUBLIC_BUS`` set.
+    """
+    if os.environ.get("CREWD_DISABLE_PUBLIC_BUS"):
+        return None
+    client = _make_github_client(cfg)
+    if client is None:
+        return None
+    from .github_bus import PublicBus
+    from .public_writer import IntentStore, PublicWriter
+
+    bus = PublicBus(
+        client,
+        crew=cfg.name,
+        expected_repo=cfg.target.remote,
+        goal_label=goal_state.label or "goal:v1",
+    )
+    return PublicWriter(bus, IntentStore.for_workspace(ws))
+
+
 def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
     from .orchestrator import Orchestrator
 
@@ -578,8 +627,10 @@ def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
 
         prompt_policy = SmokePromptPolicy.from_env()
     bus_gate = _build_bus_gate(cfg, goal_state)
+    publisher = _build_publisher(ws, cfg, goal_state)
     return Orchestrator(
-        ws, cfg, executor, goal_state, prompt_policy=prompt_policy, bus_gate=bus_gate
+        ws, cfg, executor, goal_state, prompt_policy=prompt_policy,
+        bus_gate=bus_gate, publisher=publisher,
     )
 
 
@@ -857,6 +908,25 @@ def cmd_status(workspace: Path, as_json: bool = False) -> int:
     table.add_row("paused", snap.paused_reason or "no")
     if snap.exit_reason:
         table.add_row("last exit-reason", snap.exit_reason)
+
+    # Public-write durability + operator inbox delivery (issue #29 observability).
+    if snap.public_writes is not None:
+        pw = snap.public_writes
+        pending = pw.get("pending", 0)
+        val = f"{pw.get('verified', 0)} verified"
+        if pending:
+            val += f", [yellow]{pending} unverified[/]"
+        table.add_row("public writes", val)
+    if snap.inbox:
+        delivered = sum(v.get("delivering", 0) for v in snap.inbox.values())
+        processed = sum(v.get("processed", 0) for v in snap.inbox.values())
+        pending_in = sum(v.get("pending", 0) for v in snap.inbox.values())
+        table.add_row(
+            "operator inbox",
+            f"{pending_in} pending · {delivered} delivering · {processed} processed",
+        )
+    if snap.recovery_action:
+        table.add_row("recovery", snap.recovery_action)
 
     for r in ROLES:
         if r in cfg.roles:

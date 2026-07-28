@@ -59,6 +59,7 @@ from .dispatcher import (
 from .executor import AttemptExecutor, AttemptRequest, resolve_role_terminal
 from .github_bus import Route
 from .inbox import InboxService
+from .public_writer import is_material_handoff
 from .session_backend import CancelToken
 from .workspace import Workspace
 
@@ -102,6 +103,7 @@ class Orchestrator:
         prompt_policy: object | None = None,
         inbox: InboxService | None = None,
         bus_gate: object | None = None,
+        publisher: object | None = None,
     ):
         self.ws = ws
         self.cfg = cfg
@@ -116,6 +118,15 @@ class Orchestrator:
         # reserved. Default None keeps production inert until a client is wired,
         # so authority routing is unchanged when no boundary is configured.
         self._bus_gate = bus_gate
+        # Durable attributed public-write publisher (issue #29): publishes every
+        # material role handoff / Lead decision as a verified GitHub artifact
+        # exactly once, with a durable intent journal + restart reconciliation.
+        # Default None keeps production inert until a client is wired, so authority
+        # routing is unchanged when no publisher is configured. When present the
+        # orchestrator (a) publishes material role handoffs at their terminal, (b)
+        # reconciles pending intents on run start, and (c) refuses to consume a
+        # material handoff whose public artifact is not yet verified.
+        self._publisher = publisher
         # Gated, test-only seam (default None → fully inert in production). When a
         # live-smoke policy is injected it may append a bounded instruction suffix
         # to the *production-rendered* role/Lead prompts and observe (not replace)
@@ -182,6 +193,13 @@ class Orchestrator:
         # is finalized, so a crashed in-flight generation is never resumed
         # normally (recovery advances to a fresh generation).
         self.disp.reconcile_on_restart(run.id, taint_orphan=self._taint_orphan)
+
+        # Reconcile durable public-write intents left reserved by a crash between
+        # "post intended" and "post verified" (issue #29, GOAL #5). Idempotent via
+        # the correlation marker, so a landed write is not double-posted. Best
+        # effort: a still-unavailable GitHub leaves the intent reserved and surfaces
+        # in status/doctor; it does not abort the run.
+        self._reconcile_public_writes()
 
         steps = 0
         while True:
@@ -271,7 +289,7 @@ class Orchestrator:
         # authority to Lead with the same pending handoffs intact — and the run is
         # paused with the descriptive blocker below.
         decision = turn.decision
-        gate_blocker = self._decision_gate_block(decision)
+        gate_blocker = self._decision_gate_block(decision, pending)
         if gate_blocker is not None:
             decision = None
         result = self.disp.resolve_lead_solicitation(
@@ -289,6 +307,12 @@ class Orchestrator:
         # retry (GOAL.md inbox retry invariant, issue #29).
         if not result.solicitation_invalid:
             self._inbox.acknowledge("lead", sol.attempt_id)
+            # Publish the applied Lead routing decision as an attributed artifact
+            # (issue #29, GOAL #2). Best-effort/observability: a failure leaves a
+            # durable reserved intent for reconciliation and never rolls back the
+            # already-applied decision.
+            if gate_blocker is None:
+                self._publish_lead_decision(decision, result)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
         if gate_blocker is not None:
@@ -344,7 +368,7 @@ class Orchestrator:
         terminal = resolve_role_terminal(
             result, outcome.handoff, outcome.handoff_submissions
         )
-        self.disp.record_terminal(
+        handoff_id = self.disp.record_terminal(
             attempt_id,
             result.outcome,
             outcome_class=terminal.outcome_class,
@@ -355,9 +379,91 @@ class Orchestrator:
             disagreement=terminal.disagreement,
             blocker=terminal.blocker,
         )
+        # Publish the role's material handoff as a verified GitHub artifact keyed
+        # by the durable handoff id (issue #29, GOAL #2). Best-effort here: a
+        # publish failure leaves a durable reserved intent (reconciled on restart)
+        # and does NOT terminalise-block the attempt. The consume-time enforcement
+        # in `_decision_gate_block` is what guarantees Lead cannot ack a material
+        # handoff whose artifact is not yet verified.
+        self._publish_role_handoff(handoff_id, role, terminal)
         # Attempt is durably terminal → archive the delivered operator inbox.
         self._inbox.acknowledge(role, attempt_id)
         self._persist_cycle()
+
+    def _publish_lead_decision(self, decision: object, result: object) -> None:
+        """Publish an applied Lead *dispatch* decision as an attributed artifact.
+
+        Only a dispatch (Lead → a role) is a material inter-role communication;
+        continue-lead/wait/pause/finish are Lead-internal or handled by the
+        finish-prerequisite record. Best-effort and non-blocking.
+        """
+        publisher = self._publisher
+        if publisher is None or decision is None:
+            return
+        if getattr(decision, "kind", None) is not DecisionKind.DISPATCH:
+            return
+        dispatch = getattr(result, "dispatch", None)
+        decision_id = getattr(dispatch, "id", None)
+        if not decision_id:
+            return
+        try:
+            publisher.publish_lead_decision(
+                decision_id=decision_id, kind="dispatch",
+                target_role=getattr(decision, "role", "") or "",
+                reason=getattr(decision, "reason", "") or "",
+            )
+        except Exception as exc:  # a publish bug must not abort the run
+            console.print(f"[yellow]public-write lead decision error: {exc}[/]")
+
+    def _reconcile_public_writes(self) -> None:
+        """Finish any durable public-write intents left reserved by a crash."""
+        publisher = self._publisher
+        if publisher is None:
+            return
+        try:
+            results = publisher.reconcile()
+        except Exception as exc:  # reconciliation must never abort the run
+            console.print(f"[yellow]public-write reconcile error: {exc}[/]")
+            return
+        pending = [r for r in results if not r.verified]
+        if pending:
+            console.print(
+                f"[yellow]{len(pending)} public write(s) still unverified after "
+                "reconcile; see status/doctor[/]"
+            )
+
+    def _publish_role_handoff(self, handoff_id: str, role: str, terminal: object):
+        """Publish a role's material handoff as a verified GitHub artifact.
+
+        ``terminal`` is any object exposing the handoff fields (a
+        :class:`~crewd.executor.RoleTerminal` at record time or a
+        :class:`~crewd.dispatcher.HandoffView` at consume time). Returns the
+        :class:`~crewd.public_writer.PublishOutcome`, or ``None`` when no publisher
+        is wired or the handoff is a private ``no_progress`` (not material).
+        """
+        publisher = self._publisher
+        if publisher is None:
+            return None
+        oc = getattr(terminal, "outcome_class", "")
+        oc = getattr(oc, "value", oc)
+        reason = getattr(terminal, "reason_returned", "") or ""
+        if not is_material_handoff(
+            oc,
+            evidence=terminal.evidence, changed=terminal.changed,
+            remaining=terminal.remaining, disagreement=terminal.disagreement,
+            blocker=terminal.blocker,
+        ):
+            return None
+        try:
+            return publisher.publish_role_handoff(
+                handoff_id=handoff_id, role=role, outcome_class=oc,
+                evidence=terminal.evidence, changed=terminal.changed,
+                remaining=terminal.remaining, reason=reason,
+                disagreement=terminal.disagreement, blocker=terminal.blocker,
+            )
+        except Exception as exc:  # a publish bug must not fake a verified write
+            console.print(f"[yellow]public-write publish error ({role}): {exc}[/]")
+            return None
 
     def _bus_gate_ok(self, run_id: str, role: str, dsp: object) -> bool:
         """Consult the public-bus gate (if any) before reserving an attempt.
@@ -377,24 +483,75 @@ class Orchestrator:
         )
         return False
 
-    def _decision_gate_block(self, decision: object) -> Optional[str]:
+    def _decision_gate_block(self, decision: object, pending: list | None = None) -> Optional[str]:
         """Return a public-bus blocker for a Lead decision that would advance
         authority, or ``None`` to allow it.
 
         Called BEFORE the decision is applied, so a blocked dispatch/finish never
         acks the decision's pending handoffs or transfers authority. A dispatch to
         Worker/Verifier is validated against the record; a ``finish`` is validated
-        against the final-acceptance record. All other decisions (continue-lead,
-        wait, pause, dispatch to other roles) are unrelated to the public-bus
-        prerequisite and always allowed.
+        against the final-acceptance record. Independently, *any* decision that
+        would acknowledge a material role handoff (GOAL #2) is refused until that
+        handoff's public artifact is verified — so an internal handoff is never
+        consumed while its public record is missing (a crashed/unavailable public
+        write must not become a silently-completed handoff). All other checks
+        (continue-lead, wait, pause, dispatch to other roles) are unrelated to the
+        public-bus prerequisite and always allowed.
         """
         if decision is None:
             return None
+        # Consume-time enforcement: a material handoff may not be acked until its
+        # public artifact is verified. Runs for every decision kind that acks
+        # handoffs (dispatch, continue-lead, wait, pause, finish).
+        material_blocker = self._material_handoff_block(decision, pending)
+        if material_blocker is not None:
+            return material_blocker
         kind = getattr(decision, "kind", None)
         if kind is DecisionKind.DISPATCH:
             return self._dispatch_gate_block(getattr(decision, "role", None) or "")
         if kind is DecisionKind.FINISH:
             return self._finish_gate_block()
+        return None
+
+    def _material_handoff_block(self, decision: object, pending: list | None) -> Optional[str]:
+        """Refuse a decision that would ack a material handoff whose public
+        artifact is not yet verified.
+
+        Only active when a publisher is wired (production-inert otherwise). For
+        each acknowledged handoff that :func:`is_material_handoff` classifies as
+        material, the durable intent journal must show a verified artifact; if a
+        publish was deferred by a prior GitHub outage this attempts to finish it
+        first (reconcile), and only blocks if it still cannot verify. A block drops
+        the decision, so the handoff stays pending (no consumption) until the
+        artifact lands.
+        """
+        publisher = self._publisher
+        if publisher is None:
+            return None
+        ack_ids = set(getattr(decision, "ack_handoff_ids", ()) or ())
+        if not ack_ids:
+            return None
+        by_id = {h.id: h for h in (pending or [])}
+        for hid in ack_ids:
+            handoff = by_id.get(hid)
+            if handoff is None:
+                continue
+            if not is_material_handoff(
+                getattr(handoff.outcome_class, "value", handoff.outcome_class),
+                evidence=handoff.evidence, changed=handoff.changed,
+                remaining=handoff.remaining, disagreement=handoff.disagreement,
+                blocker=handoff.blocker,
+            ):
+                continue
+            if publisher.is_verified(hid):
+                continue
+            # Deferred/failed earlier — try to finish the publish now.
+            outcome = self._publish_role_handoff(hid, handoff.role, handoff)
+            if outcome is not None and outcome.verified:
+                continue
+            detail = outcome.detail if outcome is not None else "not published"
+            return (f"public-bus write unverified for {handoff.role} handoff "
+                    f"{hid}: {detail}")
         return None
 
     def _dispatch_gate_block(self, role: str) -> Optional[str]:
