@@ -607,24 +607,39 @@ class PublicBusGate:
     run, so authority never advances on an invalid or unverifiable public record.
 
     ``task_number`` may be supplied to pin a specific task (used by focused unit
-    tests); when omitted the active task is derived from the public record via
-    :meth:`PublicBus.resolve_active_task`, so production never hard-codes an
-    identifier.
+    tests). In production the orchestrator passes the exact routed task —
+    persisted with the dispatch — into :meth:`evaluate`, so the invariant is
+    validated against the *bound* task rather than a later global re-census of
+    the public record (issue #47). When neither an explicit task nor a pin is
+    available the active task is derived from the public record via
+    :meth:`PublicBus.resolve_active_task` as a legacy fallback.
     """
 
     def __init__(self, bus: PublicBus, *, task_number: Optional[int] = None):
         self.bus = bus
         self._fixed_task = task_number
 
-    def _resolve_task(self) -> PrereqOutcome:
-        if self._fixed_task is not None:
-            return PrereqOutcome.proceed(f"task #{self._fixed_task}", task=self._fixed_task)
+    def _resolve_task(self, task_number: Optional[int] = None) -> PrereqOutcome:
+        # Priority: the exact routed task carried by the dispatch/decision >
+        # a unit-test pin > the legacy global census. Production always supplies
+        # the routed task, so the ambiguous MULTIPLE census never gates a run.
+        pinned = task_number if task_number is not None else self._fixed_task
+        if pinned is not None:
+            return PrereqOutcome.proceed(f"task #{pinned}", task=pinned)
         return self.bus.resolve_active_task()
 
-    def evaluate(self, role: str, dsp: object) -> Optional[PrereqOutcome]:
+    def evaluate(
+        self, role: str, dsp: object, *, task_number: Optional[int] = None
+    ) -> Optional[PrereqOutcome]:
         if role not in ("worker", "verifier"):
             return None
-        task = self._resolve_task()
+        # Prefer an explicit routed task; else fall back to the dispatch's
+        # persisted binding (defense-in-depth for a dispatch resurrected from the
+        # journal after a restart).
+        bound = task_number
+        if bound is None:
+            bound = getattr(dsp, "task_number", None)
+        task = self._resolve_task(bound)
         if not task.ok:
             return task
         number = task.refs["task"]

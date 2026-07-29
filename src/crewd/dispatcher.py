@@ -151,10 +151,20 @@ class LeadDecision:
     wake_condition: Optional[str] = None  # for WAIT
     human_blocker: Optional[str] = None   # for PAUSE
     final_acceptance: Optional[str] = None  # for FINISH
+    task_number: Optional[int] = None     # the exact crewd:task this DISPATCH targets
 
     @staticmethod
-    def dispatch(role: str, *, ack: tuple[str, ...] = (), reason: str | None = None) -> "LeadDecision":
-        return LeadDecision(DecisionKind.DISPATCH, ack_handoff_ids=ack, role=role, reason=reason)
+    def dispatch(
+        role: str,
+        *,
+        ack: tuple[str, ...] = (),
+        reason: str | None = None,
+        task_number: int | None = None,
+    ) -> "LeadDecision":
+        return LeadDecision(
+            DecisionKind.DISPATCH, ack_handoff_ids=ack, role=role, reason=reason,
+            task_number=task_number,
+        )
 
     @staticmethod
     def continue_lead(*, ack: tuple[str, ...] = (), reason: str | None = None) -> "LeadDecision":
@@ -203,6 +213,7 @@ class DispatchView:
     role: Optional[str]
     reason: Optional[str]
     created_at: str
+    task_number: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -327,6 +338,7 @@ CREATE TABLE IF NOT EXISTS dispatch (
     kind TEXT NOT NULL,
     role TEXT,
     reason TEXT,
+    task_number INTEGER,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS attempt (
@@ -403,7 +415,7 @@ class Dispatcher:
         self._migrate()
 
     # Bump when a schema change needs an in-place migration of existing DBs.
-    _SCHEMA_VERSION = 2
+    _SCHEMA_VERSION = 3
 
     def _migrate(self) -> None:
         """Idempotently upgrade a database created by an earlier kernel version.
@@ -413,8 +425,10 @@ class Dispatcher:
         never alters an *existing* table — so a database created by the merged
         #11 kernel lacks the ``authority_seq`` / ``invalid_solicitations``
         columns, and a database created by the merged #17 kernel lacks the #12
-        ``disagreement`` / ``blocker`` handoff columns, and either would fail to
-        decode. Add them in place with safe ``NOT NULL DEFAULT`` semantics. The
+        ``disagreement`` / ``blocker`` handoff columns, and a pre-#47 database
+        lacks the ``dispatch.task_number`` binding column — any would fail to
+        decode. Add them in place with safe ``NOT NULL DEFAULT`` semantics (or a
+        nullable column where a default would misrepresent history). The
         per-table column-existence check is the durable oracle (idempotent across
         repeated opens); ``user_version`` is a derived marker only. Runs as one
         transaction so a crash mid-upgrade leaves the database wholly upgraded or
@@ -426,6 +440,9 @@ class Dispatcher:
         handoff_cols = {
             r["name"] for r in self._conn.execute("PRAGMA table_info(handoff)").fetchall()
         }
+        dispatch_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(dispatch)").fetchall()
+        }
         additions = [
             (goal_run_cols, "authority_seq",
              "ALTER TABLE goal_run ADD COLUMN authority_seq INTEGER NOT NULL DEFAULT 0"),
@@ -435,6 +452,10 @@ class Dispatcher:
              "ALTER TABLE handoff ADD COLUMN disagreement TEXT NOT NULL DEFAULT ''"),
             (handoff_cols, "blocker",
              "ALTER TABLE handoff ADD COLUMN blocker TEXT NOT NULL DEFAULT ''"),
+            # #47: the exact routed task bound to a dispatch (nullable — historic
+            # dispatches and non-task dispatches like solicit/continue have none).
+            (dispatch_cols, "task_number",
+             "ALTER TABLE dispatch ADD COLUMN task_number INTEGER"),
         ]
         pending = [sql for cols, name, sql in additions if name not in cols]
         self._conn.execute("BEGIN IMMEDIATE;")
@@ -1094,9 +1115,10 @@ class Dispatcher:
         seq = seq_row["m"] + 1
         dispatch_id = _new_id("dsp")
         c.execute(
-            "INSERT INTO dispatch (id, run_id, seq, kind, role, reason, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (dispatch_id, run_id, seq, decision.kind.value, decision.role, decision.reason, _now()),
+            "INSERT INTO dispatch (id, run_id, seq, kind, role, reason, task_number, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (dispatch_id, run_id, seq, decision.kind.value, decision.role,
+             decision.reason, decision.task_number, _now()),
         )
         row = c.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
         return _dispatch_view(row)
@@ -1229,6 +1251,28 @@ class Dispatcher:
             raise KeyError(dispatch_id)
         return _dispatch_view(row)
 
+    def task_number_for_handoff(self, handoff_id: str) -> Optional[int]:
+        """The exact routed task bound to a handoff's originating dispatch.
+
+        Resolves handoff → attempt → dispatch and returns the persisted
+        ``task_number``. This is the durable binding the public writer uses so a
+        role handoff is published to the *routed* task, never a later global
+        re-census of the public record (issue #47). Returns ``None`` for a
+        handoff whose dispatch carries no task (e.g. a synthetic guard handoff)
+        or an unknown id, so the caller surfaces a recoverable route rather than
+        guessing.
+        """
+        row = self._conn.execute(
+            "SELECT d.task_number AS tn FROM handoff h "
+            "JOIN attempt a ON a.id = h.attempt_id "
+            "JOIN dispatch d ON d.id = a.dispatch_id "
+            "WHERE h.id = ?",
+            (handoff_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["tn"]
+
     def read_run_diagnostics(self, goal_label: str) -> "Optional[RunDiagnostics]":
         """Read-only, point-in-time projection of the latest run for a goal label.
 
@@ -1328,9 +1372,12 @@ def _run_view(row: sqlite3.Row) -> RunView:
 
 
 def _dispatch_view(row: sqlite3.Row) -> DispatchView:
+    keys = row.keys()
+    task_number = row["task_number"] if "task_number" in keys else None
     return DispatchView(
         id=row["id"], run_id=row["run_id"], seq=row["seq"], kind=DecisionKind(row["kind"]),
         role=row["role"], reason=row["reason"], created_at=row["created_at"],
+        task_number=task_number,
     )
 
 

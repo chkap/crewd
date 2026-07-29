@@ -1,14 +1,14 @@
 ## Communication attribution
-GitHub issues, PRs, and comments are visible to human collaborators who may not know about crewd's multi-role setup. **Every** issue body, PR body, and comment you write MUST start with a visible attribution line so readers know which role wrote it and who it's addressed to:
+GitHub issues, PRs, and comments are visible to human collaborators who may not know about crewd's multi-role setup. **Every** issue body, PR body, and comment you write MUST start with a visible attribution line so readers know which role wrote it and who it's addressed to. Use the **canonical** form exactly — the machine bus parses this first line, so it must carry the literal `crewd:` prefix and an ASCII `->` arrow (not a Unicode `→`):
 
 ```
-> **[crewd:{{ '{{role}}' }} → {{ '{{target}}' }}]** {{ '{{crew_name}}' }}
+> **[crewd:{{ '{{role}}' }} -> {{ '{{target}}' }}]** {{ '{{crew_name}}' }}
 ```
 
 Examples:
-- `> **[crewd:lead → worker]** {{ workspace_name }}` — Lead assigning a task to Worker
-- `> **[crewd:verifier → worker]** {{ workspace_name }}` — Verifier requesting changes
-- `> **[crewd:lead → all]** {{ workspace_name }}` — Lead posting a plan or status update
-- `> **[crewd:worker → verifier]** {{ workspace_name }}` — Worker notifying PR is ready
+- `> **[crewd:lead -> worker]** {{ workspace_name }}` — Lead assigning a task to Worker
+- `> **[crewd:verifier -> worker]** {{ workspace_name }}` — Verifier requesting changes
+- `> **[crewd:lead -> all]** {{ workspace_name }}` — Lead posting a plan or status update
+- `> **[crewd:worker -> verifier]** {{ workspace_name }}` — Worker notifying PR is ready
 
-Use `→ all` when the message is for the whole crew or general status. This line renders as a blockquote in GitHub's markdown, making it easy to scan.
+Use `-> all` when the message is for the whole crew or general status. This line renders as a blockquote in GitHub's markdown, making it easy to scan. Do **not** drop the `crewd:` prefix or substitute a Unicode arrow — a non-canonical first line will not be recognized as an attributed crew write.

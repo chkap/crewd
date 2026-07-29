@@ -366,9 +366,12 @@ _LEAD_TOOL_DESCRIPTION = (
     "once and only once. Fields: kind (one of dispatch, continue_lead, wait, "
     "pause, finish); ack_handoff_ids (the list of pending handoff ids this "
     "decision acknowledges); role (target role, required for kind=dispatch); "
-    "reason (optional rationale); wake_condition (required for kind=wait); "
-    "human_blocker (required for kind=pause); final_acceptance (required for "
-    "kind=finish)."
+    "task_number (the exact crewd:task issue number this dispatch targets — "
+    "REQUIRED for kind=dispatch to worker/verifier so the routed task identity "
+    "is carried through the attempt, handoff, and Verifier routing rather than "
+    "re-guessed from the public record); reason (optional rationale); "
+    "wake_condition (required for kind=wait); human_blocker (required for "
+    "kind=pause); final_acceptance (required for kind=finish)."
 )
 
 
@@ -391,6 +394,13 @@ def _lead_decision_params_model():
         )
         role: Optional[str] = Field(
             default=None, description="target role (required for kind=dispatch)"
+        )
+        task_number: Optional[int] = Field(
+            default=None,
+            description=(
+                "exact crewd:task issue number this dispatch targets "
+                "(required for kind=dispatch to worker/verifier)"
+            ),
         )
         reason: Optional[str] = Field(default=None, description="optional rationale")
         wake_condition: Optional[str] = Field(
