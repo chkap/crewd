@@ -1204,20 +1204,28 @@ class Dispatcher:
         return DecisionResult(run=_run_view(fresh), dispatch=dispatch)
 
     def mark_run_status(
-        self, run_id: str, status: RunStatus, *, human_blocker: str | None = None
+        self, run_id: str, status: RunStatus, *,
+        human_blocker: str | None = None, wake_condition: str | None = None,
     ) -> RunView:
-        """Durably record an operator-driven halt (stopped/paused/interrupted).
+        """Durably record an orchestrator-driven halt.
 
         This is the write counterpart to :meth:`resume_run`: it lets the
         orchestrator persist *why* a run stopped launching work so a restart sees
-        the halt instead of resuming as if nothing happened. Only the operator
-        halt states are permitted here; routing decisions (wait/finish) flow
-        through :meth:`lead_decide` / :meth:`resolve_lead_solicitation`, and
-        ``exhausted`` is set only by the budget guards. Idempotent: re-marking a
-        run already in the target status is a no-op. Terminal ``finished`` /
-        ``exhausted`` runs cannot be overwritten (raises :class:`DecisionError`).
+        the halt instead of resuming as if nothing happened. The operator halt
+        states (stopped/paused/interrupted) record a ``human_blocker``; a
+        self-healing ``waiting`` records a ``wake_condition`` instead — a recoverable
+        public-write ordering/outage condition that the next run reconciles without
+        operator action (issue #49), as opposed to a ``paused`` human blocker.
+        Routing decisions (the Lead ``wait``/``finish`` path) still flow through
+        :meth:`lead_decide` / :meth:`resolve_lead_solicitation`, and ``exhausted``
+        is set only by the budget guards. Idempotent: re-marking a run already in
+        the target status is a no-op. Terminal ``finished`` / ``exhausted`` runs
+        cannot be overwritten (raises :class:`DecisionError`).
         """
-        allowed = {RunStatus.STOPPED, RunStatus.PAUSED, RunStatus.INTERRUPTED}
+        allowed = {
+            RunStatus.STOPPED, RunStatus.PAUSED, RunStatus.INTERRUPTED,
+            RunStatus.WAITING,
+        }
         if status not in allowed:
             raise DecisionError(f"mark_run_status only accepts {allowed}, not {status}")
         terminal = {RunStatus.FINISHED.value, RunStatus.EXHAUSTED.value}
@@ -1232,8 +1240,8 @@ class Dispatcher:
                     f"run {run_id} is {run['status']} (terminal) and cannot be {status.value}"
                 )
             c.execute(
-                "UPDATE goal_run SET status = ?, human_blocker = ? WHERE id = ?",
-                (status.value, human_blocker, run_id),
+                "UPDATE goal_run SET status = ?, human_blocker = ?, wake_condition = ? WHERE id = ?",
+                (status.value, human_blocker, wake_condition, run_id),
             )
             run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
         return _run_view(run)

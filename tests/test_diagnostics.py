@@ -423,7 +423,15 @@ def test_snapshot_surfaces_pending_public_write(tmp_ws):
         target="issue", number=29, body="secret readiness body",
     ))
     snap = _snap(tmp_ws)
-    assert snap.public_writes == {"pending": 1, "verified": 0, "pending_ids": ["h1"]}
+    assert snap.public_writes == {
+        "pending": 1,
+        "verified": 0,
+        "pending_ids": ["h1"],
+        "pending_detail": [
+            {"id": "h1", "target": "issue#29", "attempts": 0, "route": "reserved"}
+        ],
+        "needs_operator": [],
+    }
     assert snap.recovery_action and "public write" in snap.recovery_action
     # to_dict is stable and never carries the write body.
     d = snap.to_dict()

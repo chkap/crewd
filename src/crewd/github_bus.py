@@ -666,6 +666,15 @@ def classify_gh_stderr(stderr: str, returncode: int) -> GitHubErrorKind:
         return GitHubErrorKind.TIMEOUT
     if "not found" in s or "404" in s:
         return GitHubErrorKind.NOT_FOUND
+    # A *closed*-target comment rejection is an ordering/closure race, not a
+    # credential failure: GitHub normally permits comments on a closed issue/PR,
+    # so a terminal write racing a merge/auto-close self-heals (WAIT → reconcile)
+    # rather than pausing for a human (issue #49). This is deliberately narrow —
+    # only the closed-target wording. Persistent operator-actionable states
+    # (locked / archived / read-only) are NOT matched here; they fall through to
+    # the permission check below so they surface as a real operator blocker.
+    if "closed issue" in s or "closed pull request" in s or "closed pr" in s:
+        return GitHubErrorKind.TRANSIENT
     if (
         "permission" in s or "forbidden" in s or "403" in s
         or "401" in s or "authentication" in s or "must have admin" in s

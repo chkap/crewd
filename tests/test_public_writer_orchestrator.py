@@ -103,7 +103,8 @@ def test_lead_dispatch_blocked_when_write_unverified(tmp_ws: Workspace):
     """A sustained write outage means the Lead dispatch decision cannot be
     published; the decision must NOT be applied — routing authority stays
     ``lead_pending``, no role dispatch is created/consumed, and the reserved
-    intent is left for reconciliation."""
+    intent is left for reconciliation. A transient outage is recoverable, so the
+    run WAITS (self-heals) rather than declaring a human blocker (issue #49)."""
     c = FakeGitHubClient(REPO)
     _valid_worker_record(c)
     c.always_fail("create_comment", GitHubErrorKind.TIMEOUT, "outage")
@@ -119,16 +120,19 @@ def test_lead_dispatch_blocked_when_write_unverified(tmp_ws: Workspace):
     assert fake.role_calls == []
     assert _crew_posts(c) == []
     run = disp.start_or_resume_run(GOAL)
-    # Authority stayed with Lead; the run paused with the descriptive blocker.
+    # Authority stayed with Lead; a transient write outage is recoverable, so the
+    # run WAITS (self-heals on the next run's reconcile) rather than declaring a
+    # human blocker (issue #49).
     assert run.routing_authority == LEAD_PENDING
-    assert RunStatus(run.status) is RunStatus.PAUSED
-    assert "lead dispatch decision unverified" in (run.human_blocker or "")
+    assert RunStatus(run.status) is RunStatus.WAITING
+    assert "lead dispatch decision unverified" in (run.wake_condition or "")
+    assert run.human_blocker in (None, "")
     # A durable reserved intent exists for the Lead dispatch, unverified.
     pending = pub.store.list_pending()
     assert len(pending) == 1
     assert pending[0].role == "lead" and pending[0].state == WriteState.RESERVED.value
     assert pub.counts()["verified"] == 0
-    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+    assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
 
 
 def test_lead_dispatch_reconciled_without_duplicate_then_applied(tmp_ws: Workspace):
@@ -176,7 +180,7 @@ def test_lead_dispatch_reconciled_without_duplicate_then_applied(tmp_ws: Workspa
 def test_consume_blocked_when_handoff_write_unverified(tmp_ws: Workspace):
     """The Lead dispatch artifact publishes (call 1), then the bus goes down so the
     Worker's material handoff cannot verify; Lead may not consume it — the run
-    pauses and the worker handoff stays pending."""
+    WAITS (self-heals on reconcile) and the worker handoff stays pending (#49)."""
     c = FakeGitHubClient(REPO)
     _valid_worker_record(c)
     # First create (the Lead dispatch artifact) succeeds; every later write fails.
@@ -194,13 +198,14 @@ def test_consume_blocked_when_handoff_write_unverified(tmp_ws: Workspace):
     assert [r.role for r in fake.role_calls] == ["worker"]
     assert len(_lead_dispatch_posts(c)) == 1
     run = disp.start_or_resume_run(GOAL)
-    assert RunStatus(run.status) is RunStatus.PAUSED
-    assert "public-bus write unverified" in (run.human_blocker or "")
+    assert RunStatus(run.status) is RunStatus.WAITING
+    assert "public-bus write unverified" in (run.wake_condition or "")
+    assert run.human_blocker in (None, "")
     pending = disp.pending_handoffs(run.id)
     assert [h.role for h in pending] == ["worker"]
     worker_intent = pub.store.get(pending[0].id)
     assert worker_intent is not None and worker_intent.state == WriteState.RESERVED.value
-    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+    assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
 
 
 # ── materiality: bare no_progress private; changed/remaining material ────
@@ -234,7 +239,8 @@ def test_bare_no_progress_needs_no_artifact(tmp_ws: Workspace):
 def test_material_no_progress_requires_artifact(tmp_ws: Workspace):
     """A ``no_progress`` that reports changed/remaining state IS material: with the
     bus down after the dispatch write, its consume is blocked and it stays
-    pending — a material no-progress is not hidden as private."""
+    pending (run WAITS, self-healing) — a material no-progress is not hidden as
+    private."""
     c = FakeGitHubClient(REPO)
     _valid_worker_record(c)
     c.create_fail_after = 1  # dispatch write ok; the handoff write fails
@@ -254,8 +260,8 @@ def test_material_no_progress_requires_artifact(tmp_ws: Workspace):
     orch.run(once=False)
 
     run = disp.start_or_resume_run(GOAL)
-    assert RunStatus(run.status) is RunStatus.PAUSED
-    assert "public-bus write unverified" in (run.human_blocker or "")
+    assert RunStatus(run.status) is RunStatus.WAITING
+    assert "public-bus write unverified" in (run.wake_condition or "")
     pending = disp.pending_handoffs(run.id)
     assert [h.role for h in pending] == ["worker"]
     # A durable worker intent was reserved (materiality forced a required artifact).

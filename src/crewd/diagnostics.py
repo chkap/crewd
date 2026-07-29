@@ -280,7 +280,13 @@ def _derive_next_action(diag: RunDiagnostics, *, daemon_alive: bool, tainted: bo
 
 
 def _public_write_state(ws: Workspace) -> Optional[dict]:
-    """Durable public-write journal counts (offline; reads state, no GitHub)."""
+    """Durable public-write journal counts (offline; reads state, no GitHub).
+
+    Beyond raw counts this surfaces, per still-pending terminal write, the target
+    (issue/pull + number), the retry/attempt count, and the last route — so an
+    operator can tell a transient WAIT that the next ``crewd run`` reconciles
+    automatically apart from a real human blocker that needs intervention (#49).
+    """
     try:
         from .public_writer import IntentStore
 
@@ -288,11 +294,31 @@ def _public_write_state(ws: Workspace) -> Optional[dict]:
         counts = store.counts()
         if counts["pending"] == 0 and counts["verified"] == 0:
             return None
-        pending_ids = [i.correlation_id for i in store.list_pending()]
+        pending = store.list_pending()
+        pending_ids = [i.correlation_id for i in pending]
+        pending_detail = [
+            {
+                "id": i.correlation_id,
+                "target": f"{i.target}#{i.number}",
+                "attempts": i.attempts,
+                "route": i.last_route or "reserved",
+            }
+            for i in pending
+        ]
+        # A pending write that last routed to PAUSE (permission) or REJECT (an
+        # invalid public record that will not fix itself on retry) is genuinely
+        # operator-needed; a WAIT/reserved write self-heals on the next reconcile
+        # (issue #49).
+        needs_operator = sorted(
+            i.correlation_id for i in pending
+            if i.last_route in ("pause", "reject")
+        )
         return {
             "pending": counts["pending"],
             "verified": counts["verified"],
             "pending_ids": pending_ids,
+            "pending_detail": pending_detail,
+            "needs_operator": needs_operator,
         }
     except Exception:
         return None
@@ -320,10 +346,20 @@ def _recovery_hint(public_writes: Optional[dict], inbox: Optional[dict]) -> Opti
     hints = []
     if public_writes and public_writes.get("pending"):
         n = public_writes["pending"]
-        hints.append(
-            f"{n} public write(s) reserved but unverified — a `crewd run` "
-            "reconciles them once GitHub is reachable."
-        )
+        needs_operator = public_writes.get("needs_operator") or []
+        if needs_operator:
+            hints.append(
+                f"{len(needs_operator)} public write(s) need a genuine operator "
+                f"action (permission/policy denial or an invalid public record): "
+                f"{', '.join(needs_operator)} — resolve it, then `crewd resume`."
+            )
+        self_heal = n - len(needs_operator)
+        if self_heal > 0:
+            hints.append(
+                f"{self_heal} public write(s) reserved but unverified — a "
+                "`crewd run` reconciles them automatically once GitHub is "
+                "reachable (no operator action needed)."
+            )
     if inbox:
         delivering = sum(v.get("delivering", 0) for v in inbox.values())
         if delivering:

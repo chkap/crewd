@@ -172,6 +172,8 @@ class WriteIntent:
     created_at: str = ""
     verified_at: str = ""
     detail: str = ""
+    attempts: int = 0           # publish attempts so far (reserve + each retry)
+    last_route: str = ""        # last non-verified route (wait/pause/reject)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
@@ -239,8 +241,11 @@ class IntentStore:
         if existing is not None and existing.state == WriteState.VERIFIED.value:
             return existing
         if existing is not None:
-            # keep original created_at; refresh the pending body/detail
+            # keep original created_at + accumulated retry history; refresh the
+            # pending body/detail (issue #49: attempts/route survive reconcile).
             intent.created_at = existing.created_at or _now()
+            intent.attempts = existing.attempts
+            intent.last_route = existing.last_route
         else:
             intent.created_at = _now()
         intent.state = WriteState.RESERVED.value
@@ -254,16 +259,26 @@ class IntentStore:
         intent.state = WriteState.VERIFIED.value
         intent.url = url
         intent.detail = detail
+        intent.last_route = Route.PROCEED.value
+        intent.attempts += 1
         intent.verified_at = _now()
         self._write_atomic(intent)
         return intent
 
-    def record_detail(self, correlation_id: str, detail: str) -> None:
-        """Record a non-verifying outcome detail (e.g. a WAIT/PAUSE reason)."""
+    def record_detail(self, correlation_id: str, detail: str, route: str = "") -> None:
+        """Record a non-verifying outcome detail (e.g. a WAIT/PAUSE reason).
+
+        Also counts the attempt and remembers the route so diagnostics can show
+        the retry/backoff/self-heal state of a still-pending terminal write and
+        tell a transient WAIT (auto-reconciled) apart from a real human blocker
+        (issue #49)."""
         intent = self.get(correlation_id)
         if intent is None:
             return
         intent.detail = detail
+        if route:
+            intent.last_route = route
+        intent.attempts += 1
         self._write_atomic(intent)
 
     def _all(self) -> list[WriteIntent]:
@@ -385,7 +400,7 @@ class PublicWriter:
         # Not verified: keep the reserved intent for reconciliation and surface the
         # explicit recoverable route (REJECT for a bad attribution; WAIT/PAUSE for
         # a GitHub failure) — never a silent success.
-        self.store.record_detail(correlation_id, post.detail)
+        self.store.record_detail(correlation_id, post.detail, route=post.route.value)
         return PublishOutcome(post.route, post.detail, correlation_id=correlation_id)
 
     # -- restart reconciliation --
