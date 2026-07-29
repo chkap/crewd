@@ -431,6 +431,7 @@ class Orchestrator:
                 decision_id=correlation_id, kind="dispatch",
                 target_role=target_role,
                 reason=getattr(decision, "reason", "") or "",
+                task_number=getattr(decision, "task_number", None),
             )
         except Exception as exc:  # a publish bug must not fake a verified write
             return f"public-bus lead decision publish error: {exc}"
@@ -465,6 +466,10 @@ class Orchestrator:
         :class:`~crewd.dispatcher.HandoffView` at consume time). Returns the
         :class:`~crewd.public_writer.PublishOutcome`, or ``None`` when no publisher
         is wired or the handoff is a private ``no_progress`` (not material).
+
+        The task the artifact is posted to is the *routed* task bound to the
+        handoff's dispatch (issue #47), resolved from the durable journal — never
+        a later global re-census — so a second queued task cannot divert it.
         """
         publisher = self._publisher
         if publisher is None:
@@ -479,9 +484,15 @@ class Orchestrator:
             blocker=terminal.blocker,
         ):
             return None
+        task_number = None
+        try:
+            task_number = self.disp.task_number_for_handoff(handoff_id)
+        except Exception:  # journal read must not fake a verified write
+            task_number = None
         try:
             return publisher.publish_role_handoff(
                 handoff_id=handoff_id, role=role, outcome_class=oc,
+                task_number=task_number,
                 evidence=terminal.evidence, changed=terminal.changed,
                 remaining=terminal.remaining, reason=reason,
                 disagreement=terminal.disagreement, blocker=terminal.blocker,
@@ -495,11 +506,14 @@ class Orchestrator:
 
         Defense-in-depth for a dispatch resurrected from the journal after a
         restart (the normal path is already gated before the dispatch is created;
-        see :meth:`_decision_gate_block`). Returns True to proceed. On a
-        non-``PROCEED`` outcome it marks the run PAUSED with a descriptive
-        public-bus blocker and returns False, so no attempt is reserved.
+        see :meth:`_decision_gate_block`). The persisted ``task_number`` on the
+        dispatch preserves the routed-task binding across the restart (issue #47),
+        so the gate re-validates the same task rather than re-censusing the
+        record. Returns True to proceed. On a non-``PROCEED`` outcome it marks the
+        run PAUSED with a descriptive public-bus blocker and returns False, so no
+        attempt is reserved.
         """
-        blocker = self._dispatch_gate_block(role)
+        blocker = self._dispatch_gate_block(role, getattr(dsp, "task_number", None))
         if blocker is None:
             return True
         self._safe_mark(run_id, RunStatus.PAUSED, blocker)
@@ -533,7 +547,10 @@ class Orchestrator:
             return material_blocker
         kind = getattr(decision, "kind", None)
         if kind is DecisionKind.DISPATCH:
-            return self._dispatch_gate_block(getattr(decision, "role", None) or "")
+            return self._dispatch_gate_block(
+                getattr(decision, "role", None) or "",
+                getattr(decision, "task_number", None),
+            )
         if kind is DecisionKind.FINISH:
             return self._finish_gate_block()
         return None
@@ -579,18 +596,24 @@ class Orchestrator:
                     f"{hid}: {detail}")
         return None
 
-    def _dispatch_gate_block(self, role: str) -> Optional[str]:
+    def _dispatch_gate_block(
+        self, role: str, task_number: Optional[int] = None
+    ) -> Optional[str]:
         """Consult the public-bus gate for a Worker/Verifier dispatch (if any).
 
-        Returns ``None`` to allow the dispatch, or a descriptive blocker string
-        when the record fails the invariant. A gate that raises does not silently
-        pass: the error becomes the blocker.
+        ``task_number`` is the exact routed task carried by the Lead decision (at
+        decision time) or persisted with the dispatch (at reserve time after a
+        restart). It is validated against that bound task — never a later global
+        re-census (issue #47) — so a stale/mismatched binding fails *before* role
+        execution with a recoverable blocker and a second queued task cannot
+        divert the gate. A gate that raises does not silently pass: the error
+        becomes the blocker.
         """
         gate = self._bus_gate
         if gate is None:
             return None
         try:
-            outcome = gate.evaluate(role, None)
+            outcome = gate.evaluate(role, None, task_number=task_number)
         except Exception as exc:  # boundary bug must not fake success
             return f"public-bus gate error: {exc}"
         if outcome is None or outcome.route is Route.PROCEED:

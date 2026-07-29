@@ -426,6 +426,7 @@ class PublicWriter:
         handoff_id: str,
         role: str,
         outcome_class: str,
+        task_number: Optional[int] = None,
         evidence: str = "",
         changed: str = "",
         remaining: str = "",
@@ -433,19 +434,26 @@ class PublicWriter:
         disagreement: str = "",
         blocker: str = "",
     ) -> PublishOutcome:
-        """Resolve the active task and durably publish a role's material handoff.
+        """Durably publish a role's material handoff to the *routed* task.
+
+        ``task_number`` is the exact task bound to this handoff's dispatch
+        (issue #47); when supplied the artifact is posted there without a global
+        re-census of the public record, so a second queued/assigned task can
+        never divert the handoff. When omitted (legacy/defensive callers) the
+        active task is resolved from the record as a fallback.
 
         The correlation id is the durable dispatcher ``handoff_id`` so the artifact
         is stable across crash/retry and the orchestrator can later prove the
         handoff was published before it is consumed.
         """
-        number, resolved = self.resolve_task_number()
+        number, resolved = self._resolve_target(task_number)
         if number is None:
-            # Target could not be resolved from the public record: surface the
-            # recoverable route (a REJECT record maps to WAIT for the writer, since
-            # the artifact still needs to be posted once the record is fixed).
+            # Target could not be resolved: surface the recoverable route (a
+            # REJECT record maps to WAIT for the writer, since the artifact still
+            # needs to be posted once the routed task is known/fixed) — never a
+            # mispublish to an unrelated task.
             route = resolved.route if resolved.route in (Route.WAIT, Route.PAUSE) else Route.WAIT
-            return PublishOutcome(route, f"cannot resolve active task: {resolved.detail}",
+            return PublishOutcome(route, f"cannot resolve routed task: {resolved.detail}",
                                   correlation_id=handoff_id)
         target_role = _HANDOFF_TARGET.get(role, "lead")
         body = render_role_handoff_body(
@@ -466,14 +474,30 @@ class PublicWriter:
         kind: str,
         target_role: str = "",
         reason: str = "",
+        task_number: Optional[int] = None,
     ) -> PublishOutcome:
-        """Durably publish a Lead routing decision to the active task issue."""
-        number, resolved = self.resolve_task_number()
+        """Durably publish a Lead routing decision to the routed task issue.
+
+        ``task_number`` (issue #47) is the exact task the decision routes to;
+        when supplied the decision is posted there rather than re-resolved from
+        the public record.
+        """
+        number, resolved = self._resolve_target(task_number)
         if number is None:
-            return PublishOutcome(Route.WAIT, f"cannot resolve active task: {resolved.detail}",
+            return PublishOutcome(Route.WAIT, f"cannot resolve routed task: {resolved.detail}",
                                   correlation_id=decision_id)
         body = render_lead_decision_body(kind=kind, target_role=target_role, reason=reason)
         return self.publish(
             role="lead", target_role=(target_role or "all"), target="issue",
             number=number, correlation_id=decision_id, body=body,
         )
+
+    def _resolve_target(
+        self, task_number: Optional[int]
+    ) -> tuple[Optional[int], PrereqOutcome]:
+        """Resolve the task a write targets: the bound routed task if supplied,
+        else the legacy global census. Production always supplies the binding."""
+        if task_number is not None:
+            return task_number, PrereqOutcome.proceed(f"routed task #{task_number}",
+                                                      task=task_number)
+        return self.resolve_task_number()

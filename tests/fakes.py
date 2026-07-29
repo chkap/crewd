@@ -180,9 +180,15 @@ class FakeExecutor:
 
 
 # ── decision-builder helpers for scripts ──
-def dispatch_to(role: str):
-    """Script item: dispatch to ``role``, acking exactly the pending handoffs."""
-    return lambda ids: LeadDecision.dispatch(role, ack=tuple(ids))
+def dispatch_to(role: str, *, task_number: int | None = None):
+    """Script item: dispatch to ``role``, acking exactly the pending handoffs.
+
+    ``task_number`` binds the exact routed ``crewd:task`` to the dispatch (issue
+    #47); when omitted the dispatch carries no task (legacy behaviour).
+    """
+    return lambda ids: LeadDecision.dispatch(
+        role, ack=tuple(ids), task_number=task_number
+    )
 
 
 def finish(acceptance: str = "done"):

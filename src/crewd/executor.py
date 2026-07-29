@@ -558,6 +558,31 @@ class SdkAttemptExecutor:
             pass
 
 
+def _coerce_task_number(raw) -> Optional[int]:
+    """Coerce an untrusted ``task_number`` payload field into an int or ``None``.
+
+    Shape validation only (issue #47): the Lead turn names the exact routed
+    ``crewd:task`` issue for a dispatch. An absent/blank value yields ``None``
+    (the public-bus gate then rejects an unbound worker/verifier dispatch with a
+    recoverable correction path); a non-numeric value is a malformed payload.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):  # bool is an int subclass — reject explicitly
+        raise ValueError(f"task_number must be an integer, not a bool: {raw!r}")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip().lstrip("#")
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            raise ValueError(f"task_number is not an integer: {raw!r}")
+    raise ValueError(f"task_number is not an integer: {raw!r}")
+
+
 def parse_lead_decision(payload) -> LeadDecision:
     """Parse an untrusted ``submit_lead_decision`` payload into a LeadDecision.
 
@@ -578,7 +603,11 @@ def parse_lead_decision(payload) -> LeadDecision:
     kind = DecisionKind(kind_raw)  # raises ValueError on unknown kind
     ack = tuple(payload.get("ack_handoff_ids") or ())
     if kind is DecisionKind.DISPATCH:
-        return LeadDecision.dispatch(payload["role"], ack=ack, reason=payload.get("reason"))
+        task_number = _coerce_task_number(payload.get("task_number"))
+        return LeadDecision.dispatch(
+            payload["role"], ack=ack, reason=payload.get("reason"),
+            task_number=task_number,
+        )
     if kind is DecisionKind.CONTINUE_LEAD:
         return LeadDecision.continue_lead(ack=ack, reason=payload.get("reason"))
     if kind is DecisionKind.WAIT:
