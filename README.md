@@ -334,4 +334,4 @@ scripts/
 - [`docs/orchestrator.md`](docs/orchestrator.md) — Lead-directed run loop: exit reasons, pre-send
   journal identity, the exactly-one typed channel, mid-attempt cancellation, and operator diagnostics.
 
-License: internal / unreleased.
+License: MIT (see [`LICENSE`](LICENSE)). crewd is free and open source software.
