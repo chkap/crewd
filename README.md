@@ -6,49 +6,103 @@
 
 The roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
 
+- **Project home:** https://github.com/chkap/crewd
+- **Issues / support:** https://github.com/chkap/crewd/issues
+- **License:** MIT — free and open source software.
+
 ---
 
-## Quickstart
+## Prerequisites
+
+crewd orchestrates other tools rather than reimplementing them, so a runnable install needs:
+
+- **Python 3.11+** — the only supported runtime (`requires-python = ">=3.11"`).
+- **A GitHub Copilot subscription.** Every role runs as an official GitHub Copilot SDK session (`backend: copilot-sdk`). The `github-copilot-sdk` runtime is bundled as a dependency, but it authenticates against your Copilot entitlement — an account without Copilot access cannot run roles.
+- **The GitHub CLI (`gh`), authenticated.** crewd shells out to `gh` to clone the target repo, list/close epoch issues, and drive the public GitHub bus (post/verify attributed comments). Install `gh`, then `gh auth login` (or export `GH_TOKEN`) for the account that owns the target repo. The token must have **repo read/write** scope on the target — see [Security & repository-write implications](#security--repository-write-implications).
+- **git** on `PATH` — crewd creates the clone and per-role worktrees with local git.
+
+Verify prerequisites before installing:
 
 ```bash
-# 0. Install. crewd runs every role through the official GitHub Copilot SDK
-#    (`backend: copilot-sdk`, the default and only production backend), which is
-#    a required core dependency — so a plain install is fully runnable:
-#      • from this repo (editable/dev):
-cd ~/crewd && uv sync
-#      • as a package (pick one):
-#        pip install crewd        # or:  uv tool install crewd
-
-# 1. Create a crew workspace (separate from your target repo)
-mkdir -p ~/crews && cd ~/crews
-uv --directory ~/crewd run crewd init my-crew --repo myorg/my-app
-
-# 2. Edit the goal
-cd my-crew
-uv --directory ~/crewd run crewd goal --edit -w "$(pwd)"
-
-# 3. Sanity check (config, families, target repo clone, agents/, inbox)
-uv --directory ~/crewd run crewd doctor -w "$(pwd)"
-
-# 4. Smoke test: one dispatcher step in the foreground (Lead is solicited,
-#    then at most one role it dispatches runs one attempt)
-uv --directory ~/crewd run crewd run --once -w "$(pwd)"
-
-# 5. (debug/compat escape hatch) Force a single tick of ONE named role,
-#    bypassing the Lead dispatcher — handy for isolating one role
-uv --directory ~/crewd run crewd tick lead -w "$(pwd)"
-
-# 6. Run until completed, human-blocked, max-cycles, or signal
-uv --directory ~/crewd run crewd run --daemon -w "$(pwd)"
-
-# 7. Check on it
-uv --directory ~/crewd run crewd status -w "$(pwd)"
-
-# 8. Stop gracefully (writes STOPPED + sends SIGINT to daemon)
-uv --directory ~/crewd run crewd stop -w "$(pwd)"
+python --version         # >= 3.11
+gh auth status           # logged in, with repo scope on the target org/repo
+git --version
 ```
 
-> ⚠️ When invoking via `uv --directory ~/crewd run crewd`, **always pass `-w "$(pwd)"`** — `uv --directory` changes uv's resolution cwd to the crewd repo, so workspace auto-discovery would otherwise pick the wrong directory.
+---
+
+## Installation
+
+crewd is a CLI application. Install it so the `crewd` command is on your `PATH` — the recommended tools give each install an isolated environment:
+
+```bash
+# pipx (recommended for a CLI): isolated venv, on PATH
+pipx install crewd
+
+# uv tool: same idea, using uv
+uv tool install crewd
+
+# plain pip (into the current/user environment)
+pip install --user crewd
+```
+
+Confirm the entry point and version:
+
+```bash
+crewd --help
+crewd --version    # or:  python -c "import crewd; print(crewd.__version__)"
+```
+
+> **Upgrading:** `pipx upgrade crewd`, `uv tool upgrade crewd`, or `pip install --upgrade crewd`. See [Upgrading an existing workspace](#upgrading-an-existing-workspace) for migrating a workspace created by an older crewd.
+
+Once installed, every example below uses the bare `crewd` command with git-style workspace discovery — no repository checkout is required.
+
+---
+
+## Quickstart (minimal SDK-native flow)
+
+```bash
+# 1. Create a crew workspace (kept separate from your target repo)
+mkdir -p ~/crews && cd ~/crews
+crewd init my-crew --repo myorg/my-app     # clones myorg/my-app into my-crew/repo/
+cd my-crew
+
+# 2. Edit the goal for this epoch
+crewd goal --edit
+
+# 3. Sanity check: config, worker≠verifier family, target clone, agents/, inbox
+crewd doctor
+
+# 4. Smoke test: one dispatcher step (Lead is solicited, then at most one role it
+#    dispatches runs a single attempt) — proves auth + bus end to end
+crewd run --once
+
+# 5. Run until goal-complete, human-blocked, max-cycles, or a signal
+crewd run --daemon
+
+# 6. Check on it, then stop gracefully (writes STOPPED + SIGINTs the daemon)
+crewd status
+crewd stop
+```
+
+All workspace-scoped commands accept `-w / --workspace <path>`. Without it, `crewd` walks up from the current directory looking for `crew.yaml` (git-style discovery), so running from inside `my-crew/` just works.
+
+> **Debug/compat escape hatch:** `crewd tick <role>` forces a single tick of one named role, bypassing the Lead dispatcher — handy for isolating one role. Normal runs go through `crewd run`.
+
+<details>
+<summary>Running from a source checkout (contributors)</summary>
+
+If you're hacking on crewd itself rather than using an installed wheel, run the in-tree CLI through uv from the repo you cloned:
+
+```bash
+git clone https://github.com/chkap/crewd && cd crewd && uv sync
+# From inside a workspace directory, always pass -w so uv's --directory cwd
+# (the crewd repo) doesn't defeat workspace auto-discovery:
+uv --directory /path/to/crewd run crewd doctor -w "$(pwd)"
+```
+
+This form is for development only; installed users should use the bare `crewd` command above.
+</details>
 
 ---
 
@@ -150,6 +204,19 @@ e.g. `> **[crewd:worker -> verifier]** my-crew`. A body missing or malforming th
 **Offline / recovery.** Set `CREWD_DISABLE_PUBLIC_BUS=1` to run the dispatcher without the public bus (offline recovery / local mechanics only). This is a deliberate escape hatch — normal runs against an attached remote keep it enabled so coordination stays on GitHub.
 
 ---
+
+## Security & repository-write implications
+
+crewd is an **autonomous agent that acts on GitHub with your credentials**. Understand the blast radius before pointing it at a repository:
+
+- **It writes to the target repo as you.** Roles use your authenticated `gh` / git identity to push branches, open PRs, comment on issues/PRs, and (verifier) **merge** PRs. Anything crewd does is attributable to, and authorized by, your token.
+- **Scope the token to the target.** Authenticate `gh` (or `GH_TOKEN`) with the least privilege that still allows repo read/write on the target. Prefer a dedicated bot/service account or a fine-grained token limited to the one repository over a broad personal token.
+- **The workspace holds session state, not secrets by policy.** `cfg/<role>/session-state/` (Copilot SDK conversations) and `state/` (run journal, public-bus intents, inbox) live under the workspace. Durable logs are redacted (GitHub tokens, JWTs, `bearer`/`authorization`/`api_key`-style values are stripped) before they are written, but treat the workspace directory as sensitive and keep it out of shared/committed locations.
+- **`extra_add_dirs` cannot escape the workspace.** The Copilot SDK mounts a single working directory (the workspace root) with no `--add-dir` equivalent, so any `extra_add_dirs` entry that resolves outside the workspace (including a symlink to an external target) is a **non-runnable blocker**: `doctor` errors and `run` refuses at pre-flight (rc=2) before any SDK work, so context outside the crew is never exposed. Copy/sanitize only what a role needs into the workspace.
+- **Merges are gated, not unconditional.** Only the verifier merges, behind a two-tier review plus a Final Acceptance Gate; only the worker pushes code. But these are policy guardrails enforced by prompts and the dispatcher — run crewd against repositories where an autonomous PR/merge is acceptable, and rely on branch protection / required reviews for a hard backstop.
+
+---
+
 
 
 ## Command reference
@@ -276,11 +343,40 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 
 ---
 
+## Upgrading an existing workspace
+
+Upgrading the crewd package never rewrites your workspaces in place — reconcile each workspace on its next use:
+
+```bash
+pipx upgrade crewd          # or: uv tool upgrade crewd / pip install --upgrade crewd
+cd /path/to/workspace
+crewd refresh               # re-render agents/ + AGENTS.md, migrate old layout/backend if needed
+crewd doctor                # confirm 0 errors before resuming
+```
+
+`crewd refresh` re-renders `agents/*.agent.md` from the current templates and migrates a legacy workspace — including a `crew.yaml` still on the retired `backend: copilot` subprocess transport → `backend: copilot-sdk` — while **preserving** unknown config keys and durable state (`STOPPED`/`PAUSED`, `goal.json`, `session-state/`, `public_writes/`). It is idempotent, so re-running it is safe. Agent templates are also auto re-rendered on the next `run`/`tick` when `crew.yaml` is newer (disable with `--no-auto-render`).
+
+---
+
+## Limitations
+
+crewd 0.1.0 is an early public release. Known constraints:
+
+- **GitHub-only bus.** Coordination is GitHub Issues/PRs; there is no GitLab/Bitbucket/other-forge backend. A reachable GitHub remote and an authenticated `gh` are required for normal (non-offline) runs.
+- **Copilot SDK is the only backend.** `backend: copilot-sdk` is the default and only production transport; the legacy `copilot -p` subprocess backend is retired and rejected at pre-flight. A GitHub Copilot subscription is required to run roles.
+- **Single mounted directory.** The SDK mounts one working directory (the workspace root) with no `--add-dir` equivalent, so all role-visible context must live inside the workspace (see `extra_add_dirs`).
+- **One run per workspace.** Do not run two `crewd run` processes against the same workspace; the durable journal assumes a single active runner.
+- **The public API is the CLI.** The importable `crewd` package ships no `py.typed` marker and makes no typed-library stability guarantee; only the `crewd` command line is a supported contract.
+- **Primarily exercised on Linux.** Development and dogfooding are on Linux; other platforms are unvalidated. Integration coverage is via dogfooding on real repos plus the unit suite in `tests/`.
+
+---
+
 ## Status
 
 - Backend: **official GitHub Copilot SDK** (`backend: copilot-sdk`, default). The legacy `gh copilot` subprocess backend is retired — selecting `backend: copilot` fails with a migration error.
 - Tested on Linux (Azure VM). Templates live in `src/crewd/templates/agents/*.j2`.
 - See `tests/` for unit coverage; integration testing is via dogfooding on real repos.
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 

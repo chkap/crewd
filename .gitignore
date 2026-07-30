@@ -6,6 +6,10 @@ __pycache__/
 .python-version
 .pytest_cache/
 
+# Build artifacts
+/dist/
+/build/
+
 # uv
 # (uv.lock IS committed)
 
