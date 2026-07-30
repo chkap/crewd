@@ -49,11 +49,17 @@ TASK = 29
 
 
 # ── helpers (mirror test_public_writer_orchestrator) ────────────────────
-def _valid_worker_record(c: FakeGitHubClient, *, task_state: str = "open") -> None:
+def _valid_worker_record(c: FakeGitHubClient, *, task_state: str = "open",
+                         merged_pr: int = 0) -> None:
     c.add_issue(30, "GOAL: x", labels=(GOAL,))
     c.add_issue(TASK, "task", state=task_state, labels=("crewd:task", GOAL),
                 assignees=("alice",))
     c.add_comment("issue", TASK, f"> **[crewd:lead -> worker]** {CREW}\n\nAssigned.")
+    # Model closure provenance: a closed task is legitimately closed only by a
+    # merged PR that links it (issue #49 authorization). Tests that close the task
+    # supply the merged linked PR that caused the auto-close.
+    if merged_pr:
+        c.add_pull(merged_pr, "impl", state="merged", linked_issues=(TASK,))
 
 
 def _writer(tmp_ws: Workspace, c: FakeGitHubClient) -> PublicWriter:
@@ -122,30 +128,94 @@ def test_classify_transient_kinds_preserved():
 # ── 2. terminal publish to a CLOSED task (merged PR auto-closed it) ──────
 def test_terminal_handoff_publishes_to_closed_task(tmp_ws: Workspace):
     """A verified linked merge auto-closes the bound task before the terminal
-    handoff is published; the comment still posts + verifies (GitHub permits
-    comments on a closed issue), so the terminal record is NOT human-blocked."""
+    handoff is published; because the closure is provably caused by a merged
+    linked PR the comment still posts + verifies (GitHub permits comments on a
+    closed issue), so the terminal record is NOT human-blocked."""
     c = FakeGitHubClient(REPO)
-    _valid_worker_record(c, task_state="closed")
+    _valid_worker_record(c, task_state="closed", merged_pr=99)
     pub = _writer(tmp_ws, c)
 
     outcome = pub.publish_role_handoff(
         handoff_id="ho-term", role="verifier", outcome_class="completed",
-        task_number=TASK, evidence="approved PR #99 (merged)", changed="none",
+        task_number=TASK, pr_number=99, evidence="approved PR #99 (merged)", changed="none",
     )
     assert outcome.route is Route.PROCEED and outcome.verified
     assert pub.counts()["verified"] == 1 and pub.counts()["pending"] == 0
+
+
+def test_terminal_handoff_to_unrelated_closed_task_is_invalid_target(tmp_ws: Workspace):
+    """A task closed with NO merged linked PR is a stale/unrelated closure: the
+    terminal write is rejected as an invalid target (typed), NOT posted and NOT
+    parked as a self-healing WAIT — it will never legitimately land (issue #49)."""
+    c = FakeGitHubClient(REPO)
+    _valid_worker_record(c, task_state="closed")  # no merged linked PR
+    pub = _writer(tmp_ws, c)
+
+    outcome = pub.publish_role_handoff(
+        handoff_id="ho-term", role="verifier", outcome_class="completed",
+        task_number=TASK, evidence="approved", changed="none",
+    )
+    assert outcome.route is Route.REJECT and not outcome.verified
+    assert len(_crew_posts(c)) == 0
+    pending = pub.store.list_pending()
+    assert len(pending) == 1
+    from crewd.public_writer import LifecyclePhase
+    assert pending[0].phase == LifecyclePhase.INVALID_TARGET.value
+    assert pending[0].disposition == "invalid_target"
+    # An invalid target is never "due" for a self-healing retry.
+    assert pub.store.list_due_pending() == []
+    assert pub.has_operator_block()
+
+
+def test_terminal_handoff_rejects_wrong_repository_goal_and_deleted_target(
+    tmp_ws: Workspace,
+):
+    cases = []
+
+    wrong_repo = FakeGitHubClient("evil/other")
+    _valid_worker_record(wrong_repo)
+    cases.append(wrong_repo)
+
+    wrong_goal = FakeGitHubClient(REPO)
+    wrong_goal.add_issue(TASK, "task", labels=("crewd:task", "goal:v1"))
+    cases.append(wrong_goal)
+
+    deleted = FakeGitHubClient(REPO)
+    cases.append(deleted)
+
+    for index, client in enumerate(cases):
+        outcome = _writer(tmp_ws, client).publish_role_handoff(
+            handoff_id=f"invalid-{index}", role="verifier",
+            outcome_class="completed", task_number=TASK, changed="none",
+        )
+        assert outcome.route is Route.REJECT
+        assert _crew_posts(client) == []
+
+
+def test_terminal_closure_provenance_lookup_timeout_waits(tmp_ws: Workspace):
+    c = FakeGitHubClient(REPO)
+    _valid_worker_record(c, task_state="closed", merged_pr=99)
+    c.fail_once("list_pulls", GitHubErrorKind.TIMEOUT, "slow")
+
+    outcome = _writer(tmp_ws, c).publish_role_handoff(
+        handoff_id="lookup-timeout", role="verifier",
+        outcome_class="completed", task_number=TASK, pr_number=99,
+        changed="none",
+    )
+    assert outcome.route is Route.WAIT
+    assert c.comments.get(("issue", TASK), [])[-1].body.endswith("Assigned.")
 
 
 def test_closed_target_reconcile_is_idempotent(tmp_ws: Workspace):
     """Re-publishing / reconciling the same terminal write against a closed target
     dedupes on the correlation marker — exactly one comment, never a duplicate."""
     c = FakeGitHubClient(REPO)
-    _valid_worker_record(c, task_state="closed")
+    _valid_worker_record(c, task_state="closed", merged_pr=99)
     pub = _writer(tmp_ws, c)
 
     first = pub.publish_role_handoff(
         handoff_id="ho-term", role="verifier", outcome_class="completed",
-        task_number=TASK, evidence="approved", changed="none",
+        task_number=TASK, pr_number=99, evidence="approved", changed="none",
     )
     assert first.verified
     posts_after_first = len(_crew_posts(c))
@@ -154,7 +224,7 @@ def test_closed_target_reconcile_is_idempotent(tmp_ws: Workspace):
     pub.reconcile()
     again = pub.publish_role_handoff(
         handoff_id="ho-term", role="verifier", outcome_class="completed",
-        task_number=TASK, evidence="approved", changed="none",
+        task_number=TASK, pr_number=99, evidence="approved", changed="none",
     )
     assert again.verified and again.deduplicated
     assert len(_crew_posts(c)) == posts_after_first == 1
@@ -165,14 +235,14 @@ def test_ambiguous_landed_post_on_closed_target_reconciles(tmp_ws: Workspace):
     AMBIGUOUS but the comment actually landed; the writer reconciles on the marker
     and reports verified without a duplicate (no lost/duplicate record, #49)."""
     c = FakeGitHubClient(REPO)
-    _valid_worker_record(c, task_state="closed")
+    _valid_worker_record(c, task_state="closed", merged_pr=99)
     c.ambiguous_but_landed = True
     c.fail_once("create_comment", GitHubErrorKind.AMBIGUOUS, "connection reset after write")
     pub = _writer(tmp_ws, c)
 
     outcome = pub.publish_role_handoff(
         handoff_id="ho-term", role="verifier", outcome_class="completed",
-        task_number=TASK, evidence="approved", changed="none",
+        task_number=TASK, pr_number=99, evidence="approved", changed="none",
     )
     assert outcome.verified and outcome.deduplicated
     assert len(_crew_posts(c)) == 1
@@ -221,10 +291,10 @@ def test_permission_denial_pauses_as_human_blocker(tmp_ws: Workspace):
 
 
 # ── 4. end-to-end self-heal: WAIT → resume → reconcile → continue ───────
-def test_outage_self_heals_on_resume_without_operator_mutation(tmp_ws: Workspace):
+def test_outage_self_heals_on_plain_run_without_operator_mutation(tmp_ws: Workspace):
     """The canonical #49 flow: the worker's terminal handoff cannot verify during a
     transient outage → run WAITS. The operator does NOT touch the record; once the
-    bus recovers a plain ``crewd resume`` reconciles the reserved terminal write
+    bus recovers a plain ``crewd run`` reconciles the reserved terminal write
     (idempotent, no duplicate) and the run continues — the handoff is consumed."""
     c = FakeGitHubClient(REPO)
     _valid_worker_record(c)
@@ -253,7 +323,7 @@ def test_outage_self_heals_on_resume_without_operator_mutation(tmp_ws: Workspace
     fake2 = FakeExecutor(lead_script=[wait("external")], role_handoff=_material_handoff)
     disp2 = Dispatcher(tmp_ws.state_dir / "dispatch.db")
     orch2, _ = _orch(tmp_ws, fake2, pub2, disp=disp2)
-    orch2.run(once=False, resume=True)
+    orch2.run(once=False)
 
     assert pub2.counts()["pending"] == 0
     # Exactly one worker terminal comment exists (reconcile did not double-post).

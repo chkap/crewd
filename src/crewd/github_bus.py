@@ -215,10 +215,22 @@ class PrereqOutcome:
 
 
 def route_for_error(err: GitHubError) -> PrereqOutcome:
-    """Map a classified GitHub failure to an explicit recoverable route."""
+    """Map a classified GitHub failure to an explicit typed route (issue #49).
+
+    * ``PERMISSION`` → :attr:`Route.PAUSE` — a genuine credential / policy denial
+      that only an operator can clear.
+    * ``NOT_FOUND`` → :attr:`Route.REJECT` — a deleted / missing target is a
+      permanent invalid-target condition, NOT something a retry will ever fix, so
+      it terminates explicitly instead of looping in WAIT forever.
+    * rate-limit / timeout / transient / ambiguous → :attr:`Route.WAIT` — a
+      recoverable condition that self-heals on a bounded retry/reconcile.
+    """
     if err.kind is GitHubErrorKind.PERMISSION:
         return PrereqOutcome(Route.PAUSE, f"github permission error: {err.detail}",
                              error_kind=err.kind)
+    if err.kind is GitHubErrorKind.NOT_FOUND:
+        return PrereqOutcome(Route.REJECT, f"github target not found: {err.detail}",
+                             reason=RejectReason.MISSING, error_kind=err.kind)
     # rate-limit / timeout / transient / ambiguous → retry via wait
     return PrereqOutcome(Route.WAIT, f"github {err.kind.value}: {err.detail}",
                          error_kind=err.kind)
@@ -448,6 +460,113 @@ class PublicBus:
                     return c
         return None
 
+    # -- terminal-publication authorization (issue #49) --
+    def authorize_terminal(
+        self, *, task_number: int, pr_number: Optional[int] = None
+    ) -> PrereqOutcome:
+        """Authorize a *terminal* attributed write to a bound task issue.
+
+        A terminal record (a Verifier/Lead handoff published at the end of an
+        attempt) must target the exact routed task under the current
+        repository/goal namespace. Unlike a dispatch prerequisite this tolerates a
+        *closed* task — but only when the closure is provably caused by the
+        verified linked merge, so an unrelated / stale closure is rejected rather
+        than silently accepted:
+
+        * wrong repository, missing task label, or wrong goal label →
+          :attr:`Route.REJECT` (an invalid target that a retry can never fix).
+        * task not found (deleted) → ``REJECT`` (invalid/deleted target).
+        * task **open** → ``PROCEED`` (with the linked PR, if any, captured).
+        * task **closed** with a merged PR that links it (matching ``pr_number``
+          when one was persisted) → ``PROCEED`` (closed-but-proven; comment
+          permitted without reopening).
+        * task **closed** with no such merged linked PR → ``REJECT``
+          (``UNVERIFIED``: unrelated/stale closure — do not post).
+
+        A transient GitHub failure while reading the record surfaces as
+        :attr:`Route.WAIT`/``PAUSE`` via :func:`route_for_error`, so a lookup
+        outage self-heals instead of terminating.
+        """
+        if (bad := self._check_repo()) is not None:
+            return bad
+        try:
+            issue = self.client.get_issue(task_number)
+        except GitHubError as e:
+            return route_for_error(e)
+        if issue is None:
+            return PrereqOutcome.reject(
+                RejectReason.MISSING,
+                f"terminal target task #{task_number} not found (deleted/missing)",
+            )
+        if not _has_label(issue, self.task_label):
+            return PrereqOutcome.reject(
+                RejectReason.WRONG_GOAL,
+                f"terminal target #{task_number} lacks {self.task_label!r} label",
+            )
+        if not _has_label(issue, self.goal_label):
+            return PrereqOutcome.reject(
+                RejectReason.WRONG_GOAL,
+                f"terminal target #{task_number} not labelled current goal "
+                f"{self.goal_label!r}",
+            )
+        try:
+            merged_pr = self._linked_merged_pr(task_number, pr_number)
+        except GitHubError as e:
+            return route_for_error(e)
+        if issue.state == "open":
+            return PrereqOutcome.proceed(
+                f"terminal target #{task_number} open",
+                task=task_number,
+                pr=(merged_pr.number if merged_pr else None),
+            )
+        # Closed: require the verified linked merge as closure provenance.
+        if merged_pr is None:
+            want = f" (expected PR #{pr_number})" if pr_number else ""
+            return PrereqOutcome.reject(
+                RejectReason.UNVERIFIED,
+                f"terminal target #{task_number} is closed with no merged linked "
+                f"PR{want} — unrelated/stale closure, not a verified linked merge",
+            )
+        return PrereqOutcome.proceed(
+            f"terminal target #{task_number} closed by merged PR #{merged_pr.number}",
+            task=task_number,
+            pr=merged_pr.number,
+        )
+
+    def _linked_merged_pr(
+        self, task_number: int, pr_number: Optional[int]
+    ) -> Optional[PullRef]:
+        """The merged PR that links ``task_number`` (matching ``pr_number`` when a
+        specific PR was persisted at Verifier routing), or ``None``."""
+        pulls = self.client.list_pulls(state="all")
+        for p in pulls:
+            if p.state != "merged":
+                continue
+            if task_number not in p.linked_issues:
+                continue
+            if pr_number is not None and p.number != pr_number:
+                continue
+            return p
+        return None
+
+    def linked_pr(self, task_number: int) -> Optional[int]:
+        """The open-or-merged PR number linking ``task_number`` at routing time.
+
+        Captured into the durable lifecycle record so a later closed-target
+        terminal write can prove the closure came from that exact merge."""
+        try:
+            pulls = self.client.list_pulls(state="all")
+        except GitHubError:
+            return None
+        linked = [p for p in pulls if task_number in p.linked_issues]
+        if not linked:
+            return None
+        # Prefer a merged link (closure provenance) then an open one.
+        for p in linked:
+            if p.state == "merged":
+                return p.number
+        return linked[0].number
+
     # -- typed reference resolution (public record → active identifiers) --
     #
     # The dispatcher journal is role-based and does not name a task/PR; the
@@ -592,6 +711,11 @@ class PublicBus:
     def _post_error(err: GitHubError) -> PostOutcome:
         if err.kind is GitHubErrorKind.PERMISSION:
             return PostOutcome(Route.PAUSE, f"github permission error: {err.detail}",
+                               error_kind=err.kind)
+        if err.kind is GitHubErrorKind.NOT_FOUND:
+            # A deleted / missing target can never be posted to: terminate as an
+            # invalid target rather than retrying forever (issue #49).
+            return PostOutcome(Route.REJECT, f"github target not found: {err.detail}",
                                error_kind=err.kind)
         return PostOutcome(Route.WAIT, f"github {err.kind.value}: {err.detail}",
                            error_kind=err.kind)

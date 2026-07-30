@@ -206,6 +206,20 @@ class Orchestrator:
     def run(self, once: bool, resume: bool = False) -> int:
         run = self.disp.start_or_resume_run(self.goal_label)
         status = RunStatus(run.status)
+        # A recoverable public-write WAIT is system-owned: reconcile it before the
+        # non-active early exit, then reactivate the run once every pending write
+        # has either verified or reached a typed terminal disposition. This keeps
+        # ordinary closure/API races self-healing under plain ``crewd run`` while
+        # preserving explicit resume for Lead-authored waits and human pauses.
+        if (
+            status is RunStatus.WAITING
+            and self._publisher is not None
+            and self._publisher.has_recoverable_pending()
+        ):
+            self._reconcile_public_writes(force=True)
+            if not self._publisher.has_recoverable_pending():
+                run = self.disp.resume_run(run.id)
+                status = RunStatus(run.status)
         # A non-active run holds a durable state — a paused human blocker, a wait
         # condition, an interrupt, an operator stop, or a terminal
         # finished/exhausted. A plain `crewd run` MUST NOT erase it: reviving a
@@ -505,13 +519,13 @@ class Orchestrator:
             f"(-> {target_role or 'role'}): {detail}",
         )
 
-    def _reconcile_public_writes(self) -> None:
+    def _reconcile_public_writes(self, *, force: bool = False) -> None:
         """Finish any durable public-write intents left reserved by a crash."""
         publisher = self._publisher
         if publisher is None:
             return
         try:
-            results = publisher.reconcile()
+            results = publisher.reconcile(force=force)
         except Exception as exc:  # reconciliation must never abort the run
             console.print(f"[yellow]public-write reconcile error: {exc}[/]")
             return
