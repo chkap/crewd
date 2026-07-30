@@ -59,6 +59,35 @@ path = "src/crewd/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/crewd"]
+# The installed wheel ships only the importable package: Python modules plus the
+# runtime Jinja templates that live under `src/crewd/templates`. LICENSE is
+# bundled automatically via `license-files`. Tests, docs, developer scripts, and
+# bytecode caches are never part of the wheel (see tests/test_release_artifacts.py).
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+    "**/*.pyo",
+]
+
+[tool.hatch.build.targets.sdist]
+# Reproducible, lean source distribution (#52): everything required to rebuild
+# the wheel plus the packaging-facing docs, and nothing else. Tests, developer/
+# live-only scripts, retrospective material, design docs, lockfiles, caches, and
+# local crew/workspace state are intentionally excluded. The exact contract is
+# enforced by tests/test_release_artifacts.py so it cannot silently regress.
+include = [
+    "/src/crewd",
+    "/pyproject.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/SKILL.md",
+]
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+    "**/*.pyo",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
