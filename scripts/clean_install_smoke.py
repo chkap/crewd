@@ -17,7 +17,8 @@ dependency and without any live SDK or GitHub call. For each artifact it:
 
    * ``python -c 'import crewd; print(crewd.__version__)'`` → import + version
      (also asserts the import resolves to site-packages, not the checkout)
-   * ``crewd --help`` (lists subcommands)
+   * ``crewd --version`` (documented installed version flag) and ``crewd --help``
+     (lists subcommands)
    * ``crewd init <ws> --repo acme/widget`` (offline scaffold; no clone)
    * ``crewd refresh -w <ws>`` and ``crewd doctor -w <ws>`` on that workspace
 
@@ -146,7 +147,15 @@ def smoke_one(artifact: Path, workroot: Path) -> dict:
     from_checkout = str(ROOT) in loc.stdout
     record("import_outside_checkout", loc.returncode == 0 and not from_checkout, loc.stdout)
 
-    # 3b. `crewd --help` lists the operator subcommands
+    # 3b. `crewd --version` reports the installed version (documented flag).
+    ver = _run([str(crewd), "--version"], cwd=cwd_dir, env=cenv)
+    record(
+        "cli_version",
+        ver.returncode == 0 and VERSION in ver.stdout,
+        ver.stdout + ver.stderr,
+    )
+
+    # 3c. `crewd --help` lists the operator subcommands
     hlp = _run([str(crewd), "--help"], cwd=cwd_dir, env=cenv)
     help_ok = hlp.returncode == 0 and all(s in hlp.stdout for s in REQUIRED_SUBCOMMANDS)
     record("cli_help", help_ok, hlp.stdout + hlp.stderr)

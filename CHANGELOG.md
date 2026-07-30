@@ -65,10 +65,12 @@ coordinating entirely through GitHub Issues and Pull Requests.
   activity, and a safe next action) with bounded secret redaction of durable
   logs.
 - **Public package contract.** MIT licensed (SPDX metadata + bundled `LICENSE`);
-  a single authoritative version (`crewd.__version__`, consumed by the build so
-  package metadata cannot drift); complete PyPI metadata (description, authors,
-  keywords, project URLs, `requires-python >=3.11`). The supported public
-  contract is the `crewd` CLI, not an importable typed API (no `py.typed`).
+  a single authoritative version (`crewd.__version__`, reported by `crewd
+  --version` and consumed by the build so package metadata cannot drift);
+  complete PyPI metadata (description, authors, keywords, project URLs,
+  `requires-python >=3.11`) with Python 3.11–3.14 verified by the build-once
+  release CI. The supported public contract is the `crewd` CLI, not an
+  importable typed API (no `py.typed`).
 
 ### Known limitations
 
