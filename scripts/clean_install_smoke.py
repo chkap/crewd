@@ -86,6 +86,9 @@ def _run(cmd: list[str], *, cwd: Path, env: dict, timeout: int = 180):
 
 def smoke_one(artifact: Path, workroot: Path) -> dict:
     """Install *artifact* into a fresh venv and exercise the offline surface."""
+    # Resolve to an absolute path: pip runs with cwd=workroot below, so a
+    # relative artifact path (e.g. CI's ``--dist dist``) would not resolve.
+    artifact = Path(artifact).resolve()
     venv_dir = workroot / "venv"
     home_dir = workroot / "home"
     cwd_dir = workroot / "cwd"
@@ -236,7 +239,11 @@ def main(argv: list[str] | None = None) -> int:
             for name in unmet:
                 snippet = res.get("details", {}).get(name, "").strip().splitlines()
                 if snippet:
-                    print(f"          {name}: {snippet[-1][:200]}")
+                    err = next(
+                        (ln for ln in snippet if "ERROR" in ln or "error:" in ln),
+                        snippet[-1],
+                    )
+                    print(f"          {name}: {err[:200]}")
     print(f"\noverall: {'PASS' if manifest['passed'] else 'FAIL'}")
     return 0 if manifest["passed"] else 1
 
