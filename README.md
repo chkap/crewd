@@ -376,7 +376,7 @@ crewd 0.1.0 is an early public release. Known constraints:
 - Backend: **official GitHub Copilot SDK** (`backend: copilot-sdk`, default). The legacy `gh copilot` subprocess backend is retired — selecting `backend: copilot` fails with a migration error.
 - Tested on Linux (Azure VM). Templates live in `src/crewd/templates/agents/*.j2`.
 - See `tests/` for unit coverage; integration testing is via dogfooding on real repos.
-- Changelog: [`CHANGELOG.md`](CHANGELOG.md).
+- Changelog: [`CHANGELOG.md`](https://github.com/chkap/crewd/blob/main/CHANGELOG.md).
 
 ---
 
@@ -418,16 +418,16 @@ scripts/
 
 ## Design docs
 
-- [`docs/retrospective-orchestration.md`](docs/retrospective-orchestration.md) — evidence-led
+- [`docs/retrospective-orchestration.md`](https://github.com/chkap/crewd/blob/main/docs/retrospective-orchestration.md) — evidence-led
   retrospective of prior crew histories. Establishes the orchestration, prompt, observability,
   and recovery requirements that the SDK-native, Lead-directed refactor is built against.
-- [`docs/sdk-backend.md`](docs/sdk-backend.md) — SDK-native role backend (`backend: copilot-sdk`):
+- [`docs/sdk-backend.md`](https://github.com/chkap/crewd/blob/main/docs/sdk-backend.md) — SDK-native role backend (`backend: copilot-sdk`):
   transport decision (per-role stdio), the one-attempt lifecycle state machine, offline-verified
   `github-copilot-sdk` capability facts, the (now resolved) capability risks, and the bounded
   live-smoke procedure.
-- [`docs/dispatcher.md`](docs/dispatcher.md) — durable dispatch kernel: journal schema, exclusive
+- [`docs/dispatcher.md`](https://github.com/chkap/crewd/blob/main/docs/dispatcher.md) — durable dispatch kernel: journal schema, exclusive
   Lead authority, at-least-once idempotent handoffs, restart reconciliation, and schema migration.
-- [`docs/orchestrator.md`](docs/orchestrator.md) — Lead-directed run loop: exit reasons, pre-send
+- [`docs/orchestrator.md`](https://github.com/chkap/crewd/blob/main/docs/orchestrator.md) — Lead-directed run loop: exit reasons, pre-send
   journal identity, the exactly-one typed channel, mid-attempt cancellation, and operator diagnostics.
 
-License: MIT (see [`LICENSE`](LICENSE)). crewd is free and open source software.
+License: MIT (see [`LICENSE`](https://github.com/chkap/crewd/blob/main/LICENSE)). crewd is free and open source software.
