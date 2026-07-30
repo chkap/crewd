@@ -376,7 +376,7 @@ crewd 0.1.0 is an early public release. Known constraints:
 - Backend: **official GitHub Copilot SDK** (`backend: copilot-sdk`, default). The legacy `gh copilot` subprocess backend is retired — selecting `backend: copilot` fails with a migration error.
 - Tested on Linux (Azure VM). Templates live in `src/crewd/templates/agents/*.j2`.
 - See `tests/` for unit coverage; integration testing is via dogfooding on real repos.
-- Changelog: [`CHANGELOG.md`](https://github.com/chkap/crewd/blob/main/CHANGELOG.md).
+- Changelog: [`CHANGELOG.md`](https://github.com/chkap/crewd/blob/e677c8abb1eaaebeb901c68b0c9e39c19892a311/CHANGELOG.md).
 
 ---
 
