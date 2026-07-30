@@ -369,7 +369,11 @@ _LEAD_TOOL_DESCRIPTION = (
     "task_number (the exact crewd:task issue number this dispatch targets — "
     "REQUIRED for kind=dispatch to worker/verifier so the routed task identity "
     "is carried through the attempt, handoff, and Verifier routing rather than "
-    "re-guessed from the public record); reason (optional rationale); "
+    "re-guessed from the public record); intent (the mode this dispatch is "
+    "routed under: one of implementation, verifier_audit, acceptance, release, "
+    "advisory — defaults to implementation; use verifier_audit/acceptance/"
+    "release for a Lead-assigned verifier-only task that has no Worker PR or "
+    "readiness to review); reason (optional rationale); "
     "wake_condition (required for kind=wait); human_blocker (required for "
     "kind=pause); final_acceptance (required for kind=finish)."
 )
@@ -400,6 +404,14 @@ def _lead_decision_params_model():
             description=(
                 "exact crewd:task issue number this dispatch targets "
                 "(required for kind=dispatch to worker/verifier)"
+            ),
+        )
+        intent: Optional[str] = Field(
+            default=None,
+            description=(
+                "dispatch mode: implementation (default), verifier_audit, "
+                "acceptance, release, or advisory; use a verifier-only intent "
+                "for a Lead-assigned audit/acceptance with no Worker PR"
             ),
         )
         reason: Optional[str] = Field(default=None, description="optional rationale")

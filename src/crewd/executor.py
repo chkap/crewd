@@ -583,6 +583,20 @@ def _coerce_task_number(raw) -> Optional[int]:
     raise ValueError(f"task_number is not an integer: {raw!r}")
 
 
+def _coerce_intent(raw):
+    """Coerce an untrusted ``intent`` payload field into a DispatchIntent.
+
+    Shape tolerance only (#64): an absent/blank/unknown value conservatively
+    yields :attr:`DispatchIntent.IMPLEMENTATION` (the strongest safeguard set),
+    so a Lead turn that omits the field never silently drops the Worker-readiness
+    gate. A verifier-only audit/acceptance/release/advisory must be named
+    explicitly.
+    """
+    from .dispatcher import DispatchIntent
+
+    return DispatchIntent.coerce(raw)
+
+
 def parse_lead_decision(payload) -> LeadDecision:
     """Parse an untrusted ``submit_lead_decision`` payload into a LeadDecision.
 
@@ -606,7 +620,7 @@ def parse_lead_decision(payload) -> LeadDecision:
         task_number = _coerce_task_number(payload.get("task_number"))
         return LeadDecision.dispatch(
             payload["role"], ack=ack, reason=payload.get("reason"),
-            task_number=task_number,
+            task_number=task_number, intent=_coerce_intent(payload.get("intent")),
         )
     if kind is DecisionKind.CONTINUE_LEAD:
         return LeadDecision.continue_lead(ack=ack, reason=payload.get("reason"))

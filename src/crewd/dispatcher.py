@@ -75,6 +75,41 @@ class DecisionKind(str, Enum):
     SOLICIT_LEAD = "solicit_lead"   # a journaled, budgeted turn that asks Lead to decide
 
 
+class DispatchIntent(str, Enum):
+    """The mode a dispatch is routed under (issue #64).
+
+    Gate policy is intent-aware: a normal implementation review keeps the
+    canonical linked-PR + Worker-readiness safeguards, while a Lead-assigned
+    verifier-only audit / acceptance / release / advisory consult must not
+    require fictitious Worker implementation work. Legacy / untyped dispatches
+    read as :attr:`IMPLEMENTATION` — the conservative default that preserves the
+    strongest safeguards for any record written before this column existed.
+    """
+
+    IMPLEMENTATION = "implementation"   # normal implement→review (full safeguards)
+    VERIFIER_AUDIT = "verifier_audit"   # Lead-assigned read-only audit (no fake Worker work)
+    ACCEPTANCE = "acceptance"           # acceptance verification (no fake Worker work)
+    RELEASE = "release"                 # release / post-publication verification
+    ADVISORY = "advisory"               # non-binding advisory consult
+
+    @classmethod
+    def coerce(cls, raw) -> "DispatchIntent":
+        """Coerce an untrusted / legacy value to a known intent.
+
+        ``None``, empty, or an unrecognised value → :attr:`IMPLEMENTATION` (the
+        conservative default), so a missing/legacy record never silently drops a
+        Worker-readiness safeguard.
+        """
+        if isinstance(raw, cls):
+            return raw
+        if not raw:
+            return cls.IMPLEMENTATION
+        try:
+            return cls(str(raw).strip().lower())
+        except ValueError:
+            return cls.IMPLEMENTATION
+
+
 class RunStatus(str, Enum):
     ACTIVE = "active"
     WAITING = "waiting"
@@ -152,6 +187,7 @@ class LeadDecision:
     human_blocker: Optional[str] = None   # for PAUSE
     final_acceptance: Optional[str] = None  # for FINISH
     task_number: Optional[int] = None     # the exact crewd:task this DISPATCH targets
+    intent: "DispatchIntent" = None       # the mode this DISPATCH is routed under (#64)
 
     @staticmethod
     def dispatch(
@@ -160,10 +196,11 @@ class LeadDecision:
         ack: tuple[str, ...] = (),
         reason: str | None = None,
         task_number: int | None = None,
+        intent: "DispatchIntent | str | None" = None,
     ) -> "LeadDecision":
         return LeadDecision(
             DecisionKind.DISPATCH, ack_handoff_ids=ack, role=role, reason=reason,
-            task_number=task_number,
+            task_number=task_number, intent=DispatchIntent.coerce(intent),
         )
 
     @staticmethod
@@ -215,6 +252,7 @@ class DispatchView:
     created_at: str
     task_number: Optional[int] = None
     pr_number: Optional[int] = None
+    intent: "DispatchIntent" = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +271,8 @@ class DecisionResult:
     guard_reason: Optional[str] = None
     solicitation_invalid: bool = False
     invalid_reason: Optional[str] = None
+    gate_corrected: bool = False
+    gate_correction_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +324,8 @@ class RunView:
     human_blocker: Optional[str]
     authority_seq: int = 0
     invalid_solicitations: int = 0
+    consecutive_corrections: int = 0
+    gate_correction: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +352,7 @@ class DispatcherLimits:
     max_consecutive_unproductive: int = 5
     max_edge_repeats: int = 3         # identical role edge repeated w/o new progress/handoff
     max_invalid_solicitations: int = 3  # invalid/failed Lead turns before a persisted pause
+    max_gate_corrections: int = 3       # consecutive correctable gate rejections before escalation
 
 
 LEAD_PENDING = "lead_pending"
@@ -330,6 +373,8 @@ CREATE TABLE IF NOT EXISTS goal_run (
     human_blocker TEXT,
     authority_seq INTEGER NOT NULL DEFAULT 0,
     invalid_solicitations INTEGER NOT NULL DEFAULT 0,
+    consecutive_corrections INTEGER NOT NULL DEFAULT 0,
+    gate_correction TEXT,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS dispatch (
@@ -341,6 +386,7 @@ CREATE TABLE IF NOT EXISTS dispatch (
     reason TEXT,
     task_number INTEGER,
     pr_number INTEGER,
+    intent TEXT,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS attempt (
@@ -417,7 +463,7 @@ class Dispatcher:
         self._migrate()
 
     # Bump when a schema change needs an in-place migration of existing DBs.
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
 
     def _migrate(self) -> None:
         """Idempotently upgrade a database created by an earlier kernel version.
@@ -460,6 +506,17 @@ class Dispatcher:
              "ALTER TABLE dispatch ADD COLUMN task_number INTEGER"),
             (dispatch_cols, "pr_number",
              "ALTER TABLE dispatch ADD COLUMN pr_number INTEGER"),
+            # #64: durable dispatch intent (nullable — a legacy/untyped row reads
+            # as IMPLEMENTATION via DispatchIntent.coerce, the conservative
+            # default that keeps the strongest safeguards); and the bounded
+            # gate-correction state that lets a correctable rejection return to
+            # Lead instead of being mislabeled as a human blocker.
+            (dispatch_cols, "intent",
+             "ALTER TABLE dispatch ADD COLUMN intent TEXT"),
+            (goal_run_cols, "consecutive_corrections",
+             "ALTER TABLE goal_run ADD COLUMN consecutive_corrections INTEGER NOT NULL DEFAULT 0"),
+            (goal_run_cols, "gate_correction",
+             "ALTER TABLE goal_run ADD COLUMN gate_correction TEXT"),
         ]
         pending = [sql for cols, name, sql in additions if name not in cols]
         self._conn.execute("BEGIN IMMEDIATE;")
@@ -550,7 +607,8 @@ class Dispatcher:
             c.execute(
                 "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = NULL, "
                 "human_blocker = NULL, consecutive_unproductive = 0, last_edge = NULL, "
-                "last_edge_repeats = 0, authority_seq = authority_seq + 1 WHERE id = ?",
+                "last_edge_repeats = 0, consecutive_corrections = 0, gate_correction = NULL, "
+                "authority_seq = authority_seq + 1 WHERE id = ?",
                 (RunStatus.ACTIVE.value, LEAD_PENDING, run_id),
             )
             run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
@@ -944,6 +1002,7 @@ class Dispatcher:
         outcome: AttemptOutcome,
         decision: Optional[LeadDecision],
         configured_roles,
+        gate_correction: Optional[str] = None,
     ) -> DecisionResult:
         """Consume a solicited Lead decision exactly once, atomically.
 
@@ -989,14 +1048,37 @@ class Dispatcher:
                 (AttemptState.TERMINAL.value, outcome.value, _now(), attempt_id),
             )
 
+            # A candidate decision may only advance state — including being
+            # downgraded to a typed gate correction (#64) — once the solicitation
+            # is proven clean and valid for the *current* authority window: a
+            # clean outcome, a well-formed non-solicit decision, an unchanged
+            # authority nonce still owned by this solicit dispatch, acknowledgement
+            # of exactly the snapshot's pending handoffs, and a configured dispatch
+            # role. A failed, malformed, or stale solicitation takes the
+            # invalid/stale path below and is NEVER downgraded to a benign
+            # correction.
             snapshot = set(json.loads(sol["pending_ids"]))
             ok, reason = self._solicitation_valid(
                 run, sol, outcome, decision, configured, snapshot
             )
             if ok:
                 assert decision is not None
+                # The Lead turn was well-formed and valid for this authority
+                # window. A correctable, intent-aware gate rejection means the
+                # public record does not yet satisfy the routed intent's predicate:
+                # drop the candidate WITHOUT reserving an attempt, acking a handoff,
+                # transferring authority, or rebinding task/PR identity, and return
+                # a typed correction to Lead so it can repair the record or reroute.
+                # Bounded: after ``max_gate_corrections`` consecutive corrections it
+                # settles into a WAITING state (not a human PAUSE) so a persistently
+                # inconsistent public record surfaces without a false human blocker.
+                if gate_correction is not None:
+                    return self._record_gate_correction(c, run, sol["run_id"], gate_correction)
+                # A productive Lead decision clears the correctable-gate streak and
+                # any stored correction so a later unrelated rejection starts fresh.
                 c.execute(
-                    "UPDATE goal_run SET invalid_solicitations = 0 WHERE id = ?",
+                    "UPDATE goal_run SET invalid_solicitations = 0, "
+                    "consecutive_corrections = 0, gate_correction = NULL WHERE id = ?",
                     (sol["run_id"],),
                 )
                 return self._apply_solicited_decision(c, sol["run_id"], decision)
@@ -1084,6 +1166,56 @@ class Dispatcher:
             )
         return False, None
 
+    def _record_gate_correction(
+        self, c, run, run_id: str, correction: str
+    ) -> DecisionResult:
+        """Return a typed, bounded gate correction to Lead (#64).
+
+        Keeps authority with Lead (``LEAD_PENDING``) and the run ``active`` while
+        the streak is under ``max_gate_corrections`` — a later Lead turn can
+        repair the public record or reroute — bumping the authority nonce so the
+        dropped candidate can never apply under a stale window. When the streak
+        reaches the cap the run settles into a bounded ``WAITING`` state with a
+        wake condition (NOT a human ``PAUSED``): a correctable public-record
+        inconsistency that merely repeats is not a human blocker (GOAL.md), so it
+        surfaces as a recoverable wait that a later reconcile/resume re-evaluates
+        rather than halting for an operator. The correctable rejection is
+        deliberately NOT counted as an invalid Lead solicitation.
+        """
+        streak = (run["consecutive_corrections"] or 0) + 1
+        cap = self.limits.max_gate_corrections
+        if cap and streak >= cap:
+            wake = (
+                f"{streak} consecutive uncorrected gate rejections (cap {cap}); "
+                f"latest correction: {correction}"
+            )
+            c.execute(
+                "UPDATE goal_run SET consecutive_corrections = ?, gate_correction = ?, "
+                "status = ?, routing_authority = ?, wake_condition = ?, "
+                "authority_seq = authority_seq + 1 WHERE id = ?",
+                (streak, correction, RunStatus.WAITING.value, LEAD_PENDING, wake, run_id),
+            )
+        else:
+            c.execute(
+                "UPDATE goal_run SET consecutive_corrections = ?, gate_correction = ?, "
+                "routing_authority = ?, authority_seq = authority_seq + 1 WHERE id = ?",
+                (streak, correction, LEAD_PENDING, run_id),
+            )
+        fresh = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
+        return DecisionResult(
+            run=_run_view(fresh),
+            gate_corrected=True,
+            gate_correction_reason=correction,
+        )
+
+    def latest_gate_correction(self, run_id: str) -> Optional[str]:
+        """The most recent typed gate correction returned to Lead, or ``None``."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT gate_correction FROM goal_run WHERE id = ?", (run_id,)
+            ).fetchone()
+        return row["gate_correction"] if row is not None else None
+
     def _synthetic_pause(self, c, run_id: str, blocker: str) -> None:
         """Emit one synthetic handoff and pause, rather than looping into Lead forever.
 
@@ -1120,10 +1252,11 @@ class Dispatcher:
         dispatch_id = _new_id("dsp")
         c.execute(
             "INSERT INTO dispatch "
-            "(id, run_id, seq, kind, role, reason, task_number, pr_number, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, run_id, seq, kind, role, reason, task_number, pr_number, intent, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (dispatch_id, run_id, seq, decision.kind.value, decision.role,
-             decision.reason, decision.task_number, None, _now()),
+             decision.reason, decision.task_number, None,
+             (decision.intent.value if decision.intent else None), _now()),
         )
         row = c.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
         return _dispatch_view(row)
@@ -1411,6 +1544,13 @@ def _run_view(row: sqlite3.Row) -> RunView:
         human_blocker=row["human_blocker"],
         authority_seq=row["authority_seq"],
         invalid_solicitations=row["invalid_solicitations"],
+        consecutive_corrections=(
+            row["consecutive_corrections"]
+            if "consecutive_corrections" in row.keys() else 0
+        ),
+        gate_correction=(
+            row["gate_correction"] if "gate_correction" in row.keys() else None
+        ),
     )
 
 
@@ -1418,11 +1558,21 @@ def _dispatch_view(row: sqlite3.Row) -> DispatchView:
     keys = row.keys()
     task_number = row["task_number"] if "task_number" in keys else None
     pr_number = row["pr_number"] if "pr_number" in keys else None
+    intent_raw = row["intent"] if "intent" in keys else None
+    # A DISPATCH always carries an intent (legacy/untyped → IMPLEMENTATION); a
+    # non-dispatch audit row (wait/pause/finish/continue/solicit) has none.
+    kind = DecisionKind(row["kind"])
+    intent = (
+        DispatchIntent.coerce(intent_raw)
+        if kind is DecisionKind.DISPATCH
+        else (DispatchIntent.coerce(intent_raw) if intent_raw else None)
+    )
     return DispatchView(
-        id=row["id"], run_id=row["run_id"], seq=row["seq"], kind=DecisionKind(row["kind"]),
+        id=row["id"], run_id=row["run_id"], seq=row["seq"], kind=kind,
         role=row["role"], reason=row["reason"], created_at=row["created_at"],
         task_number=task_number,
         pr_number=pr_number,
+        intent=intent,
     )
 
 

@@ -183,6 +183,55 @@ class RejectReason(str, enum.Enum):
     NO_OWNER = "no_owner"
     UNATTRIBUTED = "unattributed"
 
+    @property
+    def lead_correctable(self) -> bool:
+        """Whether Lead can repair this rejection by editing the public record.
+
+        Every rejection except :attr:`WRONG_REPO` is a correctable internal /
+        public-record inconsistency (missing assignment, missing readiness,
+        ambiguous census, stale/unrelated closure, wrong-goal label): Lead can
+        post the assignment/readiness, close a duplicate, relabel, or reroute
+        under a different intent. ``WRONG_REPO`` is a workspace/configuration
+        error only an operator can fix, so it is *not* Lead-correctable (#64).
+        """
+        return self is not RejectReason.WRONG_REPO
+
+
+# Suggested Lead actions surfaced with a typed correction, keyed by the failed
+# predicate. These are advice for Lead's routing turn, not a fixed policy — Lead
+# retains final authority (repair the record, reroute, wait, or escalate).
+_CORRECTION_ACTIONS: dict = {
+    RejectReason.NO_ASSIGNMENT: (
+        "repair_public_record: assign the task or post a Lead→worker assignment",
+        "reroute", "wait", "escalate",
+    ),
+    RejectReason.NOT_READY: (
+        "repair_public_record: post the attributed Worker readiness record, "
+        "or reroute under a verifier-only audit/acceptance intent",
+        "reroute", "wait", "escalate",
+    ),
+    RejectReason.MISSING: (
+        "repair_public_record: create/link the missing task/PR/summary artifact",
+        "reroute", "wait", "escalate",
+    ),
+    RejectReason.MULTIPLE: (
+        "repair_public_record: close the duplicate so exactly one open record remains",
+        "reroute", "wait", "escalate",
+    ),
+    RejectReason.CLOSED: (
+        "repair_public_record: reopen the task, or route a post-merge terminal intent",
+        "reroute", "wait", "escalate",
+    ),
+    RejectReason.WRONG_GOAL: (
+        "repair_public_record: relabel the task to the current goal epoch",
+        "reroute", "escalate",
+    ),
+    RejectReason.UNVERIFIED: (
+        "repair_public_record: link the merged PR that closed the task, or reopen it",
+        "reroute", "wait", "escalate",
+    ),
+}
+
 
 class Route(str, enum.Enum):
     """How the orchestrator must act on a prerequisite/post outcome."""
@@ -191,6 +240,7 @@ class Route(str, enum.Enum):
     REJECT = "reject"       # public record invalid; do NOT advance, no handoff consumed
     WAIT = "wait"           # transient GitHub failure; retry via a wake condition
     PAUSE = "pause"         # human-only blocker (permission); halt for operator
+
 
 
 @dataclass(frozen=True)
@@ -212,6 +262,60 @@ class PrereqOutcome:
     @staticmethod
     def reject(reason: RejectReason, detail: str) -> "PrereqOutcome":
         return PrereqOutcome(Route.REJECT, detail, reason=reason)
+
+
+@dataclass(frozen=True)
+class GateCorrection:
+    """A typed, non-mutating gate correction returned to Lead (#64).
+
+    Emitted when a dispatch/finish gate rejects a transition. It carries the
+    exact binding, the failed predicate, the observed evidence, the allowed Lead
+    actions, a retry classification, and a wake condition where applicable — so
+    Lead can repair the public record or reroute with precise evidence rather
+    than being handed an opaque human blocker. Producing a correction never
+    mutates any public or durable state.
+
+    ``retry_class`` separates a *correctable* internal / public-record
+    inconsistency Lead can repair from a *transient* condition that self-heals on
+    a wake, and an *operator* prerequisite only a human can clear.
+    """
+
+    repo: str
+    goal: str
+    role: str
+    intent: str
+    failed_predicate: str
+    observed: str
+    allowed_lead_actions: tuple
+    retry_class: str
+    task: Optional[int] = None
+    pr: Optional[int] = None
+    wake_condition: Optional[str] = None
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "repo": self.repo,
+            "goal": self.goal,
+            "role": self.role,
+            "intent": self.intent,
+            "task": self.task,
+            "pr": self.pr,
+            "failed_predicate": self.failed_predicate,
+            "observed": self.observed,
+            "allowed_lead_actions": list(self.allowed_lead_actions),
+            "retry_class": self.retry_class,
+            "wake_condition": self.wake_condition,
+        }, sort_keys=True)
+
+    def summary(self) -> str:
+        """A compact single-line rendering for a Lead prompt / pause blocker."""
+        task = f" task #{self.task}" if self.task is not None else ""
+        pr = f" pr #{self.pr}" if self.pr is not None else ""
+        return (
+            f"gate correction [{self.retry_class}] {self.role}/{self.intent}"
+            f"{task}{pr} on {self.repo}@{self.goal}: failed {self.failed_predicate} — "
+            f"{self.observed}; allowed: {', '.join(self.allowed_lead_actions)}"
+        )
 
 
 def route_for_error(err: GitHubError) -> PrereqOutcome:
@@ -364,17 +468,70 @@ class PublicBus:
             assignment=(assignment.url if assignment else None),
         )
 
-    def _find_lead_assignment(self, task_number: int) -> Optional[CommentRef]:
+    def _find_lead_assignment(
+        self, task_number: int, targets: tuple = ("worker",)
+    ) -> Optional[CommentRef]:
         try:
             comments = self.client.list_comments(target="issue", number=task_number)
         except GitHubError:
             return None
         for c in comments:
             attr = Attribution.parse(c.body)
-            if attr and attr.role == "lead" and attr.target == "worker":
+            if attr and attr.role == "lead" and attr.target in targets:
                 if attr.validate(crew=self.crew) is None:
                     return c
         return None
+
+    # -- verifier-only audit / acceptance / release dispatch (#64) --
+    def verify_verifier_audit(self, task_number: int) -> PrereqOutcome:
+        """Intent-aware prerequisite for a Lead-assigned verifier-only task.
+
+        A verifier-only audit, acceptance, or post-publication verification is
+        routed by Lead directly to the Verifier — there is no Worker
+        implementation to review — so it must NOT require a linked PR or a
+        fictitious Worker readiness record (the #61 incident, where a generic
+        Worker-readiness gate blocked direct Verifier dispatch). It still fully
+        enforces pre-dispatch safety: exactly one open umbrella, and an open,
+        goal-linked ``crewd:task`` with observable ownership (an assignee or a
+        public Lead assignment to worker *or* verifier).
+        """
+        goal = self.verify_goal_prerequisite()
+        if not goal.ok:
+            return goal
+        try:
+            issue = self.client.get_issue(task_number)
+        except GitHubError as e:
+            return route_for_error(e)
+        if issue is None:
+            return PrereqOutcome.reject(
+                RejectReason.MISSING, f"task #{task_number} not found"
+            )
+        if issue.state != "open":
+            return PrereqOutcome.reject(
+                RejectReason.CLOSED, f"task #{task_number} is {issue.state}"
+            )
+        if not _has_label(issue, self.task_label):
+            return PrereqOutcome.reject(
+                RejectReason.MISSING,
+                f"task #{task_number} lacks {self.task_label!r} label",
+            )
+        if not _has_label(issue, self.goal_label):
+            return PrereqOutcome.reject(
+                RejectReason.WRONG_GOAL,
+                f"task #{task_number} not labelled current goal {self.goal_label!r}",
+            )
+        assignment = self._find_lead_assignment(task_number, targets=("worker", "verifier"))
+        if not issue.assignees and assignment is None:
+            return PrereqOutcome.reject(
+                RejectReason.NO_ASSIGNMENT,
+                f"task #{task_number} has no assignee and no public Lead assignment",
+            )
+        return PrereqOutcome.proceed(
+            f"task #{task_number} open, owned, goal-linked (verifier-only intent)",
+            umbrella=goal.refs.get("umbrella"),
+            task=task_number,
+            assignment=(assignment.url if assignment else None),
+        )
 
     # -- verifier dispatch --
     def verify_verifier_dispatch(self, task_number: int) -> PrereqOutcome:
@@ -752,8 +909,28 @@ class PublicBusGate:
             return PrereqOutcome.proceed(f"task #{pinned}", task=pinned)
         return self.bus.resolve_active_task()
 
+    # Verifier intents that carry no Worker implementation to review, so the
+    # linked-PR + Worker-readiness safeguards must NOT gate them (#64/#61).
+    _AUDIT_INTENTS = frozenset({"verifier_audit", "acceptance", "release", "advisory"})
+
+    @staticmethod
+    def _intent_value(intent) -> str:
+        """Normalise an intent (enum/str/None) to its lowercase string value.
+
+        A missing/unknown intent conservatively reads as ``implementation`` — the
+        strongest safeguard set — so a legacy/untyped dispatch never silently
+        drops the Worker-readiness gate.
+        """
+        if intent is None:
+            return "implementation"
+        val = getattr(intent, "value", intent)
+        val = str(val).strip().lower()
+        known = {"implementation"} | PublicBusGate._AUDIT_INTENTS
+        return val if val in known else "implementation"
+
     def evaluate(
-        self, role: str, dsp: object, *, task_number: Optional[int] = None
+        self, role: str, dsp: object, *, task_number: Optional[int] = None,
+        intent: object = None,
     ) -> Optional[PrereqOutcome]:
         if role not in ("worker", "verifier"):
             return None
@@ -763,13 +940,58 @@ class PublicBusGate:
         bound = task_number
         if bound is None:
             bound = getattr(dsp, "task_number", None)
+        if intent is None:
+            intent = getattr(dsp, "intent", None)
         task = self._resolve_task(bound)
         if not task.ok:
             return task
         number = task.refs["task"]
         if role == "worker":
+            # Worker is always an implementation actor; intent does not relax its
+            # ownership prerequisite.
             return self.bus.verify_worker_dispatch(number)
+        # Verifier: an implementation review keeps the linked-PR + Worker-readiness
+        # safeguards; a Lead-assigned verifier-only intent uses the audit predicate.
+        if self._intent_value(intent) in self._AUDIT_INTENTS:
+            return self.bus.verify_verifier_audit(number)
         return self.bus.verify_verifier_dispatch(number)
+
+    def build_correction(
+        self, role: str, intent: object, outcome: "PrereqOutcome",
+        *, task_number: Optional[int] = None,
+    ) -> GateCorrection:
+        """Build a typed :class:`GateCorrection` from a rejecting outcome (#64).
+
+        Pure: reads the bus's known repo/goal identity plus the outcome's reason,
+        detail, and refs. Never mutates any state.
+        """
+        reason = outcome.reason
+        if outcome.route is Route.PAUSE:
+            retry_class = "operator"
+            actions = ("escalate",)
+        elif outcome.route is Route.WAIT:
+            retry_class = "transient"
+            actions = ("wait", "reroute", "escalate")
+        elif reason is not None and reason.lead_correctable:
+            retry_class = "correctable"
+            actions = _CORRECTION_ACTIONS.get(reason, ("reroute", "wait", "escalate"))
+        else:
+            retry_class = "operator"
+            actions = ("escalate",)
+        refs = outcome.refs or {}
+        return GateCorrection(
+            repo=self.bus.expected_repo,
+            goal=self.bus.goal_label,
+            role=role,
+            intent=self._intent_value(intent),
+            failed_predicate=(reason.value if reason is not None else outcome.route.value),
+            observed=outcome.detail,
+            allowed_lead_actions=tuple(actions),
+            retry_class=retry_class,
+            task=(task_number if task_number is not None else refs.get("task")),
+            pr=refs.get("pr"),
+            wake_condition=(outcome.detail if outcome.route is Route.WAIT else None),
+        )
 
     def evaluate_finish(self) -> PrereqOutcome:
         """Verify the finish prerequisite (closed final-acceptance issue + public
