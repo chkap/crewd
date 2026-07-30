@@ -41,6 +41,7 @@ durable and retryable.
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -83,6 +84,37 @@ _RESUMABLE = {
     RunStatus.WAITING,
     RunStatus.INTERRUPTED,
     RunStatus.STOPPED,
+}
+
+
+@dataclass(frozen=True)
+class GateBlock:
+    """A refused authority transition, classified for recovery (issue #49).
+
+    ``route`` separates a *recoverable* condition that self-heals — ``Route.WAIT``:
+    a transient GitHub outage, a closed-target ordering/closure race, a stale
+    read-after-write, an ambiguous-but-landed write, or a deferred-yet-
+    reconcilable terminal publish — from a genuine *human* blocker —
+    ``Route.PAUSE``: a real credential / permission / policy denial. A
+    ``Route.REJECT`` is an invalid *public record* (wrong repo/goal, malformed
+    attribution) that will not fix itself on retry, so it also needs an operator.
+
+    The orchestrator marks the run ``WAITING`` for a recoverable block — a later
+    ``crewd run`` reconciles the durable intent and continues *without* operator
+    action — and ``PAUSED`` only for a real human blocker. This is the fix for a
+    terminal public-write ordering race being mis-reported as ``human-blocked``.
+    """
+
+    route: Route
+    detail: str
+
+
+# A gate block's route → the durable run status it drives. Recoverable routes
+# self-heal on the next run's reconcile; only a human blocker pauses.
+_BLOCK_STATUS = {
+    Route.WAIT: RunStatus.WAITING,
+    Route.PAUSE: RunStatus.PAUSED,
+    Route.REJECT: RunStatus.PAUSED,
 }
 
 
@@ -174,6 +206,20 @@ class Orchestrator:
     def run(self, once: bool, resume: bool = False) -> int:
         run = self.disp.start_or_resume_run(self.goal_label)
         status = RunStatus(run.status)
+        # A recoverable public-write WAIT is system-owned: reconcile it before the
+        # non-active early exit, then reactivate the run once every pending write
+        # has either verified or reached a typed terminal disposition. This keeps
+        # ordinary closure/API races self-healing under plain ``crewd run`` while
+        # preserving explicit resume for Lead-authored waits and human pauses.
+        if (
+            status is RunStatus.WAITING
+            and self._publisher is not None
+            and self._publisher.has_recoverable_pending()
+        ):
+            self._reconcile_public_writes(force=True)
+            if not self._publisher.has_recoverable_pending():
+                run = self.disp.resume_run(run.id)
+                status = RunStatus(run.status)
         # A non-active run holds a durable state — a paused human blocker, a wait
         # condition, an interrupt, an operator stop, or a terminal
         # finished/exhausted. A plain `crewd run` MUST NOT erase it: reviving a
@@ -242,15 +288,42 @@ class Orchestrator:
             return "human-blocked"
         return None
 
-    def _safe_mark(self, run_id: str, status: RunStatus, blocker: str | None = None) -> None:
+    def _safe_mark(
+        self, run_id: str, status: RunStatus,
+        blocker: str | None = None, *, wake_condition: str | None = None,
+    ) -> None:
         from .dispatcher import DecisionError
 
         try:
-            self.disp.mark_run_status(run_id, status, human_blocker=blocker)
+            self.disp.mark_run_status(
+                run_id, status, human_blocker=blocker, wake_condition=wake_condition
+            )
         except DecisionError:
             # Run already terminal (finished/exhausted); the operator control is
             # moot — the terminal reason still governs the exit.
             pass
+
+    def _apply_gate_block(self, run_id: str, block: "GateBlock", context: str) -> None:
+        """Halt the run for a refused transition, self-healing where possible.
+
+        A recoverable block (``Route.WAIT``: transient outage, closed-target
+        closure race, stale read-after-write, deferred-but-reconcilable terminal
+        publish) marks the run ``WAITING`` — a later ``crewd run`` reconciles the
+        durable public-write intent and continues *without* any operator action.
+        Only a genuine human blocker (``Route.PAUSE``: credential/permission/
+        policy) or an invalid public record (``Route.REJECT``) marks the run
+        ``PAUSED``/``human-blocked`` (issue #49).
+        """
+        status = _BLOCK_STATUS.get(block.route, RunStatus.PAUSED)
+        if status is RunStatus.WAITING:
+            self._safe_mark(run_id, status, wake_condition=block.detail)
+            console.print(
+                f"[yellow]{context}: {block.detail}; run waiting — a later "
+                f"`crewd run` reconciles the public write and continues[/]"
+            )
+        else:
+            self._safe_mark(run_id, status, block.detail)
+            console.print(f"[yellow]{context}: {block.detail}; run paused[/]")
 
     # ── one orchestration step ──
     def _step(self, run_id: str, routing_authority: str) -> None:
@@ -324,11 +397,11 @@ class Orchestrator:
         if gate_blocker is not None:
             # The transition was refused: authority stayed with Lead (decision was
             # not applied, so no handoff was acked and the run was not
-            # terminalised/dispatched). Halt with a descriptive public-bus blocker
-            # so the operator sees why.
-            self._safe_mark(run_id, RunStatus.PAUSED, gate_blocker)
-            console.print(
-                f"[yellow]public-bus gate blocked Lead decision: {gate_blocker}; run paused[/]"
+            # terminalised/dispatched). Halt with a route-classified public-bus
+            # blocker: a recoverable ordering/outage condition WAITS and self-heals
+            # on the next run's reconcile; only a real human blocker PAUSES (#49).
+            self._apply_gate_block(
+                run_id, gate_blocker, "public-bus gate blocked Lead decision"
             )
         self._persist_cycle()
 
@@ -396,9 +469,10 @@ class Orchestrator:
         self._inbox.acknowledge(role, attempt_id)
         self._persist_cycle()
 
-    def _lead_decision_publish_block(self, decision: object, run_id: str, pending: list) -> Optional[str]:
+    def _lead_decision_publish_block(self, decision: object, run_id: str, pending: list) -> Optional["GateBlock"]:
         """Reserve/post/verify a material Lead *dispatch* decision artifact BEFORE
-        it is applied; return a blocker to drop the decision, or ``None`` to allow.
+        it is applied; return a :class:`GateBlock` to drop the decision, or
+        ``None`` to allow.
 
         Only a dispatch (Lead → a role) is a material inter-role routing decision
         that must be public before authority advances; continue-lead/wait/pause are
@@ -415,8 +489,8 @@ class Orchestrator:
         the next decision derives a distinct id.
 
         Returns ``None`` when no publisher is wired (production-inert) or the
-        decision is not a dispatch. A publish that does not verify (WAIT/PAUSE from
-        an outage, or REJECT from a bad record) returns a descriptive blocker.
+        decision is not a dispatch. A publish that does not verify carries the
+        publish route so a transient outage self-heals (WAIT) rather than pausing.
         """
         publisher = self._publisher
         if publisher is None or decision is None:
@@ -434,20 +508,24 @@ class Orchestrator:
                 task_number=getattr(decision, "task_number", None),
             )
         except Exception as exc:  # a publish bug must not fake a verified write
-            return f"public-bus lead decision publish error: {exc}"
+            return GateBlock(Route.PAUSE, f"public-bus lead decision publish error: {exc}")
         if outcome is not None and outcome.verified:
             return None
         detail = outcome.detail if outcome is not None else "not published"
-        return (f"public-bus lead dispatch decision unverified "
-                f"(-> {target_role or 'role'}): {detail}")
+        route = outcome.route if outcome is not None else Route.WAIT
+        return GateBlock(
+            route,
+            f"public-bus lead dispatch decision unverified "
+            f"(-> {target_role or 'role'}): {detail}",
+        )
 
-    def _reconcile_public_writes(self) -> None:
+    def _reconcile_public_writes(self, *, force: bool = False) -> None:
         """Finish any durable public-write intents left reserved by a crash."""
         publisher = self._publisher
         if publisher is None:
             return
         try:
-            results = publisher.reconcile()
+            results = publisher.reconcile(force=force)
         except Exception as exc:  # reconciliation must never abort the run
             console.print(f"[yellow]public-write reconcile error: {exc}[/]")
             return
@@ -484,15 +562,15 @@ class Orchestrator:
             blocker=terminal.blocker,
         ):
             return None
-        task_number = None
+        task_number = pr_number = None
         try:
-            task_number = self.disp.task_number_for_handoff(handoff_id)
+            task_number, pr_number = self.disp.binding_for_handoff(handoff_id)
         except Exception:  # journal read must not fake a verified write
-            task_number = None
+            task_number = pr_number = None
         try:
             return publisher.publish_role_handoff(
                 handoff_id=handoff_id, role=role, outcome_class=oc,
-                task_number=task_number,
+                task_number=task_number, pr_number=pr_number,
                 evidence=terminal.evidence, changed=terminal.changed,
                 remaining=terminal.remaining, reason=reason,
                 disagreement=terminal.disagreement, blocker=terminal.blocker,
@@ -509,22 +587,56 @@ class Orchestrator:
         see :meth:`_decision_gate_block`). The persisted ``task_number`` on the
         dispatch preserves the routed-task binding across the restart (issue #47),
         so the gate re-validates the same task rather than re-censusing the
-        record. Returns True to proceed. On a non-``PROCEED`` outcome it marks the
-        run PAUSED with a descriptive public-bus blocker and returns False, so no
-        attempt is reserved.
+        record. Returns True to proceed. On a non-``PROCEED`` outcome it halts the
+        run via :meth:`_apply_gate_block` (WAITING for a recoverable condition,
+        PAUSED for a human blocker) and returns False, so no attempt is reserved.
         """
-        blocker = self._dispatch_gate_block(role, getattr(dsp, "task_number", None))
-        if blocker is None:
+        gate = self._bus_gate
+        if gate is None:
             return True
-        self._safe_mark(run_id, RunStatus.PAUSED, blocker)
-        console.print(
-            f"[yellow]public-bus gate blocked {role} dispatch: {blocker}; run paused[/]"
-        )
-        return False
+        try:
+            outcome = gate.evaluate(
+                role, dsp, task_number=getattr(dsp, "task_number", None)
+            )
+        except Exception as exc:
+            outcome = None
+            block = GateBlock(Route.WAIT, f"public-bus gate error: {exc}")
+        else:
+            block = (
+                None if outcome is None or outcome.route is Route.PROCEED
+                else GateBlock(
+                    outcome.route,
+                    f"public-bus {outcome.route.value}: {outcome.detail}",
+                )
+            )
+        if block is not None:
+            self._apply_gate_block(
+                run_id, block, f"public-bus gate blocked {role} dispatch"
+            )
+            return False
+        if role == "verifier":
+            pr_number = (outcome.refs or {}).get("pr") if outcome is not None else None
+            if not pr_number:
+                self._apply_gate_block(
+                    run_id,
+                    GateBlock(Route.WAIT, "Verifier gate returned no exact linked PR"),
+                    "public-bus gate blocked verifier dispatch",
+                )
+                return False
+            try:
+                self.disp.bind_pr_to_dispatch(dsp.id, int(pr_number))
+            except Exception as exc:
+                self._apply_gate_block(
+                    run_id,
+                    GateBlock(Route.WAIT, f"cannot persist Verifier PR binding: {exc}"),
+                    "public-bus gate blocked verifier dispatch",
+                )
+                return False
+        return True
 
-    def _decision_gate_block(self, decision: object, pending: list | None = None) -> Optional[str]:
-        """Return a public-bus blocker for a Lead decision that would advance
-        authority, or ``None`` to allow it.
+    def _decision_gate_block(self, decision: object, pending: list | None = None) -> Optional["GateBlock"]:
+        """Return a public-bus :class:`GateBlock` for a Lead decision that would
+        advance authority, or ``None`` to allow it.
 
         Called BEFORE the decision is applied, so a blocked dispatch/finish never
         acks the decision's pending handoffs or transfers authority. A dispatch to
@@ -555,7 +667,7 @@ class Orchestrator:
             return self._finish_gate_block()
         return None
 
-    def _material_handoff_block(self, decision: object, pending: list | None) -> Optional[str]:
+    def _material_handoff_block(self, decision: object, pending: list | None) -> Optional["GateBlock"]:
         """Refuse a decision that would ack a material handoff whose public
         artifact is not yet verified.
 
@@ -566,6 +678,12 @@ class Orchestrator:
         first (reconcile), and only blocks if it still cannot verify. A block drops
         the decision, so the handoff stays pending (no consumption) until the
         artifact lands.
+
+        The returned :class:`GateBlock` carries the publish route so a terminal
+        write still racing a merge/close, a transient outage, or a deferred-but-
+        reconcilable publish self-heals (``Route.WAIT`` → the run WAITS and the
+        next run reconciles) instead of being mis-reported as ``human-blocked``
+        (issue #49). Only a genuine ``Route.PAUSE`` (permission) pauses.
         """
         publisher = self._publisher
         if publisher is None:
@@ -592,13 +710,18 @@ class Orchestrator:
             if outcome is not None and outcome.verified:
                 continue
             detail = outcome.detail if outcome is not None else "not published"
-            return (f"public-bus write unverified for {handoff.role} handoff "
-                    f"{hid}: {detail}")
+            # No outcome (no task binding yet / publish bug) is a deferred write
+            # the next reconcile can finish — recoverable, so WAIT not PAUSE.
+            route = outcome.route if outcome is not None else Route.WAIT
+            return GateBlock(
+                route,
+                f"public-bus write unverified for {handoff.role} handoff {hid}: {detail}",
+            )
         return None
 
     def _dispatch_gate_block(
         self, role: str, task_number: Optional[int] = None
-    ) -> Optional[str]:
+    ) -> Optional["GateBlock"]:
         """Consult the public-bus gate for a Worker/Verifier dispatch (if any).
 
         ``task_number`` is the exact routed task carried by the Lead decision (at
@@ -607,7 +730,7 @@ class Orchestrator:
         re-census (issue #47) — so a stale/mismatched binding fails *before* role
         execution with a recoverable blocker and a second queued task cannot
         divert the gate. A gate that raises does not silently pass: the error
-        becomes the blocker.
+        becomes a human blocker (a boundary bug is not self-healing).
         """
         gate = self._bus_gate
         if gate is None:
@@ -615,18 +738,18 @@ class Orchestrator:
         try:
             outcome = gate.evaluate(role, None, task_number=task_number)
         except Exception as exc:  # boundary bug must not fake success
-            return f"public-bus gate error: {exc}"
+            return GateBlock(Route.PAUSE, f"public-bus gate error: {exc}")
         if outcome is None or outcome.route is Route.PROCEED:
             return None
-        return f"public-bus {outcome.route.value}: {outcome.detail}"
+        return GateBlock(outcome.route, f"public-bus {outcome.route.value}: {outcome.detail}")
 
-    def _finish_gate_block(self) -> Optional[str]:
+    def _finish_gate_block(self) -> Optional["GateBlock"]:
         """Consult the public-bus gate for a Lead ``finish`` (if any).
 
-        Returns ``None`` to allow the finish, or a descriptive blocker string
-        when the final-acceptance record is missing/invalid/unverifiable. A gate
-        that lacks a finish check, or that has no gate at all, allows finish. A
-        gate that raises does not silently pass: the error becomes the blocker.
+        Returns ``None`` to allow the finish, or a :class:`GateBlock` when the
+        final-acceptance record is missing/invalid/unverifiable. A gate that lacks
+        a finish check, or that has no gate at all, allows finish. A gate that
+        raises does not silently pass: the error becomes a human blocker.
         """
         gate = self._bus_gate
         if gate is None:
@@ -637,10 +760,10 @@ class Orchestrator:
         try:
             outcome = evaluate_finish()
         except Exception as exc:  # boundary bug must not fake success
-            return f"public-bus finish gate error: {exc}"
+            return GateBlock(Route.PAUSE, f"public-bus finish gate error: {exc}")
         if outcome is None or outcome.route is Route.PROCEED:
             return None
-        return f"public-bus {outcome.route.value}: {outcome.detail}"
+        return GateBlock(outcome.route, f"public-bus {outcome.route.value}: {outcome.detail}")
 
     def _on_started(self, attempt_id: str):
         """Return the pre-send journaling callback for an in-flight attempt.

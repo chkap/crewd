@@ -234,6 +234,9 @@ def test_error_during_worker_task_lookup_routes_wait():
 
 # ── idempotent posting ───────────────────────────────────────────────────
 def _post(bus: PublicBus, cid: str = "corr-1"):
+    client = bus.client
+    if isinstance(client, FakeGitHubClient) and client.get_issue(29) is None:
+        client.add_issue(29, "task")
     return bus.post(role="worker", target_role="verifier",
                     body="ready for review", target="issue", number=29,
                     correlation_id=cid)

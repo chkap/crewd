@@ -128,6 +128,12 @@ class FakeGitHubClient:
 
     def create_comment(self, *, target: str, number: int, body: str) -> CommentRef:
         self.create_calls += 1
+        exists = number in (self.issues if target == "issue" else self.pulls)
+        if target not in ("issue", "pull") or not exists:
+            raise GitHubError(
+                GitHubErrorKind.NOT_FOUND,
+                f"{target} #{number} does not exist in {self._repo}",
+            )
         # If an ambiguous fault is queued and ambiguous_but_landed is set, store
         # first (the write landed) then raise so the boundary must reconcile.
         queue = self.faults.get("create_comment")
