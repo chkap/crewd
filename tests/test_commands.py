@@ -2,12 +2,22 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any
+import re
 import signal
 import pytest
 
 from crewd import commands
 from crewd.workspace import Workspace
 from crewd.config import CrewConfig, RoleConfig
+
+
+def _norm(text: str) -> str:
+    """Collapse all whitespace runs (incl. Rich line-wrap newlines) to single
+    spaces so semantic substring assertions on console output are independent of
+    terminal width / Rich wrapping. This does not weaken the check — the full
+    diagnostic wording must still be present, only its cosmetic line breaks are
+    normalized (a long path can make Rich wrap mid-phrase in narrow CI output)."""
+    return re.sub(r"\s+", " ", text)
 
 
 # ─── init ───
@@ -529,9 +539,10 @@ def test_doctor_flags_external_extra_add_dirs_as_error(tmp_ws: Workspace, capsys
     out = capsys.readouterr().out
     # External context is a non-runnable blocker → ERROR → doctor exits 1.
     assert rc == 1
-    assert "resolves outside the workspace" in out
-    assert "cannot" in out and "mount" in out
-    assert "Copy or sanitize" in out
+    nout = _norm(out)
+    assert "resolves outside the workspace" in nout
+    assert "cannot" in nout and "mount" in nout
+    assert "Copy or sanitize" in nout
 
 
 def test_preflight_blocks_external_extra_add_dirs(tmp_ws: Workspace, capsys, monkeypatch, tmp_path):
@@ -545,7 +556,8 @@ def test_preflight_blocks_external_extra_add_dirs(tmp_ws: Workspace, capsys, mon
     out = capsys.readouterr().out
     # Non-runnable: preflight refuses with rc=2 (not a success tuple).
     assert result == 2
-    assert "extra_add_dirs" in out and "resolves outside the workspace" in out
+    nout = _norm(out)
+    assert "extra_add_dirs" in nout and "resolves outside the workspace" in nout
 
 
 def test_run_role_blocked_by_external_extra_add_dirs_no_sdk_work(tmp_ws: Workspace, monkeypatch, tmp_path):
@@ -686,8 +698,9 @@ def test_preflight_external_context_blocker_survives_unavailable_sdk(
     out = capsys.readouterr().out
     assert result == 2
     # The external-context guidance is what's reported…
-    assert "resolves outside the workspace" in out
-    assert "Copy or sanitize" in out
+    nout = _norm(out)
+    assert "resolves outside the workspace" in nout
+    assert "Copy or sanitize" in nout
     # …and the missing-SDK / unhealthy-backend error is NOT surfaced.
-    assert "forced unhealthy" not in out
+    assert "forced unhealthy" not in nout
     assert "not importable" not in out

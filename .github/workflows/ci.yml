@@ -1,0 +1,159 @@
+# Build-once artifact CI across supported Python versions (#54).
+#
+# Contract enforced here:
+#   * `test`       — run the offline test suite on every supported Python minor
+#                    (bounded by `Requires-Python >=3.11`).
+#   * `build`      — build the wheel + sdist EXACTLY ONCE from the clean checkout,
+#                    record SHA-256 checksums + content manifests, and upload the
+#                    immutable artifacts (+ evidence) for downstream jobs.
+#   * `acceptance` — on every supported minor, DOWNLOAD (never rebuild) those
+#                    artifacts, re-verify their checksums, and run the merged #52
+#                    clean-install/offline-CLI smoke against the downloaded files.
+#
+# Security posture: read-only `GITHUB_TOKEN`, all third-party actions pinned to
+# reviewed immutable commit SHAs, safe pull-request/push triggers, concurrency
+# cancellation, and NO OIDC / publishing / token path (Trusted Publishing is a
+# later, separate slice). Everything runs offline by default and never spends
+# Copilot Premium calls (the live SDK smoke stays opt-in and is not invoked).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: the whole workflow only needs to read the repository. No job
+# escalates this, and there is no `id-token`, `packages`, or `contents: write`.
+permissions:
+  contents: read
+
+# One in-flight run per ref; superseded runs are cancelled to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Deterministic, offline-by-default execution for every job.
+  CREWD_DISABLE_PUBLIC_BUS: "1"
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Bounded by `Requires-Python >=3.11`; each minor here is also asserted
+        # as a Trove classifier (see tests/test_ci_workflow.py).
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout (pinned)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@557e51de59eb14aaaba2ed9621916900a91d50c6 # v6.6.1
+        with:
+          # Dependency download cache only; it can never alter release contents.
+          enable-cache: true
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run offline test suite
+        # Opt-in live/install smokes stay skipped: no Premium, no network.
+        run: uv run --python ${{ matrix.python-version }} --with pytest --with . pytest -q
+
+  build:
+    name: build-once
+    runs-on: ubuntu-latest
+    outputs:
+      wheel-sha256: ${{ steps.hashes.outputs.wheel }}
+      sdist-sha256: ${{ steps.hashes.outputs.sdist }}
+    steps:
+      - name: Checkout (pinned)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@557e51de59eb14aaaba2ed9621916900a91d50c6 # v6.6.1
+        with:
+          enable-cache: true
+      - name: Build wheel + sdist once (standards build)
+        run: uv build --no-sources --out-dir dist
+      - name: Record SHA-256 checksums and content manifests
+        id: hashes
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum crewd-*.whl crewd-*.tar.gz | tee SHA256SUMS
+          # Human-/machine-readable content manifests (evidence, not inputs).
+          python - <<'PY' | tee MANIFEST.txt
+          import glob, tarfile, zipfile
+          whl = glob.glob("crewd-*.whl")[0]
+          sdist = glob.glob("crewd-*.tar.gz")[0]
+          print(f"# wheel: {whl}")
+          for n in sorted(zipfile.ZipFile(whl).namelist()):
+              print(n)
+          print(f"# sdist: {sdist}")
+          with tarfile.open(sdist, "r:gz") as tf:
+              for m in sorted(m.name for m in tf.getmembers() if m.isfile()):
+                  print(m)
+          PY
+          {
+            echo "wheel=$(sha256sum crewd-*.whl | cut -d' ' -f1)"
+            echo "sdist=$(sha256sum crewd-*.tar.gz | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Upload immutable artifacts (+ evidence)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crewd-dist
+          path: |
+            dist/crewd-*.whl
+            dist/crewd-*.tar.gz
+            dist/SHA256SUMS
+            dist/MANIFEST.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  acceptance:
+    name: accept (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout (pinned)  # provides the #52 harness only; not installed
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@557e51de59eb14aaaba2ed9621916900a91d50c6 # v6.6.1
+        with:
+          enable-cache: true
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Download the single build's artifacts (no rebuild)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crewd-dist
+          path: dist
+      - name: Re-verify downloaded artifact checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS
+      - name: Metadata + content contract on downloaded artifacts
+        run: uv run --python ${{ matrix.python-version }} --with twine python -m twine check dist/crewd-*.whl dist/crewd-*.tar.gz
+      - name: Clean-install + offline CLI smoke on downloaded artifacts
+        # Reuses the merged #52 harness with --dist so it installs the DOWNLOADED
+        # wheel/sdist in fresh venvs outside the checkout and never rebuilds.
+        run: uv run --python ${{ matrix.python-version }} python scripts/clean_install_smoke.py --dist dist --json smoke-${{ matrix.python-version }}.json
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-${{ matrix.python-version }}
+          path: smoke-${{ matrix.python-version }}.json
+          if-no-files-found: ignore
+          retention-days: 14

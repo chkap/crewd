@@ -15,6 +15,28 @@ app = typer.Typer(
 )
 
 
+def _version_callback(value: bool) -> None:
+    """Print the authoritative package version and exit (``crewd --version``)."""
+    if value:
+        from . import __version__
+
+        typer.echo(f"crewd {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Show the installed crewd version and exit.",
+        is_eager=True,
+        callback=_version_callback,
+    ),
+) -> None:
+    """crewd — multi-agent coding crew CLI."""
+
+
 def _ws_opt(workspace: Optional[Path]) -> Path:
     """Resolve -w. If None, walk up from cwd looking for crew.yaml. Errors loudly."""
     if workspace is not None:

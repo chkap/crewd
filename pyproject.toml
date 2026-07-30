@@ -17,14 +17,19 @@ keywords = [
     "orchestration",
     "github",
 ]
-# Only claims backed by tests/runtime in this repo are made here. Additional
-# Python minors are added to the classifier list once the CI matrix proves them
-# green (see #43). No maturity, security, or OS-specific guarantee is asserted.
+# Only claims backed by tests/runtime in this repo are made here. The Python
+# minor classifiers below are exactly those exercised by the build-once CI
+# matrix (see .github/workflows/ci.yml and tests/test_ci_workflow.py); a minor
+# is added here only once CI proves it green. No maturity, security, or
+# OS-specific guarantee is asserted.
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Software Development :: Build Tools",
 ]

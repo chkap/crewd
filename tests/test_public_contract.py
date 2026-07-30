@@ -25,8 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
 
 # Python minors this repo can actually exercise / claims support for. Add a
-# minor here only once CI proves it green (#43); classifiers must not overclaim.
-SUPPORTED_MINORS = {11}
+# minor here only once the build-once CI matrix proves it green (see
+# .github/workflows/ci.yml + tests/test_ci_workflow.py); classifiers must not
+# overclaim. #54 added 3.12–3.14 after matrix acceptance passed on each.
+SUPPORTED_MINORS = {11, 12, 13, 14}
 
 
 def _pyproject() -> dict:

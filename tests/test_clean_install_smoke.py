@@ -27,6 +27,7 @@ REQUIRED_CHECKS = {
     "install",
     "import_version",
     "import_outside_checkout",
+    "cli_version",
     "cli_help",
     "cli_init",
     "cli_refresh",
