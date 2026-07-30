@@ -6,7 +6,8 @@ the keyword-heuristic idle table (§4), the exception census (§5), and the
 Stage-C hand-validation sample (§2/§4) exactly.
 
 The two crew histories are read-only. Point --root at the parent directory
-that contains `fin-crew/` and `legal-crew/` (default: /home/azureuser/crews).
+that contains `fin-crew/` and `legal-crew/` (default: the current directory;
+override with `--root` or the `CREWD_RETRO_ROOT` environment variable).
 
 Reproducibility contract:
   * Population ordering is CANONICAL: role logs are collected with a fixed
@@ -90,7 +91,7 @@ def canonical_population(root: Path) -> list[tuple[str, str, str, int, Path]]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/azureuser/crews")
+    ap.add_argument("--root", default=os.environ.get("CREWD_RETRO_ROOT", "."))
     ap.add_argument("--seed", type=int, default=1729)
     ap.add_argument("--n", type=int, default=16)
     args = ap.parse_args()

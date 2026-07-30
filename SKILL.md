@@ -5,11 +5,11 @@ description: Operate the crewd multi-agent coding crew CLI — bootstrap a works
 
 # crewd skill
 
-> For AI agents operating `crewd` (`~/crewd`, repo `chkap/crewd`). Read this before issuing any `crewd` command.
+> For AI agents operating `crewd` (installed as a CLI; project repo `chkap/crewd`). Read this before issuing any `crewd` command.
 
 ## What crewd is
 
-A CLI (`uv` + `typer` + `jinja2` + `pydantic`) that runs a 4-role autonomous coding crew against a target GitHub repo:
+A CLI (`typer` + `jinja2` + `pydantic`; roles run through the official `github-copilot-sdk`) that runs a 4-role autonomous coding crew against a target GitHub repo. Installed on `PATH` as `crewd` (`pipx install crewd`, `uv tool install crewd`, or `pip install crewd`):
 
 - **lead** — plans, schedules, opens umbrella issues. No code, no merges.
 - **worker** — writes code, opens PRs. No merges.
@@ -32,7 +32,7 @@ Trigger if the user asks to:
 
 1. `worker.family ≠ verifier.family`. If they match, `crewd run` exits rc=2. Pick e.g. `gpt` worker + `claude` verifier.
 2. Only verifier merges PRs. Only worker writes code. Lead and advisory never touch code or merges.
-3. **Always pass `-w "$(pwd)"`** when invoking via `uv --directory ~/crewd run crewd …` from inside a workspace. `uv --directory` resolves cwd to the crewd repo, so workspace auto-discovery picks the wrong directory otherwise.
+3. **Pass `-w "$(pwd)"` when the workspace isn't discoverable from cwd.** Installed `crewd` walks up from the current directory for `crew.yaml`, so running inside a workspace needs no flag. Always pass `-w <path>` explicitly when running from elsewhere — and always when using the dev form `uv --directory <crewd-src> run crewd …`, since `--directory` resolves cwd to the crewd source tree and defeats auto-discovery.
 4. Reusing an existing workspace for a brand-new goal: **always run `crewd new-goal --from GOAL.md`**. Manually editing `GOAL.md` and rerunning is rejected (`run` exits with sha-mismatch). Even if you delete `goal.json`, the resumed copilot session still remembers the old PASS — `new-goal` is the only path that closes prior issues, resets cycles, queues an `[OVERRIDE]` inbox notice, and re-renders agents.
 5. Human/operator blockers use `state/PAUSED`, never repeated idle cycles. Lead must post the exact requested action, pause in the same tick, and leave goal/task issues open.
 
@@ -50,25 +50,38 @@ Inter-role coordination is **public-first and host-verified**, not model best-ef
 ## Standard invocation pattern
 
 ```bash
-# Inside a workspace dir:
-uv --directory ~/crewd run crewd <command> -w "$(pwd)"
+# Installed on PATH (pipx / uv tool / pip). Inside a workspace dir, discovery is
+# automatic; pass -w <path> to target a workspace from elsewhere:
+crewd <command>                 # from inside the workspace
+crewd <command> -w /path/to/workspace
 ```
 
-If you've installed `crewd` on PATH (e.g. `uv pip install -e ~/crewd`), you can drop the `uv --directory` prefix and rely on git-style upward `crew.yaml` discovery — but the safe form above always works.
+Contributor/dev form (running an unreleased crewd from a source checkout) — always pass `-w`:
+
+```bash
+uv --directory /path/to/crewd-src run crewd <command> -w "$(pwd)"
+```
+
+## Prerequisites (must hold before any run)
+
+- **Python 3.11+**, and `crewd` installed on `PATH`.
+- **GitHub Copilot subscription** — roles run as Copilot SDK sessions; no entitlement means no role can run.
+- **`gh` authenticated** (`gh auth status`) with **repo read/write** on the target — crewd clones, lists/closes epoch issues, and posts/verifies public-bus comments via `gh`. `git` must also be on `PATH`.
+- crewd acts on GitHub **as the authenticated user**: it pushes branches, opens PRs, comments, and (verifier) merges. Scope the token to the target repo; prefer a dedicated bot/fine-grained token.
 
 ## Bootstrap a fresh crew (5 steps)
 
 ```bash
 mkdir -p ~/crews && cd ~/crews
-uv --directory ~/crewd run crewd init my-crew --repo owner/target-repo
+crewd init my-crew --repo owner/target-repo     # clones target into my-crew/repo/
 cd my-crew
-$EDITOR GOAL.md                                                # write the spec
-uv --directory ~/crewd run crewd doctor -w "$(pwd)"            # must be 0 errors
-uv --directory ~/crewd run crewd run --once -w "$(pwd)"        # one dispatcher step (Lead + ≤1 dispatched attempt)
-uv --directory ~/crewd run crewd tick lead -w "$(pwd)"         # debug/compat: force 1 named role, bypassing dispatch
-uv --directory ~/crewd run crewd run --daemon -w "$(pwd)"     # loop in background
-uv --directory ~/crewd run crewd status -w "$(pwd)"           # check daemon + crew state
-uv --directory ~/crewd run crewd stop -w "$(pwd)"             # graceful stop (STOPPED + SIGINT)
+$EDITOR GOAL.md                                 # write the spec
+crewd doctor                                    # must be 0 errors
+crewd run --once                                # one dispatcher step (Lead + ≤1 dispatched attempt)
+crewd tick lead                                 # debug/compat: force 1 named role, bypassing dispatch
+crewd run --daemon                              # loop in background
+crewd status                                    # check daemon + crew state
+crewd stop                                      # graceful stop (STOPPED + SIGINT)
 ```
 
 `init` registers the workspace in `~/.crewd/registry.json` so `crewd list` / `crewd cd <name>` work from anywhere.
@@ -187,9 +200,11 @@ When Lead writes `state/PAUSED`, the loop stops before the next role and records
 
 ## Verification after any change
 
+Contributor check from a crewd **source checkout** (not needed for installed use):
+
 ```bash
-cd ~/crewd && uv run pytest -q
-# then in a throwaway workspace:
-uv --directory ~/crewd run crewd init /tmp/crewd-smoke --repo owner/dummy
-uv --directory ~/crewd run crewd doctor -w /tmp/crewd-smoke
+uv run pytest -q                 # from the crewd source tree
+# then in a throwaway workspace (installed CLI, or the dev `uv --directory` form):
+crewd init /tmp/crewd-smoke --repo owner/dummy
+crewd doctor -w /tmp/crewd-smoke
 ```
