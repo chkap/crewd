@@ -562,15 +562,15 @@ class Orchestrator:
             blocker=terminal.blocker,
         ):
             return None
-        task_number = None
+        task_number = pr_number = None
         try:
-            task_number = self.disp.task_number_for_handoff(handoff_id)
+            task_number, pr_number = self.disp.binding_for_handoff(handoff_id)
         except Exception:  # journal read must not fake a verified write
-            task_number = None
+            task_number = pr_number = None
         try:
             return publisher.publish_role_handoff(
                 handoff_id=handoff_id, role=role, outcome_class=oc,
-                task_number=task_number,
+                task_number=task_number, pr_number=pr_number,
                 evidence=terminal.evidence, changed=terminal.changed,
                 remaining=terminal.remaining, reason=reason,
                 disagreement=terminal.disagreement, blocker=terminal.blocker,
@@ -591,11 +591,48 @@ class Orchestrator:
         run via :meth:`_apply_gate_block` (WAITING for a recoverable condition,
         PAUSED for a human blocker) and returns False, so no attempt is reserved.
         """
-        block = self._dispatch_gate_block(role, getattr(dsp, "task_number", None))
-        if block is None:
+        gate = self._bus_gate
+        if gate is None:
             return True
-        self._apply_gate_block(run_id, block, f"public-bus gate blocked {role} dispatch")
-        return False
+        try:
+            outcome = gate.evaluate(
+                role, dsp, task_number=getattr(dsp, "task_number", None)
+            )
+        except Exception as exc:
+            outcome = None
+            block = GateBlock(Route.WAIT, f"public-bus gate error: {exc}")
+        else:
+            block = (
+                None if outcome is None or outcome.route is Route.PROCEED
+                else GateBlock(
+                    outcome.route,
+                    f"public-bus {outcome.route.value}: {outcome.detail}",
+                )
+            )
+        if block is not None:
+            self._apply_gate_block(
+                run_id, block, f"public-bus gate blocked {role} dispatch"
+            )
+            return False
+        if role == "verifier":
+            pr_number = (outcome.refs or {}).get("pr") if outcome is not None else None
+            if not pr_number:
+                self._apply_gate_block(
+                    run_id,
+                    GateBlock(Route.WAIT, "Verifier gate returned no exact linked PR"),
+                    "public-bus gate blocked verifier dispatch",
+                )
+                return False
+            try:
+                self.disp.bind_pr_to_dispatch(dsp.id, int(pr_number))
+            except Exception as exc:
+                self._apply_gate_block(
+                    run_id,
+                    GateBlock(Route.WAIT, f"cannot persist Verifier PR binding: {exc}"),
+                    "public-bus gate blocked verifier dispatch",
+                )
+                return False
+        return True
 
     def _decision_gate_block(self, decision: object, pending: list | None = None) -> Optional["GateBlock"]:
         """Return a public-bus :class:`GateBlock` for a Lead decision that would

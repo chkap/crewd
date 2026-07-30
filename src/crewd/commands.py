@@ -1041,6 +1041,26 @@ def cmd_status(workspace: Path, as_json: bool = False) -> int:
         if pending:
             val += f", [yellow]{pending} unverified[/]"
         table.add_row("public writes", val)
+        for detail in pw.get("pending_detail", []):
+            provenance = (
+                f"{detail.get('repository') or '?'} "
+                f"{detail.get('goal') or '?'} task #{detail.get('task') or '?'} "
+                f"PR #{detail.get('pr') or '?'}"
+            )
+            retry = (
+                f"backoff {detail.get('backoff_seconds', 0)}s"
+                + (
+                    f", next {detail['next_retry_at']}"
+                    if detail.get("next_retry_at") else ""
+                )
+            )
+            table.add_row(
+                f"  write {detail['id']}",
+                f"{detail.get('phase')} · {provenance} · "
+                f"closure PR #{detail.get('closure_pr') or '?'} · "
+                f"{detail.get('action')} · attempts {detail.get('attempts')} · "
+                f"{retry} · {detail.get('last_error') or 'no error'}",
+            )
     if snap.inbox:
         delivered = sum(v.get("delivering", 0) for v in snap.inbox.values())
         processed = sum(v.get("processed", 0) for v in snap.inbox.values())

@@ -421,6 +421,8 @@ def test_snapshot_surfaces_pending_public_write(tmp_ws):
     store.reserve(WriteIntent(
         correlation_id="h1", role="worker", target_role="verifier",
         target="issue", number=29, body="secret readiness body",
+        repo="acme/widget", goal_label="goal:v2", task_number=29,
+        pr_number=50,
     ))
     snap = _snap(tmp_ws)
     assert snap.public_writes == {
@@ -428,7 +430,22 @@ def test_snapshot_surfaces_pending_public_write(tmp_ws):
         "verified": 0,
         "pending_ids": ["h1"],
         "pending_detail": [
-            {"id": "h1", "target": "issue#29", "attempts": 0, "route": "reserved"}
+            {
+                "id": "h1",
+                "target": "issue#29",
+                "phase": "verification_in_flight",
+                "repository": "acme/widget",
+                "goal": "goal:v2",
+                "task": 29,
+                "pr": 50,
+                "closure_pr": None,
+                "attempts": 0,
+                "route": "reserved",
+                "last_error": "",
+                "backoff_seconds": 0.0,
+                "next_retry_at": None,
+                "action": "self-healing",
+            }
         ],
         "needs_operator": [],
     }

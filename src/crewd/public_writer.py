@@ -711,11 +711,6 @@ class PublicWriter:
             return PublishOutcome(route, f"cannot resolve routed task: {resolved.detail}",
                                   correlation_id=handoff_id)
         target_role = _HANDOFF_TARGET.get(role, "lead")
-        if role == "verifier" and pr_number is None:
-            # Capture the exact linked PR in the durable intent before terminal
-            # publication. It remains authoritative if merge auto-closes the task
-            # before a restart/reconciliation pass.
-            pr_number = self.bus.linked_pr(number)
         body = render_role_handoff_body(
             role=role, target_role=target_role, outcome_class=outcome_class,
             evidence=evidence, changed=changed, remaining=remaining, reason=reason,

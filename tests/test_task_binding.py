@@ -44,6 +44,7 @@ from crewd.github_bus import (
     validate_attribution,
 )
 from crewd.public_writer import IntentStore, PublicWriter
+from crewd.orchestrator import Orchestrator
 from crewd.session_backend import AttemptOutcome
 
 CREW = "testcrew"
@@ -196,6 +197,23 @@ def test_gate_validates_bound_task_ignoring_ambiguous_census(tmp_path):
     assert out.refs["pr"] == 46
 
 
+def test_orchestrator_persists_pr_returned_by_verifier_gate(tmp_path):
+    client = _seed_multi(tmp_path)
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run(GOAL)
+    dsp = disp.lead_decide(
+        run.id,
+        LeadDecision.dispatch("verifier", task_number=44),
+        configured_roles=ROLES,
+    ).dispatch
+    orch = object.__new__(Orchestrator)
+    orch._bus_gate = PublicBusGate(_bus(client))
+    orch.disp = disp
+
+    assert orch._bus_gate_ok(run.id, "verifier", dsp)
+    assert disp.get_dispatch(dsp.id).pr_number == 46
+
+
 def test_gate_rejects_when_bound_task_lacks_pr_even_if_other_task_has_one(tmp_path):
     """The live #47 repro: routing Verifier bound to the audit task #43 must fail
     against #43 — not silently pass because *some other* task (#44) has a PR."""
@@ -310,6 +328,29 @@ def test_binding_survives_restart_between_dispatch_and_handoff(tmp_path):
     assert disp2.get_dispatch(dsp.id).task_number == 44
     hid = disp2.record_terminal(att, AttemptOutcome.IDLE_COMPLETED, evidence="PR #46")
     assert disp2.task_number_for_handoff(hid) == 44
+
+
+def test_verifier_pr_binding_is_immutable_and_survives_handoff(tmp_path):
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run(GOAL)
+    dsp = disp.lead_decide(
+        run.id,
+        LeadDecision.dispatch("verifier", task_number=44),
+        configured_roles=ROLES,
+    ).dispatch
+    bound = disp.bind_pr_to_dispatch(dsp.id, 46)
+    assert bound.pr_number == 46
+    assert disp.bind_pr_to_dispatch(dsp.id, 46).pr_number == 46
+
+    from crewd.dispatcher import DecisionError
+    import pytest
+
+    with pytest.raises(DecisionError, match="cannot rebind"):
+        disp.bind_pr_to_dispatch(dsp.id, 99)
+
+    att = disp.reserve_attempt(run.id, dsp.id, "verifier")
+    hid = disp.record_terminal(att, AttemptOutcome.IDLE_COMPLETED, evidence="accepted")
+    assert disp.binding_for_handoff(hid) == (44, 46)
 
 
 # ══════════════════════════ 8. advisory-then-worker (no cross-task) ═══════

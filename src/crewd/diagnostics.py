@@ -300,8 +300,22 @@ def _public_write_state(ws: Workspace) -> Optional[dict]:
             {
                 "id": i.correlation_id,
                 "target": f"{i.target}#{i.number}",
+                "phase": i.phase,
+                "repository": i.repo,
+                "goal": i.goal_label,
+                "task": i.task_number or None,
+                "pr": i.pr_number or None,
+                "closure_pr": i.closure_pr or None,
                 "attempts": i.attempts,
                 "route": i.last_route or "reserved",
+                "last_error": _safe_text(i.last_error),
+                "backoff_seconds": i.backoff_s,
+                "next_retry_at": i.next_retry_at or None,
+                "action": (
+                    "operator"
+                    if i.disposition in ("human", "invalid_target")
+                    else "self-healing"
+                ),
             }
             for i in pending
         ]
@@ -311,7 +325,7 @@ def _public_write_state(ws: Workspace) -> Optional[dict]:
         # (issue #49).
         needs_operator = sorted(
             i.correlation_id for i in pending
-            if i.last_route in ("pause", "reject")
+            if i.disposition in ("human", "invalid_target")
         )
         return {
             "pending": counts["pending"],

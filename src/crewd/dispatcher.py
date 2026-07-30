@@ -214,6 +214,7 @@ class DispatchView:
     reason: Optional[str]
     created_at: str
     task_number: Optional[int] = None
+    pr_number: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -339,6 +340,7 @@ CREATE TABLE IF NOT EXISTS dispatch (
     role TEXT,
     reason TEXT,
     task_number INTEGER,
+    pr_number INTEGER,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS attempt (
@@ -415,7 +417,7 @@ class Dispatcher:
         self._migrate()
 
     # Bump when a schema change needs an in-place migration of existing DBs.
-    _SCHEMA_VERSION = 3
+    _SCHEMA_VERSION = 4
 
     def _migrate(self) -> None:
         """Idempotently upgrade a database created by an earlier kernel version.
@@ -456,6 +458,8 @@ class Dispatcher:
             # dispatches and non-task dispatches like solicit/continue have none).
             (dispatch_cols, "task_number",
              "ALTER TABLE dispatch ADD COLUMN task_number INTEGER"),
+            (dispatch_cols, "pr_number",
+             "ALTER TABLE dispatch ADD COLUMN pr_number INTEGER"),
         ]
         pending = [sql for cols, name, sql in additions if name not in cols]
         self._conn.execute("BEGIN IMMEDIATE;")
@@ -1115,10 +1119,11 @@ class Dispatcher:
         seq = seq_row["m"] + 1
         dispatch_id = _new_id("dsp")
         c.execute(
-            "INSERT INTO dispatch (id, run_id, seq, kind, role, reason, task_number, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO dispatch "
+            "(id, run_id, seq, kind, role, reason, task_number, pr_number, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (dispatch_id, run_id, seq, decision.kind.value, decision.role,
-             decision.reason, decision.task_number, _now()),
+             decision.reason, decision.task_number, None, _now()),
         )
         row = c.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
         return _dispatch_view(row)
@@ -1259,6 +1264,45 @@ class Dispatcher:
             raise KeyError(dispatch_id)
         return _dispatch_view(row)
 
+    def bind_pr_to_dispatch(self, dispatch_id: str, pr_number: int) -> DispatchView:
+        """Persist the immutable PR proven by the Verifier routing gate."""
+        with self._txn() as c:
+            row = c.execute(
+                "SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(dispatch_id)
+            existing = row["pr_number"]
+            if existing is not None and int(existing) != int(pr_number):
+                raise DecisionError(
+                    f"dispatch {dispatch_id} already bound to PR #{existing}, "
+                    f"cannot rebind to PR #{pr_number}"
+                )
+            if existing is None:
+                c.execute(
+                    "UPDATE dispatch SET pr_number = ? WHERE id = ?",
+                    (int(pr_number), dispatch_id),
+                )
+            row = c.execute(
+                "SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)
+            ).fetchone()
+        return _dispatch_view(row)
+
+    def binding_for_handoff(
+        self, handoff_id: str
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Return the persisted task/PR binding for a handoff's dispatch."""
+        row = self._conn.execute(
+            "SELECT d.task_number AS tn, d.pr_number AS pn FROM handoff h "
+            "JOIN attempt a ON a.id = h.attempt_id "
+            "JOIN dispatch d ON d.id = a.dispatch_id "
+            "WHERE h.id = ?",
+            (handoff_id,),
+        ).fetchone()
+        if row is None:
+            return None, None
+        return row["tn"], row["pn"]
+
     def task_number_for_handoff(self, handoff_id: str) -> Optional[int]:
         """The exact routed task bound to a handoff's originating dispatch.
 
@@ -1270,16 +1314,7 @@ class Dispatcher:
         or an unknown id, so the caller surfaces a recoverable route rather than
         guessing.
         """
-        row = self._conn.execute(
-            "SELECT d.task_number AS tn FROM handoff h "
-            "JOIN attempt a ON a.id = h.attempt_id "
-            "JOIN dispatch d ON d.id = a.dispatch_id "
-            "WHERE h.id = ?",
-            (handoff_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return row["tn"]
+        return self.binding_for_handoff(handoff_id)[0]
 
     def read_run_diagnostics(self, goal_label: str) -> "Optional[RunDiagnostics]":
         """Read-only, point-in-time projection of the latest run for a goal label.
@@ -1382,10 +1417,12 @@ def _run_view(row: sqlite3.Row) -> RunView:
 def _dispatch_view(row: sqlite3.Row) -> DispatchView:
     keys = row.keys()
     task_number = row["task_number"] if "task_number" in keys else None
+    pr_number = row["pr_number"] if "pr_number" in keys else None
     return DispatchView(
         id=row["id"], run_id=row["run_id"], seq=row["seq"], kind=DecisionKind(row["kind"]),
         role=row["role"], reason=row["reason"], created_at=row["created_at"],
         task_number=task_number,
+        pr_number=pr_number,
     )
 
 
