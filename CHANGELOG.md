@@ -71,6 +71,14 @@ coordinating entirely through GitHub Issues and Pull Requests.
   `requires-python >=3.11`) with Python 3.11–3.14 verified by the build-once
   release CI. The supported public contract is the `crewd` CLI, not an
   importable typed API (no `py.typed`).
+- **Secure release publishing.** A dedicated `publish.yml` workflow releases to
+  PyPI via **Trusted Publishing (OIDC)** — no long-lived API token. It triggers
+  only on a published GitHub Release, validates tag/version/commit provenance,
+  builds the wheel+sdist once, re-runs the Python 3.11–3.14 clean-install
+  acceptance on those exact artifacts, and publishes them from the protected
+  `pypi` environment with least privilege (`id-token: write` on the publish job
+  only) and idempotent, duplicate-safe retries. See
+  [`docs/releasing.md`](docs/releasing.md).
 
 ### Known limitations
 

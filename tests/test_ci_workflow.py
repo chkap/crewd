@@ -4,8 +4,8 @@ These offline checks parse ``.github/workflows/ci.yml`` and lock the security
 and build-once guarantees so the release-artifact CI cannot silently regress:
 
 * least-privilege, read-only ``GITHUB_TOKEN`` and no OIDC/publish/token path
-  (Trusted Publishing is a separate, later slice — ``publish.yml`` must not
-  exist yet);
+  in ``ci.yml`` itself (Trusted Publishing lives in the separate ``publish.yml``
+  slice, covered by ``tests/test_publish_workflow.py``);
 * every third-party action pinned to an immutable 40-hex commit SHA;
 * safe ``pull_request``/``push`` triggers and concurrency cancellation;
 * the wheel/sdist are built exactly once and later jobs *download* rather than
@@ -53,19 +53,18 @@ def test_ci_workflow_exists():
     assert CI.is_file(), "expected .github/workflows/ci.yml"
 
 
-def test_no_publish_workflow_yet():
-    # Trusted Publishing / OIDC is a deliberately separate later task.
-    assert not (WORKFLOWS / "publish.yml").exists()
-    for wf in WORKFLOWS.glob("*.y*ml"):
-        # Scan only effective YAML (drop comment lines) so documentation that
-        # *describes* the excluded features doesn't trip the guard.
-        effective = "\n".join(
-            ln for ln in wf.read_text().splitlines()
-            if not ln.lstrip().startswith("#")
-        ).lower()
-        assert "pypi-publish" not in effective, f"{wf.name} must not publish"
-        assert "id-token" not in effective, f"{wf.name} must not request OIDC id-token"
-        assert "twine upload" not in effective, f"{wf.name} must not upload"
+def test_ci_workflow_has_no_publish_or_oidc_path():
+    # The integration CI (`ci.yml`) must never publish or request OIDC — that is
+    # exclusively the job of the separate `publish.yml` (tested elsewhere). Scan
+    # only effective YAML (drop comment lines) so documentation that *describes*
+    # the excluded features doesn't trip the guard.
+    effective = "\n".join(
+        ln for ln in CI.read_text().splitlines()
+        if not ln.lstrip().startswith("#")
+    ).lower()
+    assert "pypi-publish" not in effective, "ci.yml must not publish"
+    assert "id-token" not in effective, "ci.yml must not request OIDC id-token"
+    assert "twine upload" not in effective, "ci.yml must not upload"
 
 
 def test_permissions_are_read_only():
