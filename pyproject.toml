@@ -19,10 +19,8 @@ keywords = [
 ]
 # Only claims backed by tests/runtime in this repo are made here. Additional
 # Python minors are added to the classifier list once the CI matrix proves them
-# green (see #43); Development Status stays at Beta — no stability/maturity,
-# security, or OS-specific guarantee is asserted.
+# green (see #43). No maturity, security, or OS-specific guarantee is asserted.
 classifiers = [
-    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",

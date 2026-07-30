@@ -122,8 +122,7 @@ def test_project_urls_point_at_the_public_repository():
 
 def test_no_unverified_maturity_or_typed_claims():
     classifiers = _project().get("classifiers", [])
-    # Do not claim a maturity level we have not earned.
-    assert not any("Production/Stable" in c for c in classifiers)
+    assert not any(c.startswith("Development Status ::") for c in classifiers)
     # Typed-package policy: crewd is a CLI app, not a typed library.
     assert not any(c.startswith("Typing ::") for c in classifiers)
 
