@@ -171,9 +171,13 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 
 `run` (foreground or `--daemon`) installs `SIGINT`/`SIGTERM` handlers that flip an interrupt flag — the current attempt finishes, then `state/exit-reason` is written and the loop exits 0. `crewd stop` writes the `STOPPED` sentinel and sends `SIGINT` to the daemon PID if running; `--force` sends `SIGKILL`. Mid-attempt cancellation is a single non-blocking `CancelToken` abort of the in-flight SDK session; if the abort cannot be confirmed idle the session is tainted and force-stopped, so the next run starts a fresh generation instead of resuming a dirty session. A second signal aborts hard.
 
-When Lead writes `state/PAUSED`, the loop stops before the next role and records
-`exit-reason: human-blocked`. This is resumable and deliberately distinct from
-`STOPPED`/`goal-complete`; do not poll a known human blocker with more crew cycles.
+When Lead determines only a human/operator prerequisite remains, it submits a typed
+`pause` decision; the **host** durably records `exit-reason: human-blocked` and the loop
+stops before the next role (Lead does not hand-write `state/PAUSED`). This is resumable and
+deliberately distinct from `STOPPED`/`goal-complete`; do not poll a known human blocker with
+more crew cycles. Transient transport failures, protocol-uncertain/missing decisions, and
+ordinary no-progress are **not** pauses — each carries its own bounded budget and settles into
+a recoverable `WAITING` state with a wake condition that self-heals on the next reconcile.
 
 ## What NOT to do
 
