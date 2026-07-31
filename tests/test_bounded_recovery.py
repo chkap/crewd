@@ -219,3 +219,58 @@ def test_double_role_handoff_recovers_on_resume(tmp_ws: Workspace):
     assert RunStatus(resumed.status) is RunStatus.ACTIVE
     assert resumed.consecutive_unproductive == 0
     assert resumed.last_edge_repeats == 0
+
+
+# ── #65 per-class budget separation, proven END-TO-END through the orchestrator
+#    production path (resolve_role_terminal → record_terminal). A transport abort
+#    must charge ONLY the transport budget; a lost-payload protocol failure must
+#    charge ONLY the uncertain budget; neither may consume the other's budget. ──
+def test_orchestrator_transport_abort_charges_only_transport_budget(tmp_ws: Workspace):
+    """Real Worker SDK aborts flow through resolve_role_terminal (transport is
+    authoritative) and record_terminal, charging only ``consecutive_transport``
+    — never ``consecutive_no_progress`` or ``consecutive_uncertain``."""
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker")] * 3 + [finish()],
+        role_outcome=AttemptOutcome.SDK_ERROR,
+    )
+    orch, disp = _orch(
+        tmp_ws, fake, max_steps=50,
+        limits=DispatcherLimits(
+            max_edge_repeats=0, max_consecutive_unproductive=0,
+            max_transport_failures=5, max_uncertain=5, max_no_progress=5,
+        ),
+    )
+    orch.run(once=False)
+    run = disp.start_or_resume_run("goal:v1")
+    assert run.consecutive_transport == 3
+    assert run.consecutive_no_progress == 0
+    assert run.consecutive_uncertain == 0
+    assert run.consecutive_unproductive == 3  # diagnostic aggregate
+
+
+def test_orchestrator_lost_handoff_charges_only_uncertain_budget(tmp_ws: Workspace):
+    """A production-faithful double ``submit_role_handoff`` (payload lost →
+    uncertain) charges only ``consecutive_uncertain``, isolated from the transport
+    and no-progress budgets, and settles into a bounded WAIT (never a human
+    pause) once its own class cap is reached."""
+    fake = FakeExecutor(
+        lead_script=[dispatch_to("worker")] * 30,
+        role_handoff=None,
+        role_handoff_submissions=2,  # duplicate submission → capture yields None
+    )
+    orch, disp = _orch(
+        tmp_ws, fake, max_steps=100,
+        limits=DispatcherLimits(
+            max_edge_repeats=0, max_consecutive_unproductive=0,
+            max_transport_failures=99, max_uncertain=3, max_no_progress=99,
+        ),
+    )
+    orch.run(once=False)
+    assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
+    run = disp.start_or_resume_run("goal:v1")
+    assert RunStatus(run.status) is RunStatus.WAITING
+    assert run.human_blocker is None
+    assert run.wake_condition and "uncertain" in run.wake_condition
+    assert run.consecutive_uncertain == 3
+    assert run.consecutive_transport == 0
+    assert run.consecutive_no_progress == 0

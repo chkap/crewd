@@ -154,6 +154,32 @@ class HandoffOutcome(str, Enum):
             HandoffOutcome.UNCERTAIN,
         )
 
+    @property
+    def budget_class(self) -> Optional[str]:
+        """The recovery-budget class this outcome consumes, or ``None`` when the
+        outcome is productive (resets every recovery streak).
+
+        #65 requires *separated* budgets and dispositions: a transient GitHub/SDK
+        transport abort must not consume or trip the same budget as an ordinary
+        role no-progress or a protocol-uncertain handoff, and vice versa. Each
+        unproductive outcome therefore maps to exactly one durable class:
+
+        - ``"transport"`` — transient GitHub/SDK transport failures: SDK errors,
+          wait-bound timeouts, and signal/operator cancellations (lifecycle, not
+          role judgement).
+        - ``"uncertain"`` — protocol-uncertain handoffs: taint or restart
+          reconciliation left the safe state unknown.
+        - ``"no_progress"`` — an ordinary role attempt that self-reported no
+          progress.
+        """
+        return {
+            HandoffOutcome.FAILED: "transport",
+            HandoffOutcome.TIMED_OUT: "transport",
+            HandoffOutcome.CANCELLED: "transport",
+            HandoffOutcome.UNCERTAIN: "uncertain",
+            HandoffOutcome.NO_PROGRESS: "no_progress",
+        }.get(self)
+
 
 def classify(outcome: AttemptOutcome) -> HandoffOutcome:
     """Default mapping from an SDK :class:`AttemptOutcome` to a handoff class.
@@ -326,6 +352,13 @@ class RunView:
     invalid_solicitations: int = 0
     consecutive_corrections: int = 0
     gate_correction: Optional[str] = None
+    # #65 per-class recovery budgets, kept isolated from one another so a
+    # transient transport abort never trips a role no-progress / protocol
+    # uncertainty budget (or vice versa). ``consecutive_unproductive`` above is
+    # retained as a diagnostic aggregate across all three classes.
+    consecutive_transport: int = 0
+    consecutive_uncertain: int = 0
+    consecutive_no_progress: int = 0
 
 
 @dataclass(frozen=True)
@@ -349,10 +382,30 @@ class DispatcherLimits:
     """Deterministic bounds. ``0`` means unbounded."""
 
     max_work: int = 0                 # total attempt slots reservable per run
-    max_consecutive_unproductive: int = 5
+    # Aggregate across every unproductive class. Disabled by default (``0``): #65
+    # requires the *per-class* budgets below to govern disposition so distinct
+    # failure kinds cannot share a single budget. Still honoured when a caller
+    # sets it explicitly (kept for backward compatibility / a coarse ceiling).
+    max_consecutive_unproductive: int = 0
     max_edge_repeats: int = 3         # identical role edge repeated w/o new progress/handoff
     max_invalid_solicitations: int = 3  # invalid/failed Lead turns before a persisted pause
     max_gate_corrections: int = 3       # consecutive correctable gate rejections before escalation
+    # #65 separated per-class recovery budgets (each independent; ``0`` unbounded).
+    max_transport_failures: int = 5   # transient GitHub/SDK transport aborts/timeouts/cancels
+    max_uncertain: int = 5            # protocol-uncertain (taint / restart-reconciled) handoffs
+    max_no_progress: int = 5          # ordinary role attempts self-reporting no progress
+
+
+# #65 per-class budget wiring: maps a :attr:`HandoffOutcome.budget_class` name to
+# the durable ``goal_run`` counter column and the :class:`DispatcherLimits` cap
+# attribute that govern it. The single source of truth for the separation so
+# ``_return_to_lead`` (increment) and ``_thrash_reason`` (disposition) can never
+# drift apart.
+_BUDGET_CLASSES: dict[str, tuple[str, str]] = {
+    "transport": ("consecutive_transport", "max_transport_failures"),
+    "uncertain": ("consecutive_uncertain", "max_uncertain"),
+    "no_progress": ("consecutive_no_progress", "max_no_progress"),
+}
 
 
 LEAD_PENDING = "lead_pending"
@@ -375,6 +428,9 @@ CREATE TABLE IF NOT EXISTS goal_run (
     invalid_solicitations INTEGER NOT NULL DEFAULT 0,
     consecutive_corrections INTEGER NOT NULL DEFAULT 0,
     gate_correction TEXT,
+    consecutive_transport INTEGER NOT NULL DEFAULT 0,
+    consecutive_uncertain INTEGER NOT NULL DEFAULT 0,
+    consecutive_no_progress INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS dispatch (
@@ -463,7 +519,7 @@ class Dispatcher:
         self._migrate()
 
     # Bump when a schema change needs an in-place migration of existing DBs.
-    _SCHEMA_VERSION = 5
+    _SCHEMA_VERSION = 6
 
     def _migrate(self) -> None:
         """Idempotently upgrade a database created by an earlier kernel version.
@@ -517,6 +573,16 @@ class Dispatcher:
              "ALTER TABLE goal_run ADD COLUMN consecutive_corrections INTEGER NOT NULL DEFAULT 0"),
             (goal_run_cols, "gate_correction",
              "ALTER TABLE goal_run ADD COLUMN gate_correction TEXT"),
+            # #65: separated per-class recovery budgets. A legacy row reads each
+            # as 0 (no in-flight streak), so an upgraded database simply starts
+            # every class budget fresh without misrepresenting history or
+            # erasing durable handoff evidence.
+            (goal_run_cols, "consecutive_transport",
+             "ALTER TABLE goal_run ADD COLUMN consecutive_transport INTEGER NOT NULL DEFAULT 0"),
+            (goal_run_cols, "consecutive_uncertain",
+             "ALTER TABLE goal_run ADD COLUMN consecutive_uncertain INTEGER NOT NULL DEFAULT 0"),
+            (goal_run_cols, "consecutive_no_progress",
+             "ALTER TABLE goal_run ADD COLUMN consecutive_no_progress INTEGER NOT NULL DEFAULT 0"),
         ]
         pending = [sql for cols, name, sql in additions if name not in cols]
         self._conn.execute("BEGIN IMMEDIATE;")
@@ -585,9 +651,10 @@ class Dispatcher:
 
         This is the *only* way a non-active run resumes launching work; it clears
         the wake condition / human blocker and resets the per-class recovery
-        budgets (thrash counters, gate-correction streak, and invalid-solicitation
-        counter) so the run does not immediately re-trip an aggregate guard after
-        an explicit resume. Historical handoffs/attempts/dispatches are preserved
+        budgets (the separated transport / protocol-uncertainty / no-progress
+        thrash counters, the aggregate unproductive counter, the edge-repeat
+        state, the gate-correction streak, and the invalid-solicitation counter)
+        so the run does not immediately re-trip a guard after an explicit resume. Historical handoffs/attempts/dispatches are preserved
         as durable evidence — only the live budgets are refreshed. Routing
         authority returns to Lead. ``finished`` and ``exhausted`` are terminal and
         cannot be resumed (raises :class:`DecisionError`); resuming an already-
@@ -611,7 +678,9 @@ class Dispatcher:
                 "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = NULL, "
                 "human_blocker = NULL, consecutive_unproductive = 0, last_edge = NULL, "
                 "last_edge_repeats = 0, consecutive_corrections = 0, gate_correction = NULL, "
-                "invalid_solicitations = 0, authority_seq = authority_seq + 1 WHERE id = ?",
+                "invalid_solicitations = 0, consecutive_transport = 0, "
+                "consecutive_uncertain = 0, consecutive_no_progress = 0, "
+                "authority_seq = authority_seq + 1 WHERE id = ?",
                 (RunStatus.ACTIVE.value, LEAD_PENDING, run_id),
             )
             run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
@@ -729,6 +798,23 @@ class Dispatcher:
         :class:`DecisionError` (exactly-one-terminal invariant).
         """
         cls = outcome_class or classify(outcome)
+        # #65 separation invariant, enforced at the kernel boundary: for a
+        # non-idle SDK lifecycle outcome the transport class is authoritative and
+        # may not be overridden into a role-judgement class (no_progress) or any
+        # other class — otherwise a transport abort could be charged to the wrong
+        # per-class recovery budget. A role-judgement class is only admissible on
+        # a clean idle turn (IDLE_COMPLETED), where the role's substantiated claim
+        # governs. (Production always honours this via resolve_role_terminal.)
+        if (
+            outcome_class is not None
+            and outcome is not AttemptOutcome.IDLE_COMPLETED
+            and outcome_class != classify(outcome)
+        ):
+            raise DecisionError(
+                f"outcome_class {outcome_class.value!r} may not override the "
+                f"authoritative transport class {classify(outcome).value!r} for "
+                f"non-idle outcome {outcome.value!r}"
+            )
         with self._txn() as c:
             att = c.execute("SELECT * FROM attempt WHERE id = ?", (attempt_id,)).fetchone()
             if att is None:
@@ -1135,13 +1221,46 @@ class Dispatcher:
         return handoff_id
 
     def _return_to_lead(self, c, run_id: str, cls: HandoffOutcome) -> None:
-        """Hand routing authority back to Lead and update the unproductive counter."""
-        run = c.execute("SELECT consecutive_unproductive FROM goal_run WHERE id = ?", (run_id,)).fetchone()
-        unproductive = (run["consecutive_unproductive"] + 1) if cls.is_unproductive else 0
+        """Hand routing authority back to Lead and update the recovery budgets.
+
+        #65: each unproductive outcome consumes *only* its own class budget
+        (transport / uncertain / no_progress) plus the diagnostic aggregate; a
+        productive completion resets every recovery streak. This keeps the
+        classes deterministically isolated — a transient transport abort can
+        never advance (or trip) the role no-progress or protocol-uncertainty
+        budget, and vice versa.
+        """
+        cols = ("consecutive_unproductive", "consecutive_transport",
+                "consecutive_uncertain", "consecutive_no_progress")
+        run = c.execute(
+            f"SELECT {', '.join(cols)} FROM goal_run WHERE id = ?", (run_id,)
+        ).fetchone()
+        if cls.is_unproductive:
+            aggregate = run["consecutive_unproductive"] + 1
+            bumped = _BUDGET_CLASSES[cls.budget_class][0] if cls.budget_class else None
+            values = {
+                "consecutive_unproductive": aggregate,
+                "consecutive_transport": run["consecutive_transport"],
+                "consecutive_uncertain": run["consecutive_uncertain"],
+                "consecutive_no_progress": run["consecutive_no_progress"],
+            }
+            if bumped is not None:
+                values[bumped] = run[bumped] + 1
+        else:
+            # Productive completion clears every recovery streak.
+            values = {col: 0 for col in cols}
         c.execute(
             "UPDATE goal_run SET routing_authority = ?, consecutive_unproductive = ?, "
-            "authority_seq = authority_seq + 1 WHERE id = ?",
-            (LEAD_PENDING, unproductive, run_id),
+            "consecutive_transport = ?, consecutive_uncertain = ?, "
+            "consecutive_no_progress = ?, authority_seq = authority_seq + 1 WHERE id = ?",
+            (
+                LEAD_PENDING,
+                values["consecutive_unproductive"],
+                values["consecutive_transport"],
+                values["consecutive_uncertain"],
+                values["consecutive_no_progress"],
+                run_id,
+            ),
         )
 
     def _validate_acks(self, c, run_id: str, ack_ids) -> None:
@@ -1164,6 +1283,22 @@ class Dispatcher:
             )
 
     def _thrash_reason(self, run, edge: str) -> tuple[bool, Optional[str]]:
+        # #65: each recovery class trips on its OWN budget, independently, so a
+        # mix of transport aborts, protocol-uncertain handoffs, and role
+        # no-progress never combine into a single shared disposition. Class caps
+        # are checked before the coarse aggregate/edge guards.
+        _labels = {
+            "transport": "transient GitHub/SDK transport failures",
+            "uncertain": "protocol-uncertain handoffs",
+            "no_progress": "role no-progress attempts",
+        }
+        for name, (col, cap_attr) in _BUDGET_CLASSES.items():
+            cap = getattr(self.limits, cap_attr)
+            count = run[col] if col in run.keys() else 0
+            if cap and count >= cap:
+                return True, (
+                    f"{count} consecutive {_labels[name]} (cap {cap})"
+                )
         if self.limits.max_consecutive_unproductive and (
             run["consecutive_unproductive"] >= self.limits.max_consecutive_unproductive
         ):
@@ -1593,6 +1728,18 @@ def _run_view(row: sqlite3.Row) -> RunView:
         ),
         gate_correction=(
             row["gate_correction"] if "gate_correction" in row.keys() else None
+        ),
+        consecutive_transport=(
+            row["consecutive_transport"]
+            if "consecutive_transport" in row.keys() else 0
+        ),
+        consecutive_uncertain=(
+            row["consecutive_uncertain"]
+            if "consecutive_uncertain" in row.keys() else 0
+        ),
+        consecutive_no_progress=(
+            row["consecutive_no_progress"]
+            if "consecutive_no_progress" in row.keys() else 0
         ),
     )
 

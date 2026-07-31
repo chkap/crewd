@@ -280,6 +280,214 @@ def test_consecutive_unproductive_guard_waits_run(tmp_path):
     assert got.wake_condition
 
 
+# ───────────── #65 separated per-class recovery budgets ─────────────
+# Transport (SDK/GitHub transport aborts, timeouts, cancels), protocol
+# uncertainty (taint / restart reconciliation), and ordinary role no-progress
+# each own an INDEPENDENT durable budget: interleaving them must never combine
+# into a single shared disposition, and each trips only on its own cap.
+
+# outcome_class → the AttemptOutcome used to reach it via record_terminal.
+_CLASS_OUTCOME = {
+    HandoffOutcome.FAILED: AttemptOutcome.SDK_ERROR,       # transport
+    HandoffOutcome.TIMED_OUT: AttemptOutcome.ABORTED_CLEAN,  # transport
+    HandoffOutcome.CANCELLED: AttemptOutcome.CANCELLED_CLEAN,  # transport
+    HandoffOutcome.UNCERTAIN: AttemptOutcome.TAINTED,      # protocol uncertainty
+}
+
+
+def _drive_class(disp, run_id, role, cls: HandoffOutcome):
+    """Dispatch ``role`` and drive it to a terminal of handoff class ``cls``.
+
+    Returns the ``lead_decide`` DecisionResult so a caller can observe whether
+    the pre-dispatch thrash guard tripped for this edge.
+    """
+    res = disp.lead_decide(run_id, LeadDecision.dispatch(role), configured_roles=ROLES)
+    if res.guard_tripped:
+        return res
+    if cls is HandoffOutcome.NO_PROGRESS:
+        outcome, override = AttemptOutcome.IDLE_COMPLETED, HandoffOutcome.NO_PROGRESS
+    elif cls is HandoffOutcome.COMPLETED:
+        outcome, override = AttemptOutcome.IDLE_COMPLETED, None
+    else:
+        outcome, override = _CLASS_OUTCOME[cls], None
+    _drive(disp, run_id, res.dispatch.id, role, outcome, outcome_class=override)
+    return res
+
+
+# Alternate roles so the identical-edge repeat guard never confounds the
+# per-class budget under test.
+_ALT_ROLES = ("worker", "verifier")
+
+
+def test_transport_and_no_progress_budgets_are_isolated(tmp_path):
+    """Interleaved transport aborts and role no-progress each stay under their own
+    cap even though the *count* of unproductive attempts exceeds either cap: the
+    budgets are separate, so no shared disposition trips."""
+    disp = _open(
+        tmp_path, max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=3, max_no_progress=3, max_uncertain=3,
+    )
+    run = disp.start_or_resume_run("goal:v1")
+    # 2 transport + 2 no_progress, interleaved (4 unproductive total > any cap).
+    seq = [HandoffOutcome.FAILED, HandoffOutcome.NO_PROGRESS,
+           HandoffOutcome.TIMED_OUT, HandoffOutcome.NO_PROGRESS]
+    for i, cls in enumerate(seq):
+        res = _drive_class(disp, run.id, _ALT_ROLES[i % 2], cls)
+        assert res.guard_tripped is False, f"step {i} ({cls}) tripped prematurely"
+    got = disp.get_run(run.id)
+    assert got.consecutive_transport == 2
+    assert got.consecutive_no_progress == 2
+    assert got.consecutive_uncertain == 0
+    assert got.consecutive_unproductive == 4  # diagnostic aggregate
+    assert got.status is RunStatus.ACTIVE
+
+
+def test_transport_budget_trips_only_on_its_own_cap(tmp_path):
+    """Consecutive transport aborts trip the transport budget (and nothing else),
+    surfacing a transport-labelled bounded wait — not a human pause."""
+    disp = _open(
+        tmp_path, max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=3, max_no_progress=99, max_uncertain=99,
+    )
+    run = disp.start_or_resume_run("goal:v1")
+    for i in range(3):
+        res = _drive_class(disp, run.id, _ALT_ROLES[i % 2], HandoffOutcome.FAILED)
+        assert res.guard_tripped is False
+    # 4th dispatch sees consecutive_transport==3 >= cap and settles into a wait.
+    res = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    assert res.guard_tripped is True
+    assert "transport" in res.guard_reason
+    got = disp.get_run(run.id)
+    assert got.status is RunStatus.WAITING
+    assert got.human_blocker is None
+    assert got.consecutive_transport == 3
+    assert got.consecutive_no_progress == 0
+    assert got.consecutive_uncertain == 0
+
+
+def test_no_progress_does_not_trip_transport_budget(tmp_path):
+    """A run that only produces role no-progress never trips the transport budget,
+    however many attempts — the two dispositions are fully independent."""
+    disp = _open(
+        tmp_path, max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=3, max_no_progress=0, max_uncertain=0,  # only transport bounded
+    )
+    run = disp.start_or_resume_run("goal:v1")
+    for i in range(6):
+        res = _drive_class(disp, run.id, _ALT_ROLES[i % 2], HandoffOutcome.NO_PROGRESS)
+        assert res.guard_tripped is False, f"no_progress step {i} wrongly tripped transport"
+    got = disp.get_run(run.id)
+    assert got.consecutive_no_progress == 6
+    assert got.consecutive_transport == 0
+    assert got.status is RunStatus.ACTIVE
+
+
+def test_uncertain_budget_isolated_from_transport(tmp_path):
+    """Protocol-uncertain handoffs and transport aborts consume distinct budgets;
+    interleaving them keeps each under its own cap."""
+    disp = _open(
+        tmp_path, max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=3, max_uncertain=3, max_no_progress=3,
+    )
+    run = disp.start_or_resume_run("goal:v1")
+    seq = [HandoffOutcome.UNCERTAIN, HandoffOutcome.FAILED,
+           HandoffOutcome.UNCERTAIN, HandoffOutcome.CANCELLED]
+    for i, cls in enumerate(seq):
+        res = _drive_class(disp, run.id, _ALT_ROLES[i % 2], cls)
+        assert res.guard_tripped is False
+    got = disp.get_run(run.id)
+    assert got.consecutive_uncertain == 2
+    assert got.consecutive_transport == 2
+    assert got.consecutive_no_progress == 0
+
+
+def test_productive_completion_resets_all_class_budgets(tmp_path):
+    """A single productive completion clears every per-class recovery streak."""
+    disp = _open(
+        tmp_path, max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=5, max_uncertain=5, max_no_progress=5,
+    )
+    run = disp.start_or_resume_run("goal:v1")
+    for i, cls in enumerate((HandoffOutcome.FAILED, HandoffOutcome.UNCERTAIN,
+                             HandoffOutcome.NO_PROGRESS)):
+        _drive_class(disp, run.id, _ALT_ROLES[i % 2], cls)
+    mid = disp.get_run(run.id)
+    assert (mid.consecutive_transport, mid.consecutive_uncertain,
+            mid.consecutive_no_progress) == (1, 1, 1)
+    _drive_class(disp, run.id, "worker", HandoffOutcome.COMPLETED)
+    done = disp.get_run(run.id)
+    assert (done.consecutive_transport, done.consecutive_uncertain,
+            done.consecutive_no_progress, done.consecutive_unproductive) == (0, 0, 0, 0)
+
+
+def test_resume_restores_per_class_budgets_without_erasing_evidence(tmp_path):
+    """An explicit resume refreshes every per-class budget (so a resumed run does
+    not immediately re-trip) while preserving durable handoff evidence."""
+    disp = _open(
+        tmp_path, max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=2, max_uncertain=99, max_no_progress=99,
+    )
+    run = disp.start_or_resume_run("goal:v1")
+    for i in range(2):
+        _drive_class(disp, run.id, _ALT_ROLES[i % 2], HandoffOutcome.FAILED)
+    trip = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    assert trip.guard_tripped and disp.get_run(run.id).status is RunStatus.WAITING
+    handoffs_before = len(disp.export_run(run.id)["handoffs"])
+    resumed = disp.resume_run(run.id)
+    assert resumed.status is RunStatus.ACTIVE
+    assert resumed.consecutive_transport == 0
+    assert resumed.consecutive_uncertain == 0
+    assert resumed.consecutive_no_progress == 0
+    assert resumed.consecutive_unproductive == 0
+    # Durable evidence (the synthetic wait handoff + prior terminals) is intact.
+    assert len(disp.export_run(run.id)["handoffs"]) == handoffs_before
+
+
+def test_per_class_budgets_survive_restart(tmp_path):
+    """Per-class budgets are durable: a crash/restart (fresh Dispatcher on the same
+    file) reconstructs the exact class counters and still trips deterministically."""
+    db = tmp_path / "dispatch.sqlite3"
+    disp = Dispatcher(db, DispatcherLimits(
+        max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=3, max_uncertain=99, max_no_progress=99,
+    ))
+    run = disp.start_or_resume_run("goal:v1")
+    for i in range(2):
+        _drive_class(disp, run.id, _ALT_ROLES[i % 2], HandoffOutcome.FAILED)
+    disp.close()
+
+    disp2 = Dispatcher(db, DispatcherLimits(
+        max_edge_repeats=0, max_consecutive_unproductive=0,
+        max_transport_failures=3, max_uncertain=99, max_no_progress=99,
+    ))
+    assert disp2.get_run(run.id).consecutive_transport == 2
+    # One more transport abort reaches the cap and trips post-restart.
+    res = _drive_class(disp2, run.id, "worker", HandoffOutcome.FAILED)
+    assert res.guard_tripped is False  # this is the 3rd; trip is checked on the 4th dispatch
+    res2 = disp2.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    assert res2.guard_tripped and "transport" in res2.guard_reason
+
+
+def test_transport_class_override_rejected_at_kernel(tmp_path):
+    """A non-idle transport outcome cannot be re-charged to a role-judgement
+    budget: the kernel rejects a mismatched outcome_class override so a transport
+    abort can never consume the no_progress budget."""
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run("goal:v1")
+    d = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
+    att = disp.reserve_attempt(run.id, d.dispatch.id, "worker")
+    disp.mark_started(att, session_id="s", generation=0)
+    with pytest.raises(DecisionError):
+        disp.record_terminal(att, AttemptOutcome.SDK_ERROR,
+                             outcome_class=HandoffOutcome.NO_PROGRESS)
+    # The attempt stays in-flight (transaction rolled back) and can be recorded
+    # with its authoritative transport class.
+    disp.record_terminal(att, AttemptOutcome.SDK_ERROR)
+    got = disp.get_run(run.id)
+    assert got.consecutive_transport == 1
+    assert got.consecutive_no_progress == 0
+
+
 # ─────────────────────────── wait / pause / finish ───────────────────────────
 def test_wait_persists_condition_launches_no_role(tmp_path):
     disp = _open(tmp_path)
@@ -825,6 +1033,10 @@ def test_migration_upgrades_pre17_database(tmp_path):
     assert got.status is RunStatus.ACTIVE
     assert got.authority_seq == 0
     assert got.invalid_solicitations == 0
+    # #65 per-class budget columns are added in place and default to 0.
+    assert got.consecutive_transport == 0
+    assert got.consecutive_uncertain == 0
+    assert got.consecutive_no_progress == 0
     # New solicitation machinery works on the migrated DB.
     sol = disp.open_lead_solicitation("run-1")
     assert sol.attempt_id
