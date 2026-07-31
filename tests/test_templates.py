@@ -197,9 +197,116 @@ def test_render_lead_omits_advisory_when_disabled():
     assert "Use Advisory strategically" not in out
     assert "Advisory is `gpt-5.2`" not in out
     assert "Coordinate Worker and Verifier" in out
+    # The whole high-leverage consultation policy is gated on advisory being on.
+    assert "Advisory consultation policy" not in out
+    assert "No-progress damping" not in out
     # Lead should not impose a fixed issue-count quota
     assert "3–6 issues" not in out
     assert "usually at least 2" in out
+
+
+# ── #66: high-leverage Advisory consultation policy (Lead + Advisory prompts) ──
+def _lead(advisory_enabled=True):
+    return render(
+        "agents/lead.agent.md.j2",
+        workspace_name="demo",
+        target_repo="acme/widget",
+        role_model="claude-opus-4.7",
+        role_name="lead",
+        worker_model="gpt-5.4",
+        verifier_model="claude-opus-4.7",
+        advisory_model="gpt-5.2",
+        advisory_enabled=advisory_enabled,
+    )
+
+
+def test_lead_consults_advisory_at_initial_decomposition():
+    """Requirement: Lead normally consults Advisory before initial decomposition
+    of a non-trivial goal (proactively, not only when blocked)."""
+    out = _lead()
+    assert "Advisory consultation policy" in out
+    assert "Initial decomposition of a non-trivial goal" in out
+    # Consultation must happen BEFORE the decision, not after the fact.
+    assert "Consult Advisory *before* you decide" in out
+    # Proactive, not a fixed rotation.
+    assert "no automatic Advisory turn" in out
+    assert "not a fixed rotation" in out
+
+
+def test_lead_consults_advisory_at_consequential_points():
+    """Requirement: consult before consequential architecture/protocol/security/
+    migration choices, multiple viable approaches, and weak verification oracles."""
+    out = _lead()
+    assert "architecture, protocol, security, or migration" in out
+    assert "Multiple viable approaches" in out
+    assert "verification oracle is weak" in out
+
+
+def test_lead_permits_justified_skip_with_stated_reason():
+    """Requirement: routine/low-risk/already-decided skips are permitted, but Lead
+    must state why when skipping at a consequential point."""
+    out = _lead()
+    assert "Justified skips are allowed" in out
+    assert "routine, low-risk, or already-decided" in out
+    assert "state the reason in one line" in out
+
+
+def test_lead_reconsults_advisory_on_repeated_rework():
+    """Requirement (architecture re-consultation): repeated Worker/Verifier
+    disagreement or rework re-consults Advisory on the approach, not a Worker↔
+    Verifier loop."""
+    out = _lead()
+    assert "Repeated Worker/Verifier disagreement or rework" in out
+    # Re-consult on the contested approach instead of looping the roles.
+    assert "re-consult Advisory on the contested architecture/approach" in out
+
+
+def test_lead_advisory_no_progress_raises_threshold():
+    """Requirement: repeated no-progress Advisory attempts raise the threshold for
+    another dispatch rather than causing a loop."""
+    out = _lead()
+    assert "No-progress damping" in out
+    assert "raise the bar" in out
+    assert "materially new evidence" in out
+
+
+def test_lead_retains_final_authority_over_advisory():
+    """Requirement: Advisory stays non-binding, optional, Lead-directed; Lead keeps
+    final routing/design authority."""
+    out = _lead()
+    assert "non-binding" in out
+    assert "retain final routing and design authority" in out
+    assert "never routes, approves, blocks, or overrides" in out
+
+
+def test_advisory_supplies_options_tradeoffs_and_plan_implications():
+    """Requirement: Advisory supplies evidence, 2–3 options, tradeoffs,
+    recommendation, uncertainty, and broad plan implications — high-level,
+    non-binding, Lead-directed."""
+    out = render(
+        "agents/advisory.agent.md.j2",
+        workspace_name="demo",
+        target_repo="acme/widget",
+        role_model="gpt-5.2",
+        role_name="advisory",
+        worker_model="gpt-5.4",
+        verifier_model="claude-opus-4.7",
+        advisory_model="gpt-5.2",
+    )
+    assert "2-3 plausible approaches" in out
+    assert "Tradeoffs" in out
+    assert "Recommendation" in out
+    assert "Confidence / uncertainty" in out
+    assert "Plan implications" in out
+    # Aligned high-leverage proactive triggers.
+    assert "non-trivial goal is being decomposed" in out
+    assert "consequential architecture / protocol / security / migration" in out
+    assert "verification oracle is weak" in out
+    assert "Repeated Worker/Verifier disagreement or rework" in out
+    # No-progress damping on the Advisory side too (raise the bar after idle runs).
+    assert "raise the bar" in out
+    # Stays non-binding.
+    assert "non-binding" in out
 
 
 def test_render_goal_template():
