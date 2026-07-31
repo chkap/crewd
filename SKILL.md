@@ -9,14 +9,14 @@ description: Operate the crewd multi-agent coding crew CLI — bootstrap a works
 
 ## What crewd is
 
-A CLI (`typer` + `jinja2` + `pydantic`; roles run through the official `github-copilot-sdk`) that runs a 4-role autonomous coding crew against a target GitHub repo. Installed on `PATH` as `crewd` (`pipx install crewd`, `uv tool install crewd`, or `pip install crewd`):
+A CLI (`typer` + `jinja2` + `pydantic`; roles run through the official `github-copilot-sdk`) that runs a 4-role autonomous coding crew against a target GitHub repo. Installed on `PATH` as `crewd` (primary: `pip install crewd` into a virtual environment; alternatives: `pipx install crewd` or `uv tool install crewd`):
 
 - **lead** — plans, schedules, opens umbrella issues. No code, no merges.
 - **worker** — writes code, opens PRs. No merges.
 - **verifier** — reviews PRs, merges. No code. Two tiers: per-PR + final `crewd:acceptance` gate.
 - **advisory** — research, citations, design pointers. No code, no merges.
 
-Each role runs as an official **GitHub Copilot SDK session** with its own `config_directory` set to `cfg/<role>/` (private resumable conversation + config), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. There is **no fixed round-robin**: the **Lead directs the crew** — each cycle it returns one typed decision (`dispatch`/`continue_lead`/`wait`/`pause`/`finish`) and a dispatched role returns one typed handoff (`completed`/`no_progress`), all journaled to a durable SQLite run log for restart-safe recovery. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
+Each role runs as an official **GitHub Copilot SDK session** with its own `config_directory` set to `cfg/<role>/` (private resumable conversation + config), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. There is **no fixed round-robin**: the **Lead directs the crew** — each cycle it returns one typed decision (`dispatch`/`wait`/`pause`/`finish`; there is no model-selected `continue_lead` — the host manages re-solicitation, interruption, and timeout recovery under bounded per-class budgets) and a dispatched role returns one typed handoff (`completed`/`no_progress`), all journaled to a durable SQLite run log for restart-safe recovery. Recovery is classified: transient transport, uncertain/missing decisions, and no-progress carry separate budgets and settle into a bounded `WAITING` wake; `PAUSE` is reserved for operator-only blockers. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
 
 ## When to use this skill
 

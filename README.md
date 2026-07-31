@@ -2,7 +2,7 @@
 
 > Multi-agent coding crew CLI — **Lead / Worker / Verifier / Advisory** running as separate Copilot CLI sessions, with GitHub Issues as the message bus.
 
-`crewd` packages a multi-role autonomous coding crew into a reusable CLI. The roles are **Lead / Worker / Verifier**, with **Advisory as an optional fourth role** when you want proactive research and tradeoff analysis. Each role runs as an official **GitHub Copilot SDK session** (`backend: copilot-sdk`) with its own `config_directory` (pointed at `cfg/<role>/`, so its config + conversation are independent and resumable) and a per-role `agent.md` describing responsibilities. There is **no fixed round-robin**: the **Lead dynamically directs the crew** via a durable dispatcher. Each cycle the Lead is solicited and returns exactly one typed decision (`dispatch` a role, `continue_lead`, `wait`, `pause`, or `finish`); a dispatched role runs one attempt and returns exactly one typed handoff (`completed` / `no_progress`) that feeds the Lead's next decision. All dispatches, attempts, and handoffs are journaled to a SQLite run log for restart-safe, at-least-once, idempotent recovery.
+`crewd` packages a multi-role autonomous coding crew into a reusable CLI. The roles are **Lead / Worker / Verifier**, with **Advisory as an optional fourth role** when you want proactive research and tradeoff analysis. Each role runs as an official **GitHub Copilot SDK session** (`backend: copilot-sdk`) with its own `config_directory` (pointed at `cfg/<role>/`, so its config + conversation are independent and resumable) and a per-role `agent.md` describing responsibilities. There is **no fixed round-robin**: the **Lead dynamically directs the crew** via a durable dispatcher. Each cycle the Lead is solicited and returns exactly one typed decision — `dispatch` a role, `wait` (with an observable wake condition), `pause` (a human-only blocker), or `finish`. There is no model-selected "keep going" decision: if the Lead needs another turn to plan, it emits a bounded `wait` and the **host** manages re-solicitation, interruption, and timeout recovery. A dispatched role runs one attempt and returns exactly one typed handoff (`completed` / `no_progress`) that feeds the Lead's next decision. All dispatches, attempts, and handoffs are journaled to a SQLite run log for restart-safe, at-least-once, idempotent recovery.
 
 The roles are decoupled from the target repo: the workspace lives wherever you want, the target repo is cloned into `<workspace>/repo/`, per-role git worktrees are created at `cfg/<role>/worktree/` (each role's cwd), and the only inter-role communication channel is GitHub issue / PR comments (plus an out-of-band human inbox).
 
@@ -33,29 +33,45 @@ git --version
 
 ## Installation
 
-crewd is a CLI application. Install it so the `crewd` command is on your `PATH` — the recommended tools give each install an isolated environment:
+crewd is a CLI application published on **[PyPI](https://pypi.org/project/crewd/)**. The
+primary, supported path for ordinary users is a **pip install into a dedicated virtual
+environment** — this works everywhere Python 3.11+ is available and keeps crewd's
+dependencies isolated from the rest of your system:
 
 ```bash
-# pipx (recommended for a CLI): isolated venv, on PATH
-pipx install crewd
+# 1. Create and activate a virtual environment for crewd
+python -m venv ~/.venvs/crewd
+source ~/.venvs/crewd/bin/activate      # Windows: ~\.venvs\crewd\Scripts\activate
 
-# uv tool: same idea, using uv
-uv tool install crewd
+# 2. Install crewd from PyPI
+pip install crewd
 
-# plain pip (into the current/user environment)
-pip install --user crewd
-```
-
-Confirm the entry point and version:
-
-```bash
+# 3. Confirm the entry point and version
+crewd --version                         # prints the installed crewd version
 crewd --help
-crewd --version    # or:  python -c "import crewd; print(crewd.__version__)"
 ```
 
-> **Upgrading:** `pipx upgrade crewd`, `uv tool upgrade crewd`, or `pip install --upgrade crewd`. See [Upgrading an existing workspace](#upgrading-an-existing-workspace) for migrating a workspace created by an older crewd.
+With the venv activated, the `crewd` command is on your `PATH`; re-activate that venv in any
+shell where you want to run crewd. This is the path we recommend for everyday use and the one
+the upgrade and workspace guidance below assumes.
 
-Once installed, every example below uses the bare `crewd` command with git-style workspace discovery — no repository checkout is required.
+**Isolated-CLI alternatives.** If you prefer a tool manager that creates and manages the
+isolated environment for you, either of these installs `crewd` on your `PATH` without a
+manual venv:
+
+```bash
+pipx install crewd        # isolated venv managed by pipx
+uv tool install crewd     # isolated venv managed by uv
+```
+
+> **Upgrading (including 0.1.0 → 0.1.1):** with the venv active, `pip install --upgrade crewd`
+> (or `pipx upgrade crewd` / `uv tool upgrade crewd`). Upgrading the package never rewrites your
+> existing workspaces in place — after upgrading, run `crewd refresh` then `crewd doctor` in
+> each workspace. See [Upgrading an existing workspace](#upgrading-an-existing-workspace).
+
+Once installed, every example below uses the bare `crewd` command with git-style workspace
+discovery — no repository checkout is required. Contributors hacking on crewd itself run the
+in-tree CLI through uv instead; see [Running from a source checkout](#quickstart-minimal-sdk-native-flow).
 
 ---
 
@@ -170,7 +186,7 @@ Hard rules baked into `doctor` and `run`:
 - Two-tier verification: lightweight per-PR review + a heavy **Final Acceptance Gate** before the lead writes `STOPPED`.
 - Advisory is **proactive but non-binding**: it should surface alternatives, tradeoffs, prior art, weak test oracles, and hidden risks, but it does not become the decision-maker.
 - Ask the real user for input only in **true blocking cases**: unresolved product ambiguity, a material risk tradeoff, or strong cross-role disagreement that changes the shipped outcome. This should be rare.
-- When human input, operator-only action, credentials, approval, or a future external event is the only remaining path, Lead records the exact escalation and writes `PAUSED`. The loop exits before ticking more roles and remains resumable without pretending the goal is complete.
+- When human input, operator-only action, credentials, approval, or a future external event is the only remaining path, Lead submits a typed `pause` decision recording the exact escalation (the **host** durably halts the run — Lead does not hand-write `state/PAUSED`). The loop exits before ticking more roles and remains resumable without pretending the goal is complete. Transient failures, ordering races, and internal retries are **not** pauses: they become bounded `wait`s that self-heal (see [Routing & recovery model](#routing--recovery-model-accepted-behavior)).
 
 ### Role decision norms
 
@@ -202,6 +218,24 @@ e.g. `> **[crewd:worker -> verifier]** my-crew`. A body missing or malforming th
 **Prerequisite gating.** Before Lead dispatches **Worker** or **Verifier**, and before a Lead `finish` terminalises the goal, the public-bus gate validates the required GitHub record (active linked `crewd:task`, assignment/scope, and for finish a closed `crewd:acceptance` issue + public goal summary). The active task and acceptance references are derived from the public record, never hard-coded. A missing / invalid / unverifiable prerequisite **rejects** the transition **without** reserving the attempt, consuming any pending handoff, or terminalising the run — authority never advances on an unverified record. An explicit GitHub failure (rate limit, outage, ambiguous write) routes to a bounded wait/reconcile, never to a silent private advance.
 
 **Offline / recovery.** Set `CREWD_DISABLE_PUBLIC_BUS=1` to run the dispatcher without the public bus (offline recovery / local mechanics only). This is a deliberate escape hatch — normal runs against an attached remote keep it enabled so coordination stays on GitHub.
+
+---
+
+## Routing & recovery model (accepted behavior)
+
+crewd's orchestration is **Lead-directed and host-governed**. The Lead decides *what* happens next; the host owns the durable mechanics of *how* — dispatch binding, recovery, and evidence — so a single model turn can never fabricate progress or strand the run. The behaviors below are the accepted contract as of the 0.1.1 line:
+
+- **Lead-directed, exact-bound dispatch.** There is no round-robin. Each `dispatch` decision binds one role to one specific task (an active `crewd:task` issue) with a correlation id; the dispatched attempt, its handoff, and the resulting public comment all carry that exact binding, so authority advances only on the record the Lead actually addressed.
+- **Typed, intent-aware gate corrections.** A dispatch carries a typed intent (implementation, verifier audit, acceptance, release, advisory). The prerequisite gate validates the *right* record for that intent before the attempt is reserved, and a rejected transition is corrected in place rather than consuming an attempt or terminalising the run — a missing/invalid/unverifiable prerequisite never advances authority.
+- **Bounded WAIT vs operator-only PAUSE, with separated budgets.** Recovery is classified by cause and each class carries its own durable budget: transient GitHub/SDK **transport** failures, **uncertain**/missing/malformed decisions, and ordinary **no-progress** are tracked independently so one noisy class can't exhaust another. Any of these leaves the run `WAITING` with an observable `wake_condition` and self-heals on the next run's reconcile. A `PAUSE` is reserved for a genuine **operator-only** prerequisite (missing credential, authorization, protected-environment approval, or a product/policy decision) — never for internal retries or transient errors, so the crew does not raise a false human blocker.
+- **Host-managed re-solicitation (no `continue_lead`).** There is no model-selectable "keep going" outcome. When a Lead turn is interrupted, times out, or returns no/malformed decision, the host re-solicits (or replaces a stuck session) under the bounded per-class budget above, preserving inbox attachment, pending handoffs, exact binding, and correlation.
+- **Durable evidence recovery.** If a role attempt terminates without delivering its structured handoff (a lost or duplicate submission), the host performs an exact-bound search of the GitHub record — the branch/PR/checks the attempt actually produced — and reconciles that evidence instead of discarding the work, so real progress is never lost to a transport hiccup.
+- **Public, auditable trail.** Every material routing decision and handoff is a verified, attributed GitHub comment before authority advances (see the public bus above), so the entire run history is auditable and restart-safe.
+- **Operator recovery.** `crewd resume` restores a meaningful per-class retry budget after an operator resolves a blocker, without erasing accumulated evidence or immediately re-tripping an aggregate guard; `crewd status` / `crewd doctor` distinguish self-healing waits from genuine operator-only pauses.
+
+### High-leverage Advisory consultation
+
+When the optional **Advisory** role is configured, Lead follows a **high-leverage consultation policy, not a fixed rotation**: it consults Advisory before consequential decisions (non-trivial design/tradeoff choices, ambiguous scope, risky sequencing), and records a one-line reason when it deliberately skips consultation for a routine step. Advisory input is **proactive but non-binding** — Lead retains final authority — and repeated no-progress consultations are damped so Advisory adds leverage rather than churn. Omitting the `advisory:` entry from `crew.yaml` disables the policy cleanly.
 
 ---
 
@@ -246,10 +280,14 @@ crewd is an **autonomous agent that acts on GitHub with your credentials**. Unde
 ### Human-blocked pause
 
 `STOPPED` means completed or manually stopped. `PAUSED` means the goal is still open but
-cannot advance without a human/operator action. Lead must first exhaust autonomous work,
-post the exact blocker and requested action on the task and umbrella issues, then write a
-single-line `state/PAUSED` reason beginning with `human-blocked:`. The loop exits after
-Lead's decision, so Advisory, Worker, and Verifier are not invoked pointlessly.
+cannot advance without a human/operator action. When Lead determines only a human/operator
+prerequisite remains, it exhausts autonomous work, posts the exact blocker and requested
+action on the task and umbrella issues, and submits a typed `pause` decision — the **host**
+durably records the `human-blocked:` reason and halts. (Transient/internal problems instead
+become bounded `wait`s that self-heal; see
+[Routing & recovery model](#routing--recovery-model-accepted-behavior).) An operator can also
+pause directly with `crewd pause "<reason>"`. Either way the loop exits after the decision, so
+Advisory, Worker, and Verifier are not invoked pointlessly.
 
 After resolving the blocker:
 
@@ -345,13 +383,16 @@ crewd run                 # lead picks up [OVERRIDE] inbox notice with new label
 
 ## Upgrading an existing workspace
 
-Upgrading the crewd package never rewrites your workspaces in place — reconcile each workspace on its next use:
+Upgrading the crewd package (for example from **0.1.0 to 0.1.1**) never rewrites your
+workspaces in place — reconcile each workspace on its next use:
 
 ```bash
-pipx upgrade crewd          # or: uv tool upgrade crewd / pip install --upgrade crewd
+source ~/.venvs/crewd/bin/activate   # activate the venv crewd is installed in
+pip install --upgrade crewd          # or: pipx upgrade crewd / uv tool upgrade crewd
+crewd --version                      # confirm the new version is active
 cd /path/to/workspace
-crewd refresh               # re-render agents/ + AGENTS.md, migrate old layout/backend if needed
-crewd doctor                # confirm 0 errors before resuming
+crewd refresh                        # re-render agents/ + AGENTS.md, migrate old layout/backend if needed
+crewd doctor                         # confirm 0 errors before resuming
 ```
 
 `crewd refresh` re-renders `agents/*.agent.md` from the current templates and migrates a legacy workspace — including a `crew.yaml` still on the retired `backend: copilot` subprocess transport → `backend: copilot-sdk` — while **preserving** unknown config keys and durable state (`STOPPED`/`PAUSED`, `goal.json`, `session-state/`, `public_writes/`). It is idempotent, so re-running it is safe. Agent templates are also auto re-rendered on the next `run`/`tick` when `crew.yaml` is newer (disable with `--no-auto-render`).

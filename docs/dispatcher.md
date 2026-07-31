@@ -56,7 +56,10 @@ the in-flight dispatch otherwise.
 6. **Closed Lead-decision sum type.** `dispatch(role)`, `continue_lead`,
    `wait(condition)`, `pause(blocker)`, `finish(acceptance)`. A `dispatch` to an
    unconfigured role fails and keeps authority with Lead. `wait`/`pause`/`finish`
-   launch no role.
+   launch no role. `continue_lead` is a **host-internal** kind used for
+   re-solicitation bookkeeping — it is **not model-selectable**: a Lead turn that
+   emits `continue_lead` is rejected, and a Lead needing another planning turn uses
+   `wait(condition)` under the bounded per-class re-solicitation budget instead.
 7. **Exclusive routing authority.** `lead_decide` is accepted only when the run
    is `active` **and** `routing_authority == lead_pending`. This forbids
    overlapping dispatches while one attempt is in flight, and refuses to launch
