@@ -118,8 +118,16 @@ def test_parse_lead_decision_rejects_malformed_task_number():
 
 
 def test_non_dispatch_decisions_carry_no_task():
-    assert parse_lead_decision({"kind": "continue_lead"}).task_number is None
     assert parse_lead_decision({"kind": "wait", "wake_condition": "x"}).task_number is None
+    assert parse_lead_decision({"kind": "pause", "human_blocker": "x"}).task_number is None
+
+
+def test_parse_lead_decision_rejects_model_selected_continue_lead():
+    # continue_lead was removed from the Lead decision contract (#65): a Lead turn
+    # can no longer self-loop as a routing outcome. Rejecting it here makes the
+    # executor treat it as a no-decision, routing into host-managed re-solicitation.
+    with pytest.raises(ValueError):
+        parse_lead_decision({"kind": "continue_lead"})
 
 
 # ══════════════════════════ 2. journal persists the binding ═══════════════

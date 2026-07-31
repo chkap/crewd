@@ -262,7 +262,7 @@ class DecisionResult:
     ``dispatch`` is the created dispatch for ``DISPATCH`` / ``CONTINUE_LEAD`` (and
     is recorded for ``WAIT`` / ``PAUSE`` / ``FINISH`` too, as an audit entry).
     ``guard_tripped`` is True when a thrash/no-progress bound converted a routing
-    decision into a synthetic pause instead of dispatching.
+    decision into a bounded synthetic WAIT instead of dispatching.
     """
 
     run: "RunView"
@@ -584,11 +584,14 @@ class Dispatcher:
         """Explicitly transition a paused/waiting/interrupted run back to active.
 
         This is the *only* way a non-active run resumes launching work; it clears
-        the wake condition / human blocker and resets the thrash counters so the
-        run does not immediately re-trip a guard after human intervention.
-        Routing authority returns to Lead. ``finished`` and ``exhausted`` are
-        terminal and cannot be resumed (raises :class:`DecisionError`); resuming
-        an already-active run is a no-op.
+        the wake condition / human blocker and resets the per-class recovery
+        budgets (thrash counters, gate-correction streak, and invalid-solicitation
+        counter) so the run does not immediately re-trip an aggregate guard after
+        an explicit resume. Historical handoffs/attempts/dispatches are preserved
+        as durable evidence — only the live budgets are refreshed. Routing
+        authority returns to Lead. ``finished`` and ``exhausted`` are terminal and
+        cannot be resumed (raises :class:`DecisionError`); resuming an already-
+        active run is a no-op.
         """
         resumable = {
             RunStatus.PAUSED.value,
@@ -608,7 +611,7 @@ class Dispatcher:
                 "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = NULL, "
                 "human_blocker = NULL, consecutive_unproductive = 0, last_edge = NULL, "
                 "last_edge_repeats = 0, consecutive_corrections = 0, gate_correction = NULL, "
-                "authority_seq = authority_seq + 1 WHERE id = ?",
+                "invalid_solicitations = 0, authority_seq = authority_seq + 1 WHERE id = ?",
                 (RunStatus.ACTIVE.value, LEAD_PENDING, run_id),
             )
             run = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
@@ -845,8 +848,9 @@ class Dispatcher:
         exceeding ``max_consecutive_unproductive``, or repeating an identical role
         edge more than ``max_edge_repeats`` times without an intervening
         productive handoff, does **not** dispatch; it emits one synthetic handoff,
-        pauses the run, and returns ``guard_tripped=True`` (the acks are not
-        applied so Lead re-decides after the human unblocks).
+        settles the run into a bounded ``waiting`` state (never a human pause), and
+        returns ``guard_tripped=True`` (the acks are not applied so Lead re-decides
+        after an explicit resume restores the per-class budgets).
         """
         configured = set(configured_roles)
         with self._txn() as c:
@@ -876,7 +880,7 @@ class Dispatcher:
                 edge = decision.role or "lead"
                 tripped, reason = self._thrash_reason(run, edge)
                 if tripped:
-                    self._synthetic_pause(c, run_id, reason)
+                    self._synthetic_wait(c, run_id, reason)
                     return DecisionResult(
                         run=_run_view(c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()),
                         guard_tripped=True,
@@ -1017,9 +1021,13 @@ class Dispatcher:
           the snapshot's pending handoffs, and any dispatch target is configured
           — resetting the invalid-solicitation counter; or
         * **records it invalid** — increments the invalid-solicitation counter
-          and returns authority to Lead for another (budgeted) solicitation,
-          persisting a ``paused`` blocker once
-          ``max_invalid_solicitations`` is reached.
+          and returns authority to Lead for another (budgeted) solicitation. A
+          clean turn that omits or malforms its structured decision is host-managed
+          recovery, not an operator prerequisite, so once
+          ``max_invalid_solicitations`` is reached the run settles into a bounded
+          ``waiting`` state with an observable wake condition (never a human
+          ``paused``) so it can be reconciled/re-solicited without fabricated human
+          intervention.
 
         Raises :class:`DecisionError` if ``attempt_id`` is not an in-flight
         solicitation (e.g. already reconciled by a restart — the stale candidate
@@ -1086,12 +1094,18 @@ class Dispatcher:
             new_invalid = run["invalid_solicitations"] + 1
             cap = self.limits.max_invalid_solicitations
             if cap and new_invalid >= cap:
-                blocker = f"{new_invalid} invalid/failed Lead solicitations (cap {cap}): {reason}"
+                # Bounded host-managed recovery: a run that cannot obtain a clean,
+                # valid Lead decision within budget is NOT a human blocker — it
+                # settles into a recoverable ``waiting`` state with an observable
+                # wake condition (authority stays with Lead, pending handoffs
+                # intact) so a later reconcile/resume can re-solicit or replace the
+                # stuck session without fabricated operator intervention.
+                wake = f"{new_invalid} invalid/failed Lead solicitations (cap {cap}): {reason}"
                 c.execute(
                     "UPDATE goal_run SET invalid_solicitations = ?, status = ?, "
-                    "routing_authority = ?, human_blocker = ?, authority_seq = authority_seq + 1 "
+                    "routing_authority = ?, wake_condition = ?, authority_seq = authority_seq + 1 "
                     "WHERE id = ?",
-                    (new_invalid, RunStatus.PAUSED.value, LEAD_PENDING, blocker, sol["run_id"]),
+                    (new_invalid, RunStatus.WAITING.value, LEAD_PENDING, wake, sol["run_id"]),
                 )
             else:
                 c.execute(
@@ -1216,15 +1230,24 @@ class Dispatcher:
             ).fetchone()
         return row["gate_correction"] if row is not None else None
 
-    def _synthetic_pause(self, c, run_id: str, blocker: str) -> None:
-        """Emit one synthetic handoff and pause, rather than looping into Lead forever.
+    def _synthetic_wait(self, c, run_id: str, blocker: str) -> None:
+        """Emit one synthetic evidence handoff and settle into a bounded WAIT,
+        rather than looping into Lead forever.
+
+        A tripped thrash guard (too many consecutive unproductive attempts, or an
+        identical role edge repeated without progress) is an *internal* recovery
+        condition, not an operator-only prerequisite, so it must NOT masquerade as
+        a human ``paused`` blocker (#65). The run settles into a recoverable
+        ``waiting`` state with an observable wake condition; authority returns to
+        Lead so an explicit resume (which restores the per-class budgets) or a
+        later reconcile can make fresh progress.
 
         The synthetic handoff represents non-Lead work/control evidence, so it is
         attached to the most recent *non-solicitation* attempt. A ``SOLICIT_LEAD``
         attempt must never produce a handoff through any kernel path, so if the
         only recent attempt is a Lead solicitation (e.g. the guard trips while
         applying a solicited ``continue_lead``/``dispatch`` decision), the run
-        pauses without inserting a synthetic ``role='lead'`` handoff.
+        waits without inserting a synthetic ``role='lead'`` handoff.
         """
         att = c.execute(
             "SELECT a.id, a.role FROM attempt a "
@@ -1239,9 +1262,9 @@ class Dispatcher:
                 evidence="", changed="", remaining=blocker, reason_returned="thrash_guard",
             )
         c.execute(
-            "UPDATE goal_run SET status = ?, routing_authority = ?, human_blocker = ?, "
+            "UPDATE goal_run SET status = ?, routing_authority = ?, wake_condition = ?, "
             "authority_seq = authority_seq + 1 WHERE id = ?",
-            (RunStatus.PAUSED.value, LEAD_PENDING, blocker, run_id),
+            (RunStatus.WAITING.value, LEAD_PENDING, blocker, run_id),
         )
 
     def _create_dispatch(self, c, run_id: str, decision: LeadDecision) -> DispatchView:
@@ -1302,7 +1325,7 @@ class Dispatcher:
             edge = decision.role or "lead"
             tripped, reason = self._thrash_reason(run, edge)
             if tripped:
-                self._synthetic_pause(c, run_id, reason)
+                self._synthetic_wait(c, run_id, reason)
                 fresh = c.execute("SELECT * FROM goal_run WHERE id = ?", (run_id,)).fetchone()
                 return DecisionResult(run=_run_view(fresh), guard_tripped=True, guard_reason=reason)
 

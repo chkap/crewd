@@ -245,7 +245,7 @@ def test_ack_all_or_nothing_on_unknown_id(tmp_path):
 
 
 # ─────────────────────────── thrash / no-progress bounds ───────────────────────────
-def test_edge_repeat_guard_pauses_run(tmp_path):
+def test_edge_repeat_guard_waits_run(tmp_path):
     disp = _open(tmp_path, max_edge_repeats=2, max_consecutive_unproductive=0)
     run = disp.start_or_resume_run("goal:v1")
     # Two worker dispatches allowed; the third identical edge trips the guard.
@@ -255,11 +255,17 @@ def test_edge_repeat_guard_pauses_run(tmp_path):
     res = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
     assert res.guard_tripped is True
     assert res.dispatch is None
-    assert disp.get_run(run.id).status is RunStatus.PAUSED
+    # A thrash guard is internal recovery, not an operator prerequisite: it
+    # settles into a bounded WAIT with an observable wake condition, never a
+    # human PAUSE (#65).
+    got = disp.get_run(run.id)
+    assert got.status is RunStatus.WAITING
+    assert got.human_blocker is None
+    assert got.wake_condition
     assert any(h.reason_returned == "thrash_guard" for h in disp.pending_handoffs(run.id))
 
 
-def test_consecutive_unproductive_guard_pauses_run(tmp_path):
+def test_consecutive_unproductive_guard_waits_run(tmp_path):
     disp = _open(tmp_path, max_consecutive_unproductive=2, max_edge_repeats=0)
     run = disp.start_or_resume_run("goal:v1")
     # Alternate roles so the edge-repeat guard is not what trips.
@@ -268,7 +274,10 @@ def test_consecutive_unproductive_guard_pauses_run(tmp_path):
         _drive(disp, run.id, d.dispatch.id, role, AttemptOutcome.SDK_ERROR)
     res = disp.lead_decide(run.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
     assert res.guard_tripped is True
-    assert disp.get_run(run.id).status is RunStatus.PAUSED
+    got = disp.get_run(run.id)
+    assert got.status is RunStatus.WAITING
+    assert got.human_blocker is None
+    assert got.wake_condition
 
 
 # ─────────────────────────── wait / pause / finish ───────────────────────────
@@ -354,7 +363,7 @@ def test_explicit_resume_reactivates_and_resets_thrash(tmp_path):
     d = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
     _drive(disp, r.id, d.dispatch.id, "worker", AttemptOutcome.SDK_ERROR)
     res = disp.lead_decide(r.id, LeadDecision.dispatch("worker"), configured_roles=ROLES)
-    assert res.guard_tripped and disp.get_run(r.id).status is RunStatus.PAUSED
+    assert res.guard_tripped and disp.get_run(r.id).status is RunStatus.WAITING
     resumed = disp.resume_run(r.id)
     assert resumed.status is RunStatus.ACTIVE
     assert resumed.routing_authority == LEAD_PENDING
@@ -561,7 +570,7 @@ def test_solicitation_unclean_outcome_is_invalid(tmp_path):
     assert disp.get_attempt(sol.attempt_id).terminal_outcome is AttemptOutcome.SDK_ERROR
 
 
-def test_solicitation_invalid_cap_pauses(tmp_path):
+def test_solicitation_invalid_cap_waits(tmp_path):
     disp = _open(tmp_path, max_invalid_solicitations=2)
     run = disp.start_or_resume_run("goal:v1")
     for _ in range(2):
@@ -571,9 +580,13 @@ def test_solicitation_invalid_cap_pauses(tmp_path):
             decision=None, configured_roles=ROLES,
         )
     got = disp.get_run(run.id)
-    assert got.status is RunStatus.PAUSED
+    # Repeated missing/malformed Lead decisions are bounded host-managed recovery,
+    # not an operator prerequisite: the run settles into a recoverable WAIT with an
+    # observable wake condition, never a human PAUSE (#65).
+    assert got.status is RunStatus.WAITING
     assert got.invalid_solicitations == 2
-    assert got.human_blocker
+    assert got.human_blocker is None
+    assert got.wake_condition
 
 
 def test_valid_solicitation_resets_invalid_counter(tmp_path):
@@ -702,8 +715,10 @@ def _lead_handoffs(disp, run_id):
 
 
 def test_solicited_decision_guard_trip_emits_no_lead_handoff(tmp_path):
-    """A thrash guard reached while applying a solicited continue_lead must pause
-    without a synthetic role='lead' handoff for the solicitation attempt."""
+    """A thrash guard reached while applying a solicited routing decision must
+    settle into a bounded WAIT without a synthetic role='lead' handoff for the
+    solicitation attempt. (Exercised via the retained kernel ``continue_lead``
+    compatibility path, which is no longer model-selectable.)"""
     disp = _open(tmp_path, max_edge_repeats=1, max_consecutive_unproductive=0)
     run = disp.start_or_resume_run("goal:v1")
     s1 = disp.open_lead_solicitation(run.id)
@@ -713,7 +728,7 @@ def test_solicited_decision_guard_trip_emits_no_lead_handoff(tmp_path):
     res = disp.resolve_lead_solicitation(s2.attempt_id, outcome=AttemptOutcome.IDLE_COMPLETED,
                                          decision=LeadDecision.continue_lead(), configured_roles=ROLES)
     assert res.guard_tripped
-    assert disp.get_run(run.id).status is RunStatus.PAUSED
+    assert disp.get_run(run.id).status is RunStatus.WAITING
     assert _lead_handoffs(disp, run.id) == []
     assert disp.pending_handoffs(run.id) == []
 

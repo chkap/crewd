@@ -249,8 +249,11 @@ def test_non_lead_roles_carry_dispatch_model_and_handoff_contract(role):
 
 def test_lead_prompt_describes_all_decision_kinds_and_operator_distinction():
     out = render("agents/lead.agent.md.j2", role_name="lead", role_model="m", **_BASE_CTX)
-    for kind in ("dispatch", "continue_lead", "wait", "pause", "finish"):
+    for kind in ("dispatch", "wait", "pause", "finish"):
         assert kind in out
+    # continue_lead was removed from the Lead decision contract (#65): the model
+    # must not be offered a self-loop routing outcome.
+    assert "continue_lead" not in out
     assert "submit_lead_decision" in out
     assert "wake_condition" in out
     assert "human_blocker" in out

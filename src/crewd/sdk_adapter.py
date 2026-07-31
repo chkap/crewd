@@ -363,7 +363,7 @@ def sdk_available() -> bool:
 # ── submit_lead_decision custom tool (official define_tool API) ──
 _LEAD_TOOL_DESCRIPTION = (
     "Submit EXACTLY ONE routing decision for the crew this turn. Call this tool "
-    "once and only once. Fields: kind (one of dispatch, continue_lead, wait, "
+    "once and only once. Fields: kind (one of dispatch, wait, "
     "pause, finish); ack_handoff_ids (the list of pending handoff ids this "
     "decision acknowledges); role (target role, required for kind=dispatch); "
     "task_number (the exact crewd:task issue number this dispatch targets — "
@@ -375,7 +375,12 @@ _LEAD_TOOL_DESCRIPTION = (
     "release for a Lead-assigned verifier-only task that has no Worker PR or "
     "readiness to review); reason (optional rationale); "
     "wake_condition (required for kind=wait); human_blocker (required for "
-    "kind=pause); final_acceptance (required for kind=finish)."
+    "kind=pause — reserve pause for a genuine operator-only prerequisite such as "
+    "a missing credential, authorization, protected-environment approval, or "
+    "product/policy decision, NOT for internal retries); final_acceptance "
+    "(required for kind=finish). If you need more analysis before routing, choose "
+    "wait with an observable wake_condition rather than looping — the host "
+    "re-solicits you under a bounded budget."
 )
 
 
@@ -390,7 +395,7 @@ def _lead_decision_params_model():
 
     class SubmitLeadDecisionParams(BaseModel):
         kind: str = Field(
-            description="one of: dispatch, continue_lead, wait, pause, finish"
+            description="one of: dispatch, wait, pause, finish"
         )
         ack_handoff_ids: List[str] = Field(
             default_factory=list,

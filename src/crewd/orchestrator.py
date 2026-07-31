@@ -1059,8 +1059,10 @@ class Orchestrator:
             f"decision via the `submit_lead_decision` tool. Your decision MUST "
             f"acknowledge exactly these handoff ids: {ids}. Valid kinds: dispatch "
             f"(with a configured role: {list(self.configured_roles)}), "
-            f"continue_lead, wait (with an observable wake_condition), pause (with "
-            f"a human-only human_blocker), finish (with final_acceptance "
+            f"wait (with an observable wake_condition — also use this if you need "
+            f"another turn to plan; the host re-solicits you under a bounded "
+            f"budget), pause (with a human-only human_blocker, reserved for a "
+            f"genuine operator-only prerequisite), finish (with final_acceptance "
             f"evidence)."
         )
 

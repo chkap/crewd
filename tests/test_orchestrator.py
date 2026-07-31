@@ -108,8 +108,11 @@ def test_role_failure_then_lead_pauses(tmp_ws: Workspace):
 
 
 # ── invalid solicitations (no decision) pause after the cap ──
-def test_invalid_solicitations_pause_after_cap(tmp_ws: Workspace):
-    # Every Lead turn returns None (no decision) → invalid; cap pauses the run.
+def test_invalid_solicitations_wait_after_cap(tmp_ws: Workspace):
+    # Every Lead turn returns None (no decision) → invalid. Repeated missing/
+    # malformed Lead decisions are bounded host-managed recovery, not an operator
+    # prerequisite, so the cap settles the run into a recoverable WAIT (never a
+    # human PAUSE) (#65).
     fake = FakeExecutor(lead_script=[None] * 10)
     cfg = CrewConfig.load(tmp_ws.crew_yaml)
     gs = GoalState(version=1, label="goal:v1", cycles=0, goal_md_sha256="x")
@@ -121,9 +124,11 @@ def test_invalid_solicitations_pause_after_cap(tmp_ws: Workspace):
     orch = Orchestrator(tmp_ws, cfg, fake, gs, dispatcher=disp, max_steps=50)
     rc = orch.run(once=False)
     assert rc == 0
-    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
+    assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
     run = disp.get_run(disp.start_or_resume_run("goal:v1").id)
-    assert run.status == RunStatus.PAUSED.value
+    assert run.status == RunStatus.WAITING.value
+    assert run.human_blocker is None
+    assert run.wake_condition
     assert run.invalid_solicitations >= 3
 
 
@@ -213,11 +218,12 @@ def test_restart_reconciles_inflight_attempt(tmp_ws: Workspace):
     disp2.close()
 
 
-# ── thrash guard: repeated identical edge trips a synthetic pause ──
-def test_thrash_guard_pauses(tmp_ws: Workspace):
+# ── thrash guard: repeated identical edge trips a bounded synthetic WAIT ──
+def test_thrash_guard_waits(tmp_ws: Workspace):
     # Lead dispatches worker every time; worker always reports no progress
     # (SDK_ERROR → unproductive). The edge-repeat / unproductive guard must
-    # eventually pause the run rather than dispatch forever.
+    # eventually settle the run into a bounded WAIT (internal recovery, not a
+    # human blocker) rather than dispatch forever or fabricate a PAUSE (#65).
     fake = FakeExecutor(
         lead_script=[dispatch_to("worker")] * 30,
         role_outcome=AttemptOutcome.SDK_ERROR,
@@ -225,8 +231,10 @@ def test_thrash_guard_pauses(tmp_ws: Workspace):
     orch = _orch(tmp_ws, fake, max_steps=100)
     rc = orch.run(once=False)
     assert rc == 0
-    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
-    assert _final_run(tmp_ws).status == RunStatus.PAUSED.value
+    assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
+    run = _final_run(tmp_ws)
+    assert run.status == RunStatus.WAITING.value
+    assert run.human_blocker is None
 
 
 # ── signal interrupt mid-loop exits interrupted ──
@@ -593,10 +601,11 @@ def test_disagreement_and_blocker_round_trip_to_sqlite_and_lead_prompt(tmp_ws: W
     assert "needs a human product decision on the acceptance bar" in prompt
 
 
-def test_repeated_empty_completion_eventually_pauses(tmp_ws: Workspace):
+def test_repeated_empty_completion_eventually_waits(tmp_ws: Workspace):
     # Advisory PR #21: an all-empty `completed` payload must remain unproductive
     # (an uncertain protocol failure) so the no-progress guard still fires —
     # otherwise a role could evade the thrash bound with success-shaped noise.
+    # The guard settles into a bounded WAIT (internal recovery), not a human PAUSE.
     empty_completed = role_handoff("completed")  # no evidence, no state account
     fake = FakeExecutor(
         lead_script=[dispatch_to("worker")] * 30,
@@ -604,8 +613,10 @@ def test_repeated_empty_completion_eventually_pauses(tmp_ws: Workspace):
     )
     orch = _orch(tmp_ws, fake, max_steps=100)
     assert orch.run(once=False) == 0
-    assert tmp_ws.exit_reason_file.read_text().strip() == "human-blocked"
-    assert _final_run(tmp_ws).status == RunStatus.PAUSED.value
+    assert tmp_ws.exit_reason_file.read_text().strip() == "waiting"
+    run = _final_run(tmp_ws)
+    assert run.status == RunStatus.WAITING.value
+    assert run.human_blocker is None
     # Every worker handoff was uncertain, never a productive completion.
     worker_rows = [r for r in _handoff_rows(tmp_ws) if r["role"] == "worker"]
     assert worker_rows
