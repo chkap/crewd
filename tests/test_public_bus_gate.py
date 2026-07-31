@@ -337,3 +337,43 @@ def test_blocked_verifier_dispatch_preserves_pending_handoff(tmp_ws: Workspace):
     run = disp.get_run(run_id)
     assert RunStatus(run.status) is not RunStatus.PAUSED
     assert run.routing_authority == "lead_pending"
+
+
+# ── #65: the exact bound PR flows through the Verifier gate ──
+def _dsp_stub(*, task_number, pr_number=None, intent=None, id="dsp-x"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=id, role="verifier", task_number=task_number,
+        pr_number=pr_number, intent=intent,
+    )
+
+
+def test_verifier_gate_pins_bound_pr_over_ambiguous_links():
+    """A Verifier dispatch carrying a bound PR reviews that exact PR even when
+    several open PRs link the task (the recovered/bound PR is authoritative)."""
+    c = FakeGitHubClient(REPO)
+    c.add_issue(30, "GOAL: x", labels=(GOAL,))
+    c.add_issue(TASK, "task", labels=("crewd:task", GOAL), assignees=("alice",))
+    c.add_pull(31, "impl A", linked_issues=(TASK,))
+    c.add_pull(32, "impl B", linked_issues=(TASK,))
+    _readiness(c, TASK)
+    gate = PublicBusGate(_bus(c))
+    out = gate.evaluate("verifier", _dsp_stub(task_number=TASK, pr_number=32),
+                        task_number=TASK)
+    assert out.route.value == "proceed" and out.refs["pr"] == 32
+
+
+def test_verifier_gate_ambiguous_without_binding_fails_closed():
+    """Without a bound PR, multiple linked PRs are ambiguous and the gate refuses
+    to guess — no arbitrary review target."""
+    c = FakeGitHubClient(REPO)
+    c.add_issue(30, "GOAL: x", labels=(GOAL,))
+    c.add_issue(TASK, "task", labels=("crewd:task", GOAL), assignees=("alice",))
+    c.add_pull(31, "impl A", linked_issues=(TASK,))
+    c.add_pull(32, "impl B", linked_issues=(TASK,))
+    _readiness(c, TASK)
+    gate = PublicBusGate(_bus(c))
+    out = gate.evaluate("verifier", _dsp_stub(task_number=TASK, pr_number=None),
+                        task_number=TASK)
+    assert out.route.value == "reject"

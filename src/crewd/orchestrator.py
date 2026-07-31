@@ -41,8 +41,9 @@ durable and retryable.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 from rich.console import Console
@@ -145,6 +146,7 @@ class Orchestrator:
         inbox: InboxService | None = None,
         bus_gate: object | None = None,
         publisher: object | None = None,
+        evidence_discovery: object | None = None,
     ):
         self.ws = ws
         self.cfg = cfg
@@ -168,6 +170,14 @@ class Orchestrator:
         # reconciles pending intents on run start, and (c) refuses to consume a
         # material handoff whose public artifact is not yet verified.
         self._publisher = publisher
+        # Host-side durable evidence discovery (#65): when a task-bound role tick
+        # reaches a clean idle but its structured handoff is lost (a duplicate or
+        # malformed ``submit_role_handoff`` yields no payload), the host reads the
+        # bound task's real linked branch/PR/check evidence from GitHub so Lead
+        # routes on durable facts — never a fabricated readiness — while the
+        # routing class stays ``uncertain`` (no blind Worker repeat, exact-bound
+        # Verifier review preserved). Default None keeps this inert.
+        self._evidence_discovery = evidence_discovery
         # Gated, test-only seam (default None → fully inert in production). When a
         # live-smoke policy is injected it may append a bounded instruction suffix
         # to the *production-rendered* role/Lead prompts and observe (not replace)
@@ -488,6 +498,13 @@ class Orchestrator:
         terminal = resolve_role_terminal(
             result, outcome.handoff, outcome.handoff_submissions
         )
+        # Host-side durable evidence discovery (#65): a clean-idle turn whose
+        # structured handoff was lost (duplicate/malformed submission → uncertain)
+        # may still have produced real branch/PR/check work. Recover that evidence
+        # from the exact bound task's GitHub record and bind the discovered PR, so
+        # Lead routes on durable facts and a later Verifier reviews the exact PR —
+        # never fabricating a completion (the class stays uncertain).
+        terminal = self._recover_lost_handoff_evidence(dsp, result, terminal)
         handoff_id = self.disp.record_terminal(
             attempt_id,
             result.outcome,
@@ -577,6 +594,62 @@ class Orchestrator:
                 "reconcile; see status/doctor[/]"
             )
 
+    def _recover_lost_handoff_evidence(self, dsp: object, result: object, terminal: object):
+        """Enrich an ``uncertain`` clean-idle terminal with host-recovered durable
+        GitHub evidence for the exact bound task (#65).
+
+        Only fires when every condition of the live #64 failure chain holds:
+
+        * durable evidence discovery is wired (production or an injected seam);
+        * the transport reached a **clean idle** (``idle_completed``) — the role
+          ran to completion and may have done real external work, as opposed to an
+          SDK abort/timeout/cancel where no such assumption is safe;
+        * the terminal is ``uncertain`` — its structured ``submit_role_handoff``
+          was lost (a duplicate/malformed submission returns no payload), so the
+          role's own evidence is unavailable;
+        * the dispatch is **task-bound** (carries the exact routed ``crewd:task``).
+
+        It reads the bound task's linked branch/PR/check state from GitHub, binds
+        the discovered PR to the dispatch (idempotently, preserving exact task/PR
+        binding so a later Verifier reviews that exact PR), and appends the durable
+        facts to the terminal's evidence. It NEVER changes the routing class: a
+        botched handoff can never fabricate a completion — Lead still sees an
+        uncertain terminal and routes on real evidence instead of blindly repeating
+        Worker. Any discovery error leaves the un-enriched terminal untouched.
+        """
+        disc = self._evidence_discovery
+        if disc is None:
+            return terminal
+        if getattr(result, "outcome", None) is None or result.outcome.value != "idle_completed":
+            return terminal
+        oc = getattr(terminal, "outcome_class", "")
+        oc = getattr(oc, "value", oc)
+        if oc != "uncertain":
+            return terminal
+        task_number = getattr(dsp, "task_number", None)
+        if not task_number:
+            return terminal
+        pr_number = getattr(dsp, "pr_number", None)
+        try:
+            rec = disc.discover(task_number=int(task_number), pr_number=pr_number)
+        except Exception as exc:  # a discovery bug must not fake or drop a terminal
+            console.print(f"[yellow]evidence discovery error (task #{task_number}): {exc}[/]")
+            return terminal
+        if rec is None or not getattr(rec, "found", False):
+            return terminal
+        # Bind the recovered PR to the exact dispatch (idempotent) so the terminal
+        # publishes against — and a later Verifier reviews — that exact PR.
+        if getattr(rec, "pr_number", None) is not None:
+            try:
+                self.disp.bind_pr_to_dispatch(dsp.id, int(rec.pr_number))
+            except Exception as exc:
+                console.print(f"[yellow]could not bind recovered PR #{rec.pr_number}: {exc}[/]")
+        note = f"[host-recovered durable evidence] {rec.render()}"
+        evidence = terminal.evidence + ("\n" if terminal.evidence else "") + note
+        reason = terminal.reason_returned + " | host-recovered durable evidence"
+        console.print(f"[cyan]recovered lost-handoff evidence: {rec.render()}[/]")
+        return replace(terminal, evidence=evidence, reason_returned=reason)
+
     def _publish_role_handoff(self, handoff_id: str, role: str, terminal: object):
         """Publish a role's material handoff as a verified GitHub artifact.
 
@@ -637,6 +710,26 @@ class Orchestrator:
             return True
         intent = getattr(dsp, "intent", None)
         task_number = getattr(dsp, "task_number", None)
+        # A later Verifier dispatch for a task inherits the exact PR already bound
+        # to any prior dispatch for that task (resolved at Worker routing, or
+        # host-recovered from the #64 lost-handoff chain), so it reviews that exact
+        # PR rather than re-guessing among linked PRs (#47/#65). Idempotent and
+        # best-effort: a lookup/bind failure leaves the un-pinned public-record
+        # gate, which now fails closed on ambiguity anyway.
+        if (
+            role == "verifier"
+            and self._is_implementation_intent(intent)
+            and task_number is not None
+            and getattr(dsp, "pr_number", None) is None
+        ):
+            try:
+                inherited = self.disp.pr_bound_to_task(int(task_number))
+                if inherited is not None:
+                    dsp = self.disp.bind_pr_to_dispatch(dsp.id, inherited)
+            except Exception as exc:
+                console.print(
+                    f"[yellow]could not inherit bound PR for task #{task_number}: {exc}[/]"
+                )
         try:
             outcome = gate.evaluate(
                 role, dsp, task_number=task_number, intent=intent
@@ -818,8 +911,21 @@ class Orchestrator:
         gate = self._bus_gate
         if gate is None:
             return None
+        # Carry the exact PR durably bound to this task (resolved at Worker routing
+        # or host-recovered from the #64 lost-handoff chain) into the pre-application
+        # gate so a Verifier dispatch reviews that exact PR and is not falsely
+        # blocked as ambiguous when several PRs link the task (#47/#65). The gate
+        # reads ``pr_number``/``intent`` off this candidate.
+        candidate = None
+        if role == "verifier" and task_number is not None:
+            try:
+                inherited = self.disp.pr_bound_to_task(int(task_number))
+            except Exception:
+                inherited = None
+            if inherited is not None:
+                candidate = SimpleNamespace(pr_number=inherited, intent=intent)
         try:
-            outcome = gate.evaluate(role, None, task_number=task_number, intent=intent)
+            outcome = gate.evaluate(role, candidate, task_number=task_number, intent=intent)
         except Exception as exc:  # boundary bug must not fake success
             return GateBlock(Route.PAUSE, f"public-bus gate error: {exc}")
         return self._classify_gate_block(role, intent, task_number, outcome)
@@ -1059,8 +1165,10 @@ class Orchestrator:
             f"decision via the `submit_lead_decision` tool. Your decision MUST "
             f"acknowledge exactly these handoff ids: {ids}. Valid kinds: dispatch "
             f"(with a configured role: {list(self.configured_roles)}), "
-            f"continue_lead, wait (with an observable wake_condition), pause (with "
-            f"a human-only human_blocker), finish (with final_acceptance "
+            f"wait (with an observable wake_condition — also use this if you need "
+            f"another turn to plan; the host re-solicits you under a bounded "
+            f"budget), pause (with a human-only human_blocker, reserved for a "
+            f"genuine operator-only prerequisite), finish (with final_acceptance "
             f"evidence)."
         )
 

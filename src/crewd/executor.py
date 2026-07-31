@@ -623,7 +623,19 @@ def parse_lead_decision(payload) -> LeadDecision:
             task_number=task_number, intent=_coerce_intent(payload.get("intent")),
         )
     if kind is DecisionKind.CONTINUE_LEAD:
-        return LeadDecision.continue_lead(ack=ack, reason=payload.get("reason"))
+        # Model-selected ``continue_lead`` was removed from the Lead decision
+        # contract (#65): a Lead turn may no longer ask the model to "keep going"
+        # as a routing outcome. Rejecting it here yields ``None`` in the executor's
+        # capture reader, which routes into bounded host-managed no-decision
+        # recovery (the run re-solicits Lead under the invalid-solicitation budget,
+        # settling into a recoverable WAIT if it cannot make progress) rather than
+        # an unbounded model-driven self-loop. The kernel kind is retained only for
+        # historical journal compatibility, never emitted by a live Lead turn.
+        raise ValueError(
+            "continue_lead was removed from the Lead decision contract; a Lead turn "
+            "must dispatch, wait, pause, or finish — needing another turn is handled "
+            "by host-managed re-solicitation"
+        )
     if kind is DecisionKind.WAIT:
         return LeadDecision.wait(payload["wake_condition"], ack=ack, reason=payload.get("reason"))
     if kind is DecisionKind.PAUSE:

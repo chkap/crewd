@@ -125,6 +125,9 @@ class DiagnosticSnapshot:
     routing_authority: Optional[str] = None          # 'lead_pending' or a dispatch id
     authority_holder: Optional[str] = None           # 'lead' | 'role' | None
     consecutive_unproductive: int = 0
+    consecutive_transport: int = 0
+    consecutive_uncertain: int = 0
+    consecutive_no_progress: int = 0
     invalid_solicitations: int = 0
     wake_condition: Optional[str] = None
     human_blocker: Optional[str] = None
@@ -165,6 +168,9 @@ class DiagnosticSnapshot:
                 "routing_authority": self.routing_authority,
                 "authority_holder": self.authority_holder,
                 "consecutive_unproductive": self.consecutive_unproductive,
+                "consecutive_transport": self.consecutive_transport,
+                "consecutive_uncertain": self.consecutive_uncertain,
+                "consecutive_no_progress": self.consecutive_no_progress,
                 "invalid_solicitations": self.invalid_solicitations,
                 "wake_condition": self.wake_condition,
                 "human_blocker": self.human_blocker,
@@ -480,6 +486,9 @@ def build_snapshot(ws: Workspace, *, crew_name: str, backend: str,
         routing_authority=run.routing_authority,
         authority_holder=("lead" if run.routing_authority == LEAD_PENDING else "role"),
         consecutive_unproductive=run.consecutive_unproductive,
+        consecutive_transport=run.consecutive_transport,
+        consecutive_uncertain=run.consecutive_uncertain,
+        consecutive_no_progress=run.consecutive_no_progress,
         invalid_solicitations=run.invalid_solicitations,
         wake_condition=run.wake_condition,
         human_blocker=run.human_blocker,

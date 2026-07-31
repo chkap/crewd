@@ -737,6 +737,25 @@ def _build_publisher(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
     return PublicWriter(bus, IntentStore.for_workspace(ws))
 
 
+def _build_evidence_discovery(cfg: CrewConfig):
+    """Construct the default-on host-side durable evidence discovery for a run.
+
+    Wires ``CliGitHubClient`` → :class:`~crewd.github_bus.EvidenceDiscovery` so a
+    plain ``crewd run`` can recover a task-bound role's real branch/PR/check
+    evidence directly from GitHub when its structured handoff is lost to a
+    duplicate/malformed submission (#65). Inert under the same guard as the gate:
+    no remote, or ``CREWD_DISABLE_PUBLIC_BUS`` set.
+    """
+    if os.environ.get("CREWD_DISABLE_PUBLIC_BUS"):
+        return None
+    client = _make_github_client(cfg)
+    if client is None:
+        return None
+    from .github_bus import EvidenceDiscovery
+
+    return EvidenceDiscovery(client)
+
+
 def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
     from .orchestrator import Orchestrator
 
@@ -752,9 +771,11 @@ def _build_orchestrator(ws: Workspace, cfg: CrewConfig, goal_state: GoalState):
         prompt_policy = SmokePromptPolicy.from_env()
     bus_gate = _build_bus_gate(cfg, goal_state)
     publisher = _build_publisher(ws, cfg, goal_state)
+    evidence_discovery = _build_evidence_discovery(cfg)
     return Orchestrator(
         ws, cfg, executor, goal_state, prompt_policy=prompt_policy,
         bus_gate=bus_gate, publisher=publisher,
+        evidence_discovery=evidence_discovery,
     )
 
 
