@@ -97,7 +97,15 @@ class GateBlock:
     reconcilable terminal publish — from a genuine *human* blocker —
     ``Route.PAUSE``: a real credential / permission / policy denial. A
     ``Route.REJECT`` is an invalid *public record* (wrong repo/goal, malformed
-    attribution) that will not fix itself on retry, so it also needs an operator.
+    attribution) that will not fix itself on retry.
+
+    When a ``Route.REJECT`` is a Lead-*correctable* inconsistency (#64) the block
+    carries a typed ``correction`` (a serialized :class:`~crewd.github_bus.
+    GateCorrection`): the orchestrator returns it to Lead — keeping the same task
+    binding and pending handoffs, reserving no attempt — instead of pausing, so a
+    correctable public-record gap is never mislabeled as a human blocker. Only a
+    genuine operator prerequisite (permission, wrong-repo config) or the bounded
+    escalation still pauses.
 
     The orchestrator marks the run ``WAITING`` for a recoverable block — a later
     ``crewd run`` reconciles the durable intent and continues *without* operator
@@ -107,6 +115,7 @@ class GateBlock:
 
     route: Route
     detail: str
+    correction: Optional[str] = None
 
 
 # A gate block's route → the durable run status it drives. Recoverable routes
@@ -339,7 +348,7 @@ class Orchestrator:
             return  # run marked exhausted; the loop exits on the next iteration
         pending = self.disp.pending_handoffs(run_id)
         self._cycle += 1
-        prompt = self._deliver_inbox("lead", sol.attempt_id, self._lead_prompt(pending))
+        prompt = self._deliver_inbox("lead", sol.attempt_id, self._lead_prompt(pending, run_id))
         req = self._request("lead", prompt)
         console.print(f"  [magenta]lead[/] ({self.cfg.roles.get('lead', _NoModel()).model}) solicitation → {req.log_path}")
         # Journal the Lead session identity durably BEFORE any SDK send, via the
@@ -375,33 +384,65 @@ class Orchestrator:
         # authority epoch, so a retry never double-posts).
         if gate_blocker is None:
             gate_blocker = self._lead_decision_publish_block(decision, run_id, pending)
-        if gate_blocker is not None:
+        # A Lead-correctable gate rejection (#64) is routed back to Lead as a
+        # typed correction rather than pausing: the same pending handoffs stay
+        # intact, no attempt is reserved, and the dispatcher records the
+        # correction (bounded — after the correction streak cap the run settles
+        # into a recoverable WAITING state, never a human PAUSE). Every other
+        # block keeps its existing recovery disposition (WAIT self-heals;
+        # PAUSE/permission halts).
+        #
+        # For a non-correctable block the candidate decision is dropped here so it
+        # can never be applied. For a correctable block the REAL candidate is
+        # passed through so the dispatcher can prove the solicitation clean and
+        # valid for the current authority window BEFORE recording any correction:
+        # a failed/malformed/stale solicitation combined with a correctable public
+        # rejection takes the invalid/stale path in the dispatcher and is never
+        # downgraded to a benign correction.
+        correctable = gate_blocker is not None and gate_blocker.correction is not None
+        if gate_blocker is not None and not correctable:
             decision = None
         result = self.disp.resolve_lead_solicitation(
             sol.attempt_id,
             outcome=turn.result.outcome,
             decision=decision,
             configured_roles=self.configured_roles,
+            gate_correction=(gate_blocker.correction if correctable else None),
         )
-        # Only archive the delivered operator inbox once the solicitation was
-        # accepted as a valid terminal step. An invalid Lead decision returns
-        # authority to Lead for a retry (dispatcher.resolve_lead_solicitation with
-        # solicitation_invalid=True), so the message must NOT be archived here —
-        # leaving the attempt's staging file in place lets the next Lead
-        # solicitation's deliver() re-absorb it, retaining the OVERRIDE across the
-        # retry (GOAL.md inbox retry invariant, issue #29).
-        if not result.solicitation_invalid:
+        # Only archive the delivered operator inbox once the solicitation reached a
+        # productive terminal step. An invalid Lead decision OR a correctable gate
+        # rejection returns authority to Lead for another turn, so the message must
+        # NOT be archived here — leaving the attempt's staging file in place lets
+        # the next Lead solicitation's deliver() re-absorb it, retaining the
+        # OVERRIDE across the retry (GOAL.md inbox retry invariant, issue #29).
+        if not result.solicitation_invalid and not result.gate_corrected:
             self._inbox.acknowledge("lead", sol.attempt_id)
         if self._prompt_policy is not None:
             self._prompt_policy.record_lead_decision(turn.decision)
-        if gate_blocker is not None:
-            # The transition was refused: authority stayed with Lead (decision was
-            # not applied, so no handoff was acked and the run was not
-            # terminalised/dispatched). Halt with a route-classified public-bus
-            # blocker: a recoverable ordering/outage condition WAITS and self-heals
-            # on the next run's reconcile; only a real human blocker PAUSES (#49).
-            self._apply_gate_block(
-                run_id, gate_blocker, "public-bus gate blocked Lead decision"
+        if gate_blocker is not None and not result.gate_corrected:
+            # The transition was refused and NOT recorded as a correction (either a
+            # non-correctable block, or a correctable rejection whose solicitation
+            # was itself invalid/stale and so took the invalid path). Authority
+            # stayed with Lead (decision was not applied, so no handoff was acked
+            # and the run was not terminalised/dispatched). For a real gate block,
+            # halt with a route-classified public-bus blocker: a recoverable
+            # ordering/outage condition WAITS and self-heals on the next run's
+            # reconcile; only a real human blocker PAUSES (#49). For an invalid
+            # solicitation the dispatcher already returned authority to Lead, so
+            # only apply the gate block when the transition was actually refused by
+            # the gate (not merely an invalid Lead turn).
+            if not correctable:
+                self._apply_gate_block(
+                    run_id, gate_blocker, "public-bus gate blocked Lead decision"
+                )
+        elif result.gate_corrected:
+            # Authority stayed with Lead; the correction is durably recorded and
+            # surfaced in the next Lead solicitation. If the dispatcher reached the
+            # correction-streak cap the run is already WAITING (bounded, recoverable
+            # — not a human PAUSE).
+            console.print(
+                f"[yellow]public-bus returned a correctable gate rejection to Lead: "
+                f"{gate_blocker.detail}[/]"
             )
         self._persist_cycle()
 
@@ -594,27 +635,27 @@ class Orchestrator:
         gate = self._bus_gate
         if gate is None:
             return True
+        intent = getattr(dsp, "intent", None)
+        task_number = getattr(dsp, "task_number", None)
         try:
             outcome = gate.evaluate(
-                role, dsp, task_number=getattr(dsp, "task_number", None)
+                role, dsp, task_number=task_number, intent=intent
             )
         except Exception as exc:
             outcome = None
             block = GateBlock(Route.WAIT, f"public-bus gate error: {exc}")
         else:
-            block = (
-                None if outcome is None or outcome.route is Route.PROCEED
-                else GateBlock(
-                    outcome.route,
-                    f"public-bus {outcome.route.value}: {outcome.detail}",
-                )
-            )
+            block = self._classify_gate_block(role, intent, task_number, outcome)
         if block is not None:
             self._apply_gate_block(
                 run_id, block, f"public-bus gate blocked {role} dispatch"
             )
             return False
-        if role == "verifier":
+        # An implementation-review Verifier dispatch must resolve (and durably
+        # bind) the exact linked PR. A Lead-assigned verifier-only intent
+        # (audit/acceptance/release/advisory) has no Worker PR to review, so the
+        # PR-binding requirement does not apply (#64/#61).
+        if role == "verifier" and self._is_implementation_intent(intent):
             pr_number = (outcome.refs or {}).get("pr") if outcome is not None else None
             if not pr_number:
                 self._apply_gate_block(
@@ -633,6 +674,17 @@ class Orchestrator:
                 )
                 return False
         return True
+
+    @staticmethod
+    def _is_implementation_intent(intent) -> bool:
+        """Whether a dispatch intent is a normal implementation review.
+
+        Missing/legacy/unknown → True (the conservative default that keeps the
+        linked-PR + Worker-readiness safeguards)."""
+        if intent is None:
+            return True
+        val = str(getattr(intent, "value", intent)).strip().lower()
+        return val not in ("verifier_audit", "acceptance", "release", "advisory")
 
     def _decision_gate_block(self, decision: object, pending: list | None = None) -> Optional["GateBlock"]:
         """Return a public-bus :class:`GateBlock` for a Lead decision that would
@@ -662,6 +714,7 @@ class Orchestrator:
             return self._dispatch_gate_block(
                 getattr(decision, "role", None) or "",
                 getattr(decision, "task_number", None),
+                getattr(decision, "intent", None),
             )
         if kind is DecisionKind.FINISH:
             return self._finish_gate_block()
@@ -719,8 +772,38 @@ class Orchestrator:
             )
         return None
 
+    def _classify_gate_block(
+        self, role: str, intent, task_number, outcome
+    ) -> Optional["GateBlock"]:
+        """Turn a non-PROCEED gate outcome into a :class:`GateBlock` (#64).
+
+        A Lead-correctable ``Route.REJECT`` is enriched with a typed
+        :class:`~crewd.github_bus.GateCorrection` and returned to Lead instead of
+        pausing; every other route keeps its existing recovery disposition.
+        """
+        if outcome is None or outcome.route is Route.PROCEED:
+            return None
+        gate = self._bus_gate
+        reason = getattr(outcome, "reason", None)
+        if (
+            outcome.route is Route.REJECT
+            and reason is not None
+            and getattr(reason, "lead_correctable", False)
+            and gate is not None
+            and hasattr(gate, "build_correction")
+        ):
+            correction = gate.build_correction(
+                role, intent, outcome, task_number=task_number
+            )
+            return GateBlock(
+                Route.REJECT,
+                f"public-bus correction: {correction.summary()}",
+                correction=correction.to_json(),
+            )
+        return GateBlock(outcome.route, f"public-bus {outcome.route.value}: {outcome.detail}")
+
     def _dispatch_gate_block(
-        self, role: str, task_number: Optional[int] = None
+        self, role: str, task_number: Optional[int] = None, intent=None,
     ) -> Optional["GateBlock"]:
         """Consult the public-bus gate for a Worker/Verifier dispatch (if any).
 
@@ -736,12 +819,10 @@ class Orchestrator:
         if gate is None:
             return None
         try:
-            outcome = gate.evaluate(role, None, task_number=task_number)
+            outcome = gate.evaluate(role, None, task_number=task_number, intent=intent)
         except Exception as exc:  # boundary bug must not fake success
             return GateBlock(Route.PAUSE, f"public-bus gate error: {exc}")
-        if outcome is None or outcome.route is Route.PROCEED:
-            return None
-        return GateBlock(outcome.route, f"public-bus {outcome.route.value}: {outcome.detail}")
+        return self._classify_gate_block(role, intent, task_number, outcome)
 
     def _finish_gate_block(self) -> Optional["GateBlock"]:
         """Consult the public-bus gate for a Lead ``finish`` (if any).
@@ -929,8 +1010,19 @@ class Orchestrator:
             return self._prompt_policy.decorate_role(role, prompt)
         return prompt
 
-    def _lead_prompt(self, pending: list[HandoffView]) -> str:
+    def _lead_prompt(self, pending: list[HandoffView], run_id: str | None = None) -> str:
         prompt = self._lead_prompt_production(pending)
+        # Surface the latest typed gate correction (#64) so Lead can repair the
+        # public record or reroute with precise evidence rather than re-guessing.
+        if run_id is not None:
+            correction = self.disp.latest_gate_correction(run_id)
+            if correction:
+                prompt = (
+                    f"{prompt}\n\nPUBLIC-BUS GATE CORRECTION (a prior routing "
+                    f"decision was refused by the gate; the same task binding and "
+                    f"pending handoffs are preserved and no attempt was reserved — "
+                    f"repair the public record or reroute):\n{correction}"
+                )
         if self._prompt_policy is not None:
             return self._prompt_policy.decorate_lead(pending, prompt)
         return prompt

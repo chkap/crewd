@@ -227,23 +227,26 @@ def test_resolver_gate_blocks_worker_when_no_active_task(tmp_ws: Workspace):
     assert RunStatus(run.status) is RunStatus.PAUSED
 
 
-def test_resolver_gate_blocks_worker_when_multiple_active_tasks(tmp_ws: Workspace):
+def test_resolver_gate_correction_on_multiple_active_tasks(tmp_ws: Workspace):
     c = FakeGitHubClient(REPO)
     c.add_issue(30, "GOAL: x", labels=(GOAL,))
     c.add_issue(29, "task a", labels=("crewd:task", GOAL))
     c.add_issue(28, "task b", labels=("crewd:task", GOAL))
     _assign(c, 29)
-    _assign(c, 28)  # two actively-assigned tasks → ambiguous → block
+    _assign(c, 28)  # two actively-assigned tasks → ambiguous → correctable
     gate = PublicBusGate(_bus(c))
 
-    fake = FakeExecutor(lead_script=[dispatch_to("worker"), finish("done")])
+    fake = FakeExecutor(lead_script=[dispatch_to("worker"), wait("external")])
     orch, disp = _orch(tmp_ws, fake, gate)
-    orch.run(once=False)
+    orch.run(once=True)  # a single Lead step: the refused dispatch → correction
 
+    # No attempt reserved; the ambiguous census is a Lead-correctable rejection
+    # returned as a typed correction rather than a human pause (#64).
     assert fake.role_calls == []
     run = disp.start_or_resume_run(GOAL)
-    assert RunStatus(run.status) is RunStatus.PAUSED
-    assert "multiple" in (run.human_blocker or "").lower()
+    assert RunStatus(run.status) is RunStatus.ACTIVE
+    assert run.routing_authority == "lead_pending"
+    assert "multiple" in (run.gate_correction or "").lower()
 
 
 def test_resolver_gate_allows_verifier_with_pr_and_readiness(tmp_ws: Workspace):
@@ -287,9 +290,11 @@ def _seed_pending_worker_handoff(disp) -> tuple[str, str]:
 
 
 def test_blocked_worker_dispatch_preserves_pending_handoff(tmp_ws: Workspace):
-    """Regression (Verifier PR #32): a Worker dispatch blocked by the public-bus
+    """Regression (Verifier PR #32): a Worker dispatch refused by the public-bus
     gate must not ack the handoff its decision acknowledges, nor reserve an
-    attempt. The handoff stays pending for Lead's retry."""
+    attempt. The handoff stays pending for Lead's retry. Under #64 the missing
+    assignment is Lead-correctable, so authority returns to Lead with a typed
+    correction (run stays active) rather than a human pause."""
     c = FakeGitHubClient(REPO)
     c.add_issue(30, "GOAL: x", labels=(GOAL,))  # umbrella only; no assigned task
     gate = PublicBusGate(_bus(c))
@@ -299,23 +304,25 @@ def test_blocked_worker_dispatch_preserves_pending_handoff(tmp_ws: Workspace):
     run_id, hid = _seed_pending_worker_handoff(disp)
 
     # Lead dispatches Worker again, acking the pending handoff, but the record has
-    # no assigned task → the gate blocks BEFORE the decision is applied.
+    # no assigned task → the gate refuses BEFORE the decision is applied.
     fake._lead_script = [dispatch_to("worker")]
     orch._lead_step(run_id)
 
     assert [h.id for h in disp.pending_handoffs(run_id)] == [hid]  # not consumed
     assert fake.role_calls == []                                   # no attempt reserved
-    assert RunStatus(disp.get_run(run_id).status) is RunStatus.PAUSED
-    assert "public-bus" in (disp.get_run(run_id).human_blocker or "")
+    run = disp.get_run(run_id)
+    assert RunStatus(run.status) is not RunStatus.PAUSED           # correctable → returned to Lead
+    assert run.routing_authority == "lead_pending"
+    assert "no_assignment" in (run.gate_correction or "")
 
 
 def test_blocked_verifier_dispatch_preserves_pending_handoff(tmp_ws: Workspace):
-    """Same atomicity guarantee for a Verifier dispatch blocked by a missing
-    linked PR / readiness record."""
+    """Same non-mutation guarantee for a Verifier dispatch refused by a missing
+    linked PR / readiness record — returned to Lead as a correction (#64)."""
     c = FakeGitHubClient(REPO)
     c.add_issue(30, "GOAL: x", labels=(GOAL,))
     c.add_issue(TASK, "task", labels=("crewd:task", GOAL))
-    _assign(c, TASK)  # worker prereqs ok, but no PR / readiness → verifier blocked
+    _assign(c, TASK)  # worker prereqs ok, but no PR / readiness → verifier refused
     gate = PublicBusGate(_bus(c))
 
     fake = FakeExecutor(lead_script=[])
@@ -327,4 +334,6 @@ def test_blocked_verifier_dispatch_preserves_pending_handoff(tmp_ws: Workspace):
 
     assert [h.id for h in disp.pending_handoffs(run_id)] == [hid]
     assert fake.role_calls == []
-    assert RunStatus(disp.get_run(run_id).status) is RunStatus.PAUSED
+    run = disp.get_run(run_id)
+    assert RunStatus(run.status) is not RunStatus.PAUSED
+    assert run.routing_authority == "lead_pending"
