@@ -119,6 +119,15 @@ class PullRef:
     body: str = ""
     url: str = ""
     linked_issues: tuple[int, ...] = ()
+    # Durable head-of-branch evidence (#65): the source branch, the mergeability
+    # signal, and a summarised check-rollup state. These let the host recover a
+    # role's real branch/PR/check evidence directly from GitHub when the role's
+    # own structured handoff was lost (a duplicate/malformed ``submit_role_handoff``
+    # returns no payload), so Lead routes on durable facts rather than a fabricated
+    # readiness. Empty string means "not reported by this read".
+    head_ref: str = ""               # source branch name (gh ``headRefName``)
+    mergeable: str = ""              # gh ``mergeable``: MERGEABLE/CONFLICTING/UNKNOWN
+    checks: str = ""                 # summarised rollup: passing/failing/pending/none
 
 
 @dataclass(frozen=True)
@@ -170,7 +179,145 @@ class GitHubClient(Protocol):
     def create_comment(self, *, target: str, number: int, body: str) -> CommentRef: ...
 
 
-# ── prerequisite validation results ─────────────────────────────────────
+# ── host-side durable evidence discovery (#65) ──────────────────────────
+#
+# When a dispatched role reaches a clean idle but its structured
+# ``submit_role_handoff`` is lost — a duplicate or malformed submission makes the
+# exactly-one capture return *no payload* — the role may still have produced real
+# durable work on GitHub (a pushed branch, an opened/mergeable PR, green checks).
+# The host recovers that evidence directly from the exact bound task's linked PR
+# so Lead routes on durable facts instead of a fabricated readiness, preserving
+# the exact task/PR binding and enabling an exact-bound Verifier review — without
+# blindly repeating Worker. Discovery NEVER upgrades the routing class; it only
+# enriches evidence.
+def summarize_check_rollup(rollup: object) -> str:
+    """Summarise a ``gh`` ``statusCheckRollup`` list into a stable state token.
+
+    ``passing`` when every contexts's conclusion/state is a success, ``failing``
+    when any is a failure/error/cancelled, ``pending`` when some are still
+    running with none failing, ``none`` when there are no checks, and ``unknown``
+    when the shape is unrecognised. Kept deterministic and defensive so a shape
+    change in the CLI degrades to ``unknown`` rather than raising.
+    """
+    if rollup is None:
+        return "unknown"
+    if not isinstance(rollup, (list, tuple)):
+        return "unknown"
+    if len(rollup) == 0:
+        return "none"
+    ok = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+    bad = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+    saw_pending = False
+    for c in rollup:
+        if not isinstance(c, dict):
+            return "unknown"
+        # A check run carries ``conclusion`` (+ ``status``); a legacy commit
+        # status carries ``state``. Only an explicit success conclusion/state
+        # passes — a bare ``COMPLETED`` status with no conclusion is treated as
+        # not-yet-green (pending) rather than optimistically passing.
+        raw = c.get("conclusion") or c.get("state") or ""
+        token = str(raw).upper()
+        if token in bad:
+            return "failing"
+        if token in ok:
+            continue
+        saw_pending = True
+    return "pending" if saw_pending else "passing"
+
+
+@dataclass(frozen=True)
+class RecoveredEvidence:
+    """Durable branch/PR/check evidence the host recovered for a bound task.
+
+    ``found`` is True when a linked PR (or at least a branch) was discovered. All
+    fields are read from GitHub, never from the role's lost handoff payload, so a
+    completion can never be fabricated from a botched handoff.
+    """
+
+    task_number: int
+    pr_number: Optional[int] = None
+    pr_state: Optional[str] = None
+    branch: Optional[str] = None
+    mergeable: Optional[str] = None
+    checks: Optional[str] = None
+    pr_url: str = ""
+
+    @property
+    def found(self) -> bool:
+        return self.pr_number is not None or bool(self.branch)
+
+    def render(self) -> str:
+        if not self.found:
+            return f"no linked PR/branch found for task #{self.task_number}"
+        parts = [f"task #{self.task_number}"]
+        if self.pr_number is not None:
+            pr = f"PR #{self.pr_number}"
+            if self.pr_state:
+                pr += f" ({self.pr_state})"
+            parts.append(pr)
+        if self.branch:
+            parts.append(f"branch {self.branch}")
+        if self.mergeable:
+            parts.append(f"mergeable={self.mergeable}")
+        if self.checks:
+            parts.append(f"checks={self.checks}")
+        if self.pr_url:
+            parts.append(self.pr_url)
+        return "; ".join(parts)
+
+
+class EvidenceDiscovery:
+    """Recovers a bound task's durable branch/PR/check evidence from GitHub.
+
+    Pure read-side and side-effect free: it resolves the PR that links the exact
+    routed ``crewd:task`` (optionally constrained to a specific ``pr_number`` when
+    one was already bound), then reads its full head/mergeable/check state. A
+    transient GitHub failure yields ``None`` (the caller keeps the un-enriched
+    uncertain terminal); a clean absence yields a ``RecoveredEvidence`` with
+    ``found == False`` (no fabricated evidence).
+    """
+
+    def __init__(self, client: GitHubClient):
+        self.client = client
+
+    def discover(
+        self, *, task_number: int, pr_number: Optional[int] = None
+    ) -> Optional[RecoveredEvidence]:
+        try:
+            pulls = self.client.list_pulls(state="all")
+        except GitHubError:
+            return None
+        linked = [p for p in pulls if task_number in p.linked_issues]
+        if pr_number is not None:
+            # A previously bound PR is authoritative: only accept that exact PR so
+            # an unrelated PR that also mentions the issue can never divert binding.
+            linked = [p for p in linked if p.number == pr_number]
+        if not linked:
+            return RecoveredEvidence(task_number=task_number)
+        if pr_number is None and len({p.number for p in linked}) > 1:
+            # Ambiguous: several PRs mention the task and none is authoritatively
+            # bound. Fail closed rather than guess a binding — the caller keeps the
+            # un-enriched uncertain terminal (safe; never fabricates or mis-binds).
+            return RecoveredEvidence(task_number=task_number)
+        pr = linked[0]
+        # Re-read the chosen PR for full head/mergeable/check detail (list views
+        # may omit it); tolerate a transient failure by falling back to the list
+        # record we already have rather than discarding the discovery.
+        full = None
+        try:
+            full = self.client.get_pull(pr.number)
+        except GitHubError:
+            full = None
+        p = full or pr
+        return RecoveredEvidence(
+            task_number=task_number,
+            pr_number=p.number,
+            pr_state=p.state,
+            branch=p.head_ref or None,
+            mergeable=p.mergeable or None,
+            checks=p.checks or None,
+            pr_url=p.url,
+        )
 class RejectReason(str, enum.Enum):
     MISSING = "missing"
     MULTIPLE = "multiple"
@@ -534,9 +681,21 @@ class PublicBus:
         )
 
     # -- verifier dispatch --
-    def verify_verifier_dispatch(self, task_number: int) -> PrereqOutcome:
+    def verify_verifier_dispatch(
+        self, task_number: int, *, pr_number: Optional[int] = None
+    ) -> PrereqOutcome:
         """Linked PR (or acceptance issue) plus an attributed Worker readiness
-        record before Verifier routing."""
+        record before Verifier routing.
+
+        ``pr_number`` pins the exact PR the Verifier must review — the durable
+        binding established when the Worker dispatch resolved (or the host
+        recovered) it (#47/#65). When pinned, only that exact linked-and-open PR
+        is accepted so an unrelated PR that merely mentions the task can never
+        divert the review; a pinned PR that is not an open linked PR fails closed
+        (``MISSING``). When *not* pinned and several distinct PRs link the task,
+        the selection is ambiguous and fails closed (``MULTIPLE``) rather than
+        arbitrarily reviewing the first one.
+        """
         worker = self.verify_worker_dispatch(task_number)
         if not worker.ok:
             return worker
@@ -550,6 +709,24 @@ class PublicBus:
                 RejectReason.MISSING,
                 f"no open PR linked to task #{task_number}",
             )
+        if pr_number is not None:
+            exact = [p for p in linked if p.number == pr_number]
+            if not exact:
+                return PrereqOutcome.reject(
+                    RejectReason.MISSING,
+                    f"bound PR #{pr_number} is not an open PR linked to task "
+                    f"#{task_number} (found: {[p.number for p in linked]})",
+                )
+            chosen = exact[0]
+        elif len({p.number for p in linked} ) > 1:
+            nums = sorted({p.number for p in linked})
+            return PrereqOutcome.reject(
+                RejectReason.MULTIPLE,
+                f"multiple open PRs linked to task #{task_number}: {nums} — "
+                f"bind the exact PR to review rather than guessing",
+            )
+        else:
+            chosen = linked[0]
         readiness = self._find_worker_readiness(task_number)
         if readiness is None:
             return PrereqOutcome.reject(
@@ -557,9 +734,9 @@ class PublicBus:
                 f"no attributed Worker readiness record on task #{task_number}",
             )
         return PrereqOutcome.proceed(
-            f"PR #{linked[0].number} linked; readiness recorded",
+            f"PR #{chosen.number} linked; readiness recorded",
             task=task_number,
-            pr=linked[0].number,
+            pr=chosen.number,
             readiness=readiness.url,
         )
 
@@ -954,7 +1131,12 @@ class PublicBusGate:
         # safeguards; a Lead-assigned verifier-only intent uses the audit predicate.
         if self._intent_value(intent) in self._AUDIT_INTENTS:
             return self.bus.verify_verifier_audit(number)
-        return self.bus.verify_verifier_dispatch(number)
+        # Honour the exact PR durably bound to this dispatch (resolved when the
+        # Worker dispatch landed, or host-recovered from the #64 lost-handoff
+        # chain) so the Verifier reviews that exact PR rather than an arbitrary
+        # linked one (#47/#65).
+        pinned_pr = getattr(dsp, "pr_number", None)
+        return self.bus.verify_verifier_dispatch(number, pr_number=pinned_pr)
 
     def build_correction(
         self, role: str, intent: object, outcome: "PrereqOutcome",
@@ -1080,7 +1262,8 @@ class CliGitHubClient:
     def get_pull(self, number: int) -> Optional[PullRef]:
         try:
             out = self._run(["pr", "view", str(number), "--json",
-                             "number,title,state,body,url"])
+                             "number,title,state,body,url,headRefName,"
+                             "mergeable,statusCheckRollup"])
         except GitHubError as e:
             if e.kind is GitHubErrorKind.NOT_FOUND:
                 return None
@@ -1089,7 +1272,8 @@ class CliGitHubClient:
 
     def list_pulls(self, state: str = "open") -> list[PullRef]:
         out = self._run(["pr", "list", "--state", state, "--json",
-                         "number,title,state,body,url", "--limit", "200"])
+                         "number,title,state,body,url,headRefName,"
+                         "mergeable,statusCheckRollup", "--limit", "200"])
         return [self._pull_from_json(d) for d in json.loads(out or "[]")]
 
     def list_comments(self, *, target: str, number: int) -> list[CommentRef]:
@@ -1139,4 +1323,7 @@ class CliGitHubClient:
             body=body,
             url=d.get("url", ""),
             linked_issues=linked,
+            head_ref=d.get("headRefName", "") or "",
+            mergeable=str(d.get("mergeable", "") or ""),
+            checks=summarize_check_rollup(d.get("statusCheckRollup")),
         )

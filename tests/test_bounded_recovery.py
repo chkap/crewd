@@ -11,10 +11,11 @@ prerequisite (an explicit Lead ``pause``) still PAUSES; and that model-selected
 host-managed no-decision re-solicitation.
 
 Includes a subset of the live #64 incident chain: two clean Worker SDK aborts
-followed by an attempt that durably produces branch/PR evidence but double-calls
-``submit_role_handoff`` — the double submission is a protocol failure (uncertain)
-that must NOT fabricate a human pause and must preserve the durable evidence in
-the pending handoff so Lead can route on it instead of blindly repeating Worker.
+followed by an attempt that double-calls ``submit_role_handoff`` so the
+exactly-one capture returns no payload — the lost handoff is a protocol failure
+(uncertain) that must NOT fabricate a human pause. Host-side recovery of the
+lost evidence from durable external (GitHub) state, and the exact-bound Verifier
+review it enables, are proven in tests/test_evidence_discovery.py.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ from crewd.orchestrator import Orchestrator
 from crewd.session_backend import AttemptOutcome
 from crewd.workspace import Workspace
 
-from fakes import FakeExecutor, dispatch_to, finish, pause, role_handoff
+from fakes import FakeExecutor, dispatch_to, finish, pause
 
 ROLES = ("lead", "advisory", "worker", "verifier")
 
@@ -151,13 +152,22 @@ def test_continue_lead_kernel_kind_retained_for_compat(tmp_path):
     disp.close()
 
 
-# ── #64 incident-chain subset: two clean SDK aborts, then a double role handoff
-#    carrying durable branch/PR evidence must stay uncertain, preserve the
-#    evidence, and never fabricate a human pause. ──
-def test_double_role_handoff_is_uncertain_preserves_evidence_no_false_pause(tmp_ws: Workspace):
-    evidence = "branch crewd/x; PR #99 mergeable, checks green; task #65 bound"
-    # Two clean Worker SDK aborts, then every later Worker tick durably produces
-    # branch/PR evidence but double-calls submit_role_handoff (submissions=2).
+# ── #64 incident-chain subset: two clean SDK aborts, then a duplicate role
+#    handoff loses its payload (real capture semantics). The attempt stays
+#    uncertain and the run WAITs — never a fabricated human pause. Recovery of
+#    the lost evidence from durable external state is proven in
+#    tests/test_evidence_discovery.py. ──
+def test_double_role_handoff_loses_payload_no_false_pause(tmp_ws: Workspace):
+    """Production-faithful capture semantics: a duplicate ``submit_role_handoff``
+    (submissions=2) makes the exactly-one capture return NO payload, so the
+    orchestrator receives ``handoff=None`` and cannot preserve any structured
+    evidence from either duplicate call. The attempt is therefore ``uncertain``
+    (never a silent completion) and the run settles into a bounded WAIT — never a
+    fabricated human PAUSE. Evidence recovery from durable external state is
+    proven separately in tests/test_evidence_discovery.py."""
+    # Two clean Worker SDK aborts, then every later Worker tick reaches a clean
+    # idle but double-submits (handoff lost). No RoleHandoff is injected: that
+    # models the real path where the structured payload is unrecoverable.
     outcomes = iter([AttemptOutcome.ABORTED_CLEAN, AttemptOutcome.ABORTED_CLEAN])
 
     def role_outcome(req):
@@ -166,7 +176,7 @@ def test_double_role_handoff_is_uncertain_preserves_evidence_no_false_pause(tmp_
     fake = FakeExecutor(
         lead_script=[dispatch_to("worker")] * 30,
         role_outcome=role_outcome,
-        role_handoff=role_handoff("completed", evidence=evidence, changed="opened PR #99"),
+        role_handoff=None,           # duplicate submission → capture yields None
         role_handoff_submissions=2,  # double submission → protocol failure
     )
     orch, disp = _orch(tmp_ws, fake, max_steps=100)
@@ -178,27 +188,27 @@ def test_double_role_handoff_is_uncertain_preserves_evidence_no_false_pause(tmp_
     assert RunStatus(run.status) is RunStatus.WAITING
     assert run.human_blocker is None
 
-    # Every double-submission Worker handoff is uncertain (a double submission is
-    # never a silent completion); the two leading SDK aborts are no_progress. No
-    # Worker attempt is ever a fabricated completion, and the durable branch/PR
-    # evidence is preserved so Lead can route on it (independent Verifier review)
-    # instead of blindly repeating Worker.
+    # No Worker attempt is ever a fabricated completion; the lost-payload ticks
+    # are uncertain with NO structured evidence (proving the payload is gone).
     worker_handoffs = [
         h for h in disp.export_run(run.id)["handoffs"] if h["role"] == "worker"
     ]
     assert worker_handoffs
     assert all(h["outcome_class"] != "completed" for h in worker_handoffs)
-    assert any(h["outcome_class"] == "uncertain" for h in worker_handoffs)
-    assert any(evidence in (h["evidence"] or "") for h in worker_handoffs)
+    idle_uncertain = [
+        h for h in worker_handoffs
+        if h["outcome_class"] == "uncertain" and "protocol_failure" in (h["reason_returned"] or "")
+    ]
+    assert idle_uncertain
+    assert all(not (h["evidence"] or "").strip() for h in idle_uncertain)
 
 
 def test_double_role_handoff_recovers_on_resume(tmp_ws: Workspace):
     """After the double-submission thrash settles into WAITING, an explicit resume
-    restores the budget and a subsequent clean single-submission completion is
-    accepted — recovery is possible without operator intervention."""
+    restores the budget — recovery is possible without operator intervention."""
     fake = FakeExecutor(
         lead_script=[dispatch_to("worker")] * 30,
-        role_handoff=role_handoff("completed", evidence="PR #99", changed="opened PR"),
+        role_handoff=None,
         role_handoff_submissions=2,
     )
     orch, disp = _orch(tmp_ws, fake, max_steps=100)

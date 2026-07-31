@@ -54,10 +54,12 @@ class FakeGitHubClient:
         return ref
 
     def add_pull(self, number: int, title: str, *, state: str = "open",
-                 body: str = "", linked_issues: tuple[int, ...] = ()) -> PullRef:
+                 body: str = "", linked_issues: tuple[int, ...] = (),
+                 head_ref: str = "", mergeable: str = "", checks: str = "") -> PullRef:
         ref = PullRef(number, title, state, body,
                       url=f"https://github.com/{self._repo}/pull/{number}",
-                      linked_issues=linked_issues)
+                      linked_issues=linked_issues,
+                      head_ref=head_ref, mergeable=mergeable, checks=checks)
         self.pulls[number] = ref
         return ref
 

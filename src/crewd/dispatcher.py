@@ -1459,6 +1459,26 @@ class Dispatcher:
             return None, None
         return row["tn"], row["pn"]
 
+    def pr_bound_to_task(self, task_number: int) -> Optional[int]:
+        """The exact PR durably bound to any dispatch for ``task_number``.
+
+        A PR binding established on one dispatch (a Worker dispatch that resolved
+        the linked PR, or the host recovering it from the #64 lost-handoff chain)
+        is the authoritative review target for the whole task, so a *later*
+        Verifier dispatch inherits it and reviews that exact PR rather than
+        re-guessing among linked PRs (#47/#65). Returns the single bound PR, or
+        ``None`` when none is bound or the bindings are inconsistent (fail closed;
+        the caller then falls back to the public-record gate)."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT pr_number FROM dispatch "
+            "WHERE task_number = ? AND pr_number IS NOT NULL",
+            (int(task_number),),
+        ).fetchall()
+        prs = {r["pr_number"] for r in rows}
+        if len(prs) == 1:
+            return int(next(iter(prs)))
+        return None
+
     def task_number_for_handoff(self, handoff_id: str) -> Optional[int]:
         """The exact routed task bound to a handoff's originating dispatch.
 

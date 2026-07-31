@@ -183,6 +183,41 @@ def test_verifier_dispatch_no_readiness_record():
     assert out.route is Route.REJECT and out.reason is RejectReason.NOT_READY
 
 
+def test_verifier_dispatch_multiple_linked_pulls_fails_closed():
+    """Several open PRs link the task and none is bound: the gate refuses to guess
+    which to review, failing closed (MULTIPLE) rather than picking the first."""
+    c = FakeGitHubClient(REPO)
+    _seed_worker_ready(c)
+    c.add_pull(31, "impl A", linked_issues=(29,))
+    c.add_pull(32, "impl B", linked_issues=(29,))
+    c.add_comment("issue", 29, _worker_readiness_body())
+    out = _bus(c).verify_verifier_dispatch(29)
+    assert out.route is Route.REJECT and out.reason is RejectReason.MULTIPLE
+
+
+def test_verifier_dispatch_pinned_pr_disambiguates_multiple():
+    """A bound PR pins the exact review target even when several PRs link the
+    task — the arbitrary-first ambiguity is resolved to the authoritative PR."""
+    c = FakeGitHubClient(REPO)
+    _seed_worker_ready(c)
+    c.add_pull(31, "impl A", linked_issues=(29,))
+    c.add_pull(32, "impl B", linked_issues=(29,))
+    c.add_comment("issue", 29, _worker_readiness_body())
+    out = _bus(c).verify_verifier_dispatch(29, pr_number=32)
+    assert out.route is Route.PROCEED and out.refs["pr"] == 32
+
+
+def test_verifier_dispatch_pinned_pr_not_linked_fails_closed():
+    """A bound PR that is not an open linked PR (unrelated/stale) fails closed
+    rather than silently reviewing some other linked PR."""
+    c = FakeGitHubClient(REPO)
+    _seed_worker_ready(c)
+    c.add_pull(31, "impl", linked_issues=(29,))
+    c.add_comment("issue", 29, _worker_readiness_body())
+    out = _bus(c).verify_verifier_dispatch(29, pr_number=999)
+    assert out.route is Route.REJECT and out.reason is RejectReason.MISSING
+
+
 # ── finish prerequisite ──────────────────────────────────────────────────
 def test_finish_success():
     c = FakeGitHubClient(REPO)

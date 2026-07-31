@@ -164,6 +164,36 @@ def test_task_number_for_unbound_or_unknown_handoff_is_none(tmp_path):
     assert disp.task_number_for_handoff("ho-does-not-exist") is None
 
 
+def test_pr_bound_to_task_inherited_across_dispatches(tmp_path):
+    """A PR bound to one dispatch for a task (Worker routing, or host-recovered
+    from the #64 lost-handoff chain) is the authoritative review target for a
+    later Verifier dispatch on the same task (#47/#65)."""
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run(GOAL)
+    assert disp.pr_bound_to_task(44) is None  # nothing bound yet
+    dsp = _dispatch_worker(disp, run.id, 44)
+    disp.bind_pr_to_dispatch(dsp.id, 46)
+    # A later dispatch for the same task inherits the exact bound PR.
+    assert disp.pr_bound_to_task(44) == 46
+
+
+def test_pr_bound_to_task_fails_closed_on_inconsistent_bindings(tmp_path):
+    """Inconsistent PR bindings across dispatches for one task resolve to None so
+    the caller falls back to the public-record gate rather than guessing."""
+    disp = _open(tmp_path)
+    run = disp.start_or_resume_run(GOAL)
+    d1 = _dispatch_worker(disp, run.id, 44)
+    disp.bind_pr_to_dispatch(d1.id, 46)
+    # Return authority to Lead, then a second dispatch for the same task bound to
+    # a different PR (an anomaly) makes the task-level lookup ambiguous.
+    att = disp.reserve_attempt(run.id, d1.id, "worker")
+    disp.mark_started(att, session_id="s", generation=0)
+    disp.record_terminal(att, AttemptOutcome.IDLE_COMPLETED, evidence="x")
+    d2 = _dispatch_worker(disp, run.id, 44)
+    disp.bind_pr_to_dispatch(d2.id, 47)
+    assert disp.pr_bound_to_task(44) is None
+
+
 # ══════════════════════════ 3. schema migration ══════════════════════════
 def test_migration_adds_task_number_to_legacy_dispatch(tmp_path):
     """A pre-#47 database (dispatch without ``task_number``) is upgraded in place
