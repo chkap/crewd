@@ -102,9 +102,9 @@ def test_install_classified_by_returncode_despite_pip_notice(
     # A realistic pip run whose LAST line is the upgrade notice, not the
     # "Successfully installed" line. Classification must ignore this and use rc.
     install_output = (
-        "Processing ./crewd-0.1.0-py3-none-any.whl\n"
+        "Processing ./crewd-0.1.1-py3-none-any.whl\n"
         "Installing collected packages: crewd\n"
-        "Successfully installed crewd-0.1.0\n"
+        "Successfully installed crewd-0.1.1\n"
         "\n"
         "[notice] A new release of pip is available: 25.0.1 -> 26.2\n"
         "[notice] To update, run: pip install --upgrade pip\n"
@@ -121,4 +121,4 @@ def test_install_classified_by_returncode_despite_pip_notice(
 
     assert result["checks"]["install"] is expected
     # Diagnostic detail is retained (bounded) regardless of pass/fail.
-    assert "Successfully installed crewd-0.1.0" in result["details"]["install"]
+    assert "Successfully installed crewd-0.1.1" in result["details"]["install"]

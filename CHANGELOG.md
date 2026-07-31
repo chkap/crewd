@@ -4,10 +4,15 @@ All notable, user-facing changes to crewd are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crewd
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] — 2026-07-31
 
-Documentation and behavior refinements landed toward the **0.1.1** line. The authoritative
-package version is unchanged until 0.1.1 is cut and published.
+Documentation and behavior refinements on top of 0.1.0. This is a
+**backward-compatible** release: `crew.yaml`, workspace layout, the durable run
+journal, and the `crewd` CLI surface are unchanged, so upgrading is a drop-in
+`pip install --upgrade crewd` followed by `crewd refresh` + `crewd doctor` in each
+workspace (durable state and unknown config keys are preserved; the journal
+schema migrates in place idempotently). No configuration or command changes are
+required.
 
 ### Changed
 
@@ -124,5 +129,6 @@ coordinating entirely through GitHub Issues and Pull Requests.
 - Run **one `crewd run` per workspace**.
 - Primarily exercised on **Linux**; other platforms are unvalidated.
 
-[Unreleased]: https://github.com/chkap/crewd/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/chkap/crewd/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/chkap/crewd/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/chkap/crewd/releases/tag/v0.1.0

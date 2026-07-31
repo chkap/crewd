@@ -1,4 +1,8 @@
-"""Release-artifact contract for ``crewd==0.1.0`` (#52).
+"""Release-artifact contract for the ``crewd`` distribution (#52).
+
+The ``VERSION`` constant tracks the single authoritative ``crewd.__version__``
+so this contract validates whichever release candidate is on ``main`` (0.1.1 at
+time of writing).
 
 These deterministic checks build the wheel and sdist once with the project's
 own ecosystem tooling and then assert the *exact* packaged-content contract:
@@ -32,7 +36,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 WHEEL_NAME = f"crewd-{VERSION}-py3-none-any.whl"
 SDIST_NAME = f"crewd-{VERSION}.tar.gz"
 
