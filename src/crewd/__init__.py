@@ -11,5 +11,5 @@ The importable package therefore does not ship a ``py.typed`` marker and makes
 no typed-library stability guarantee. Revisit this only if/when a typed public
 API is intentionally offered and verified by a type checker in CI.
 """
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 

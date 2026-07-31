@@ -47,7 +47,7 @@ import venv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 WHEEL_NAME = f"crewd-{VERSION}-py3-none-any.whl"
 SDIST_NAME = f"crewd-{VERSION}.tar.gz"
 

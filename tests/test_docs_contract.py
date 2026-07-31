@@ -75,14 +75,19 @@ def test_skill_install_line_leads_with_pip():
     assert "no model-selected `continue_lead`" in SKILL
 
 
-def test_changelog_has_unreleased_section_documenting_recovery_behavior():
-    assert "## [Unreleased]" in CHANGELOG
-    unreleased = CHANGELOG.split("## [Unreleased]", 1)[1].split("## [0.1.0]", 1)[0]
-    assert "continue_lead" in unreleased  # documents its removal
-    assert "WAITING" in unreleased or "WAIT" in unreleased
-    assert "Advisory" in unreleased
-    # The authoritative version is not bumped by this documentation change.
-    assert '__version__ = "0.1.0"' in (ROOT / "src/crewd/__init__.py").read_text()
+def test_changelog_0_1_1_entry_documents_recovery_behavior():
+    # The 0.1.1 release notes (finalized from the former [Unreleased] section)
+    # must accurately cover the #64-#67 behavior on top of 0.1.0.
+    assert "## [0.1.1]" in CHANGELOG
+    entry = CHANGELOG.split("## [0.1.1]", 1)[1].split("## [0.1.0]", 1)[0]
+    assert "continue_lead" in entry  # documents its removal
+    assert "WAITING" in entry or "WAIT" in entry
+    assert "Advisory" in entry
+    # 0.1.1 is a dated, backward-compatible entry with an upgrade path.
+    assert "2026-" in entry
+    assert "pip install --upgrade crewd" in entry
+    # The authoritative version is bumped to 0.1.1 for the release candidate.
+    assert '__version__ = "0.1.1"' in (ROOT / "src/crewd/__init__.py").read_text()
 
 
 # --- cross-document recovery-language contract (Verifier PR #71 audit) -------
