@@ -4,6 +4,40 @@ All notable, user-facing changes to crewd are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crewd
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Documentation and behavior refinements landed toward the **0.1.1** line. The authoritative
+package version is unchanged until 0.1.1 is cut and published.
+
+### Changed
+
+- **Lead-directed dispatch is exact-bound and host-governed.** Each `dispatch` binds one role
+  to one specific `crewd:task` with a correlation id; the attempt, handoff, and public comment
+  carry that exact binding so authority advances only on the record the Lead addressed.
+- **Typed, intent-aware gate corrections.** A dispatch carries a typed intent (implementation,
+  verifier audit, acceptance, release, advisory); the prerequisite gate validates the right
+  record for that intent and corrects a rejected transition in place instead of consuming an
+  attempt or terminalising the run.
+- **Bounded WAIT vs operator-only PAUSE, with separated recovery budgets.** Transient
+  GitHub/SDK **transport** failures, **uncertain**/missing/malformed decisions, and ordinary
+  **no-progress** now carry independent durable budgets and leave the run `WAITING` with an
+  observable wake condition that self-heals on the next reconcile. `PAUSE` is reserved for a
+  genuine operator-only prerequisite, so the crew no longer raises a false human blocker for
+  internal retries or transient errors.
+- **Durable evidence recovery.** When a role attempt terminates without delivering its
+  structured handoff, the host performs an exact-bound search of the GitHub record (branch/PR/
+  checks) and reconciles that evidence rather than discarding real work.
+- **High-leverage Advisory consultation policy.** When Advisory is configured, Lead consults it
+  before consequential decisions (not on a fixed rotation), records a one-line reason when it
+  skips consultation for a routine step, and treats Advisory input as proactive but non-binding.
+
+### Removed
+
+- **Model-selected `continue_lead` decision.** The Lead decision contract no longer exposes a
+  "keep going" outcome; the host manages re-solicitation, interruption, and timeout recovery
+  under bounded per-class budgets. Lead uses `wait` (with a wake condition) to request another
+  planning turn.
+
 ## [0.1.0] — 2026-07-30
 
 First public release of crewd — a multi-agent coding-crew CLI that runs a
@@ -90,4 +124,5 @@ coordinating entirely through GitHub Issues and Pull Requests.
 - Run **one `crewd run` per workspace**.
 - Primarily exercised on **Linux**; other platforms are unvalidated.
 
+[Unreleased]: https://github.com/chkap/crewd/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/chkap/crewd/releases/tag/v0.1.0

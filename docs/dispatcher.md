@@ -56,7 +56,10 @@ the in-flight dispatch otherwise.
 6. **Closed Lead-decision sum type.** `dispatch(role)`, `continue_lead`,
    `wait(condition)`, `pause(blocker)`, `finish(acceptance)`. A `dispatch` to an
    unconfigured role fails and keeps authority with Lead. `wait`/`pause`/`finish`
-   launch no role.
+   launch no role. `continue_lead` is a **host-internal** kind used for
+   re-solicitation bookkeeping — it is **not model-selectable**: a Lead turn that
+   emits `continue_lead` is rejected, and a Lead needing another planning turn uses
+   `wait(condition)` under the bounded per-class re-solicitation budget instead.
 7. **Exclusive routing authority.** `lead_decide` is accepted only when the run
    is `active` **and** `routing_authority == lead_pending`. This forbids
    overlapping dispatches while one attempt is in flight, and refuses to launch
@@ -70,12 +73,18 @@ the in-flight dispatch otherwise.
    (`UNIQUE(dispatch_id)` backstop). A stale caller after a crash therefore
    cannot launch a second role while the journal says another dispatch owns
    authority, nor bind an attempt to the wrong run/role.
-9. **Deterministic thrash bounds.** Exceeding `max_consecutive_unproductive`, or
-   repeating an identical role edge more than `max_edge_repeats` times without an
-   intervening productive handoff, emits one synthetic handoff and **pauses** the
-   run (`guard_tripped=True`) instead of recursively invoking Lead. `resume_run`
-   clears the blocker and resets the thrash counters. Thresholds are configurable
-   pending #12's semantic progress token.
+9. **Deterministic per-class thrash bounds.** Recovery is classified by cause and
+   each class trips on its **own** durable budget, independently, so a mix of
+   transient GitHub/SDK **transport** aborts, protocol-**uncertain** handoffs, and
+   role **no-progress** attempts never combine into one shared disposition (#65).
+   Class caps are checked before the coarse aggregate (`max_consecutive_unproductive`)
+   and edge-repeat (`max_edge_repeats`) guards. Exceeding any of these emits one
+   synthetic evidence handoff and settles the run into a bounded **`WAITING`** state
+   with an observable wake condition (NOT a human `paused`) — an internal recovery
+   condition, not an operator-only prerequisite — returning authority to Lead so an
+   explicit `resume_run` (which restores the per-class budgets) or a later reconcile
+   can make fresh progress. Thresholds are configurable pending #12's semantic
+   progress token.
 10. **Journaled Lead solicitation (#17).** A Lead *decision-production* SDK call is
     real Premium work, so it is durably reserved and bounded exactly like role
     work — never an unjournaled orchestration call. `open_lead_solicitation(run)`
@@ -91,22 +100,24 @@ the in-flight dispatch otherwise.
     Lead attempt and then either **applies** the decision — only if the turn
     completed cleanly, the authority nonce is unchanged, and the decision
     acknowledges *exactly* the snapshot set — or **records it invalid**. Invalid /
-    missing / timed-out / errored decisions increment
-    `goal_run.invalid_solicitations` and return authority to Lead for another
-    bounded solicitation; reaching `max_invalid_solicitations` persists a
-    `paused` blocker. `continue_lead` returns authority to Lead (another budgeted
-    solicitation), never a free recursive call. The authority nonce is bumped on
-    every transition back to `lead_pending`, so a candidate produced under an
-    earlier authority window (e.g. one whose attempt a restart already reconciled
-    to `uncertain`) can never apply — `resolve_lead_solicitation` refuses a
+    missing / timed-out / errored decisions are their own **uncertain** recovery
+    class: they increment `goal_run.invalid_solicitations` and return authority to
+    Lead for another bounded solicitation; reaching `max_invalid_solicitations`
+    settles the run into a bounded **`WAITING`** state with a wake condition (NOT a
+    human `paused`), so a persistently uncertain Lead turn is reconciled/re-solicited
+    without fabricating a human blocker. `continue_lead` returns authority to Lead
+    (another budgeted solicitation), never a free recursive call. The authority nonce
+    is bumped on every transition back to `lead_pending`, so a candidate produced
+    under an earlier authority window (e.g. one whose attempt a restart already
+    reconciled to `uncertain`) can never apply — `resolve_lead_solicitation` refuses a
     solicitation attempt that is no longer in-flight. SQLite, not any
     `decision.json` file, owns idempotent consumption. A solicitation attempt is
     terminalized **only** through `resolve_lead_solicitation`: `record_terminal`
     rejects it, and the thrash/no-progress guard reached while applying a
-    solicited decision pauses **without** synthesising a `role='lead'` handoff
-    (the synthetic handoff attaches only to the most recent non-solicitation
-    attempt, i.e. real role work/control evidence). So no kernel path — public or
-    internal — can ever create a Lead handoff.
+    solicited decision settles into a bounded wait **without** synthesising a
+    `role='lead'` handoff (the synthetic handoff attaches only to the most recent
+    non-solicitation attempt, i.e. real role work/control evidence). So no kernel
+    path — public or internal — can ever create a Lead handoff.
 
 ## Schema migration
 

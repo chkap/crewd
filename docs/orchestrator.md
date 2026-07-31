@@ -127,7 +127,9 @@ Advisory finding), and a `no_progress` claim must carry a return `reason`. Zero,
 multiple, malformed (one counted submission that failed to parse into a handoff),
 or under-substantiated (success-shaped but empty) submissions all resolve to
 `HandoffOutcome.UNCERTAIN` (`reason_returned` prefixed `role_protocol_failure:`),
-which is unproductive and so counts toward the no-progress thrash bound. This
+which is its own **uncertain** recovery class with a dedicated durable budget —
+separate from ordinary role no-progress (#65) — and trips a bounded `WAITING` wake
+on its own cap rather than being folded into the no-progress thrash bound. This
 closes the success-shaped-idle loophole #9/#12 targeted, and the resolver never
 dereferences a missing handoff. The
 evidence/changed/remaining/`disagreement`/`blocker` fields are threaded through
@@ -233,7 +235,7 @@ maintenance command that reports and clears a stale daemon PID.
 `tests/test_orchestrator.py` is the end-to-end fake-SDK matrix (`tests/fakes.py`
 provides a scriptable `FakeExecutor`): happy-path dispatch→finish, pause, wait,
 budget exhaustion, role failure, invalid solicitations, `once=True`, stop
-sentinel, advisory dispatch, `continue_lead`, restart reconciliation, thrash
+sentinel, advisory dispatch, host-internal `continue_lead`, restart reconciliation, thrash
 guard, and signal interrupt. The command-layer loop tests
 (`tests/test_commands.py`, `tests/test_goal_lifecycle.py`) drive `cmd_run` with a
 monkeypatched `build_executor` returning a `FakeExecutor`, so no test touches the

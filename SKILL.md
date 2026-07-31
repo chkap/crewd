@@ -9,14 +9,14 @@ description: Operate the crewd multi-agent coding crew CLI — bootstrap a works
 
 ## What crewd is
 
-A CLI (`typer` + `jinja2` + `pydantic`; roles run through the official `github-copilot-sdk`) that runs a 4-role autonomous coding crew against a target GitHub repo. Installed on `PATH` as `crewd` (`pipx install crewd`, `uv tool install crewd`, or `pip install crewd`):
+A CLI (`typer` + `jinja2` + `pydantic`; roles run through the official `github-copilot-sdk`) that runs a 4-role autonomous coding crew against a target GitHub repo. Installed on `PATH` as `crewd` (primary: `pip install crewd` into a virtual environment; alternatives: `pipx install crewd` or `uv tool install crewd`):
 
 - **lead** — plans, schedules, opens umbrella issues. No code, no merges.
 - **worker** — writes code, opens PRs. No merges.
 - **verifier** — reviews PRs, merges. No code. Two tiers: per-PR + final `crewd:acceptance` gate.
 - **advisory** — research, citations, design pointers. No code, no merges.
 
-Each role runs as an official **GitHub Copilot SDK session** with its own `config_directory` set to `cfg/<role>/` (private resumable conversation + config), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. There is **no fixed round-robin**: the **Lead directs the crew** — each cycle it returns one typed decision (`dispatch`/`continue_lead`/`wait`/`pause`/`finish`) and a dispatched role returns one typed handoff (`completed`/`no_progress`), all journaled to a durable SQLite run log for restart-safe recovery. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
+Each role runs as an official **GitHub Copilot SDK session** with its own `config_directory` set to `cfg/<role>/` (private resumable conversation + config), driven by an `AGENTS.md` file auto-loaded from its working directory at `cfg/<role>/`. Each role has an isolated git worktree at `cfg/<role>/worktree/`. There is **no fixed round-robin**: the **Lead directs the crew** — each cycle it returns one typed decision (`dispatch`/`wait`/`pause`/`finish`; there is no model-selected `continue_lead` — the host manages re-solicitation, interruption, and timeout recovery under bounded per-class budgets) and a dispatched role returns one typed handoff (`completed`/`no_progress`), all journaled to a durable SQLite run log for restart-safe recovery. Recovery is classified: transient transport, uncertain/missing decisions, and no-progress carry separate budgets and settle into a bounded `WAITING` wake; `PAUSE` is reserved for operator-only blockers. Inter-role communication is GitHub issue/PR comments only. Operator-to-role communication is `state/inbox/<role>.md`.
 
 ## When to use this skill
 
@@ -171,9 +171,13 @@ It prints: roles table (models / families / agent.md freshness / session-state /
 
 `run` (foreground or `--daemon`) installs `SIGINT`/`SIGTERM` handlers that flip an interrupt flag — the current attempt finishes, then `state/exit-reason` is written and the loop exits 0. `crewd stop` writes the `STOPPED` sentinel and sends `SIGINT` to the daemon PID if running; `--force` sends `SIGKILL`. Mid-attempt cancellation is a single non-blocking `CancelToken` abort of the in-flight SDK session; if the abort cannot be confirmed idle the session is tainted and force-stopped, so the next run starts a fresh generation instead of resuming a dirty session. A second signal aborts hard.
 
-When Lead writes `state/PAUSED`, the loop stops before the next role and records
-`exit-reason: human-blocked`. This is resumable and deliberately distinct from
-`STOPPED`/`goal-complete`; do not poll a known human blocker with more crew cycles.
+When Lead determines only a human/operator prerequisite remains, it submits a typed
+`pause` decision; the **host** durably records `exit-reason: human-blocked` and the loop
+stops before the next role (Lead does not hand-write `state/PAUSED`). This is resumable and
+deliberately distinct from `STOPPED`/`goal-complete`; do not poll a known human blocker with
+more crew cycles. Transient transport failures, protocol-uncertain/missing decisions, and
+ordinary no-progress are **not** pauses — each carries its own bounded budget and settles into
+a recoverable `WAITING` state with a wake condition that self-heals on the next reconcile.
 
 ## What NOT to do
 
