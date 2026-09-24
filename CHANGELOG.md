@@ -15,6 +15,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Advisory handoffs can now publish to correctly bound consultation tasks that
   were closed without an implementation PR; code-producing role handoffs retain
   the merged-PR closure requirement.
+- Lead instructions now pin the exact canonical Worker-assignment attribution
+  line, preventing task routing loops caused by replacing the crew name with
+  descriptive prose.
 
 ## [0.1.1] — 2026-07-31
 
