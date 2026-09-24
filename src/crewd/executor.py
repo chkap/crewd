@@ -434,6 +434,29 @@ class SdkAttemptExecutor:
                 )
                 return (res, None) if lead else (res, None, 0)
 
+            candidate = self._read_captured_decision(capture, ops) if lead else None
+            if (
+                lead
+                and result.outcome is AttemptOutcome.IDLE_COMPLETED
+                and candidate is None
+            ):
+                submissions = capture.count if capture is not None else 0
+                retired = registry.retire(
+                    goal_label=req.goal_label,
+                    role=req.role,
+                    session_id=session_id,
+                    reason=(
+                        "prior Lead session completed without exactly one valid "
+                        f"submit_lead_decision call ({submissions} submissions)"
+                    ),
+                )
+                if retired:
+                    log_lines.append(
+                        "[crewd] Lead decision protocol failure: "
+                        f"{submissions} submissions; session retired so the next "
+                        "solicitation starts a fresh recovery generation"
+                    )
+
             for ev in result.events:
                 log_lines.append(ev.to_line())
             for s in result.session_event_summaries:
@@ -445,9 +468,7 @@ class SdkAttemptExecutor:
             )
             self._write_log(req.log_path, log_lines)
             self._write_sidecar(req, result, decision.generation)
-
             if lead:
-                candidate = self._read_captured_decision(capture, ops)
                 return result, candidate
             handoff = self._read_captured_handoff(role_capture)
             submissions = role_capture.count if role_capture is not None else 0

@@ -144,6 +144,10 @@ JSON (`config_dir/.crewd-sdk-sessions.json`):
   SDK's persistence semantics: `force_stop()` clears in-memory sessions but does
   **not** destroy persisted state, so reusing the same id would risk colliding
   with untrusted on-disk state (Advisory). A new-generation id sidesteps that.
+- **Clean Lead protocol failure** (no single valid `submit_lead_decision` call)
+  retires the completed conversation without marking it tainted. The registry
+  advances once to a fresh recovery generation; later valid turns resume that
+  replacement normally instead of repeatedly reusing a context-stuck session.
 
 ## Backend wiring (`SdkBackend.run_role`)
 
@@ -338,4 +342,3 @@ The legacy `"copilot"` value is **retired**: `get_backend("copilot")` raises a
 preflight converts that into exit code 2 rather than silently launching a
 subprocess. `CopilotBackend` has been deleted. See `docs/orchestrator.md` for the
 dispatcher-driven run loop that consumes this backend.
-

@@ -358,7 +358,17 @@ class Orchestrator:
             return  # run marked exhausted; the loop exits on the next iteration
         pending = self.disp.pending_handoffs(run_id)
         self._cycle += 1
-        prompt = self._deliver_inbox("lead", sol.attempt_id, self._lead_prompt(pending, run_id))
+        run_view = self.disp.get_run(run_id)
+        prompt = self._deliver_inbox(
+            "lead",
+            sol.attempt_id,
+            self._lead_prompt(
+                pending,
+                run_id,
+                recovery_attempt=run_view.invalid_solicitations,
+                retry_feedback=run_view.wake_condition,
+            ),
+        )
         req = self._request("lead", prompt)
         console.print(f"  [magenta]lead[/] ({self.cfg.roles.get('lead', _NoModel()).model}) solicitation → {req.log_path}")
         # Journal the Lead session identity durably BEFORE any SDK send, via the
@@ -1116,8 +1126,19 @@ class Orchestrator:
             return self._prompt_policy.decorate_role(role, prompt)
         return prompt
 
-    def _lead_prompt(self, pending: list[HandoffView], run_id: str | None = None) -> str:
-        prompt = self._lead_prompt_production(pending)
+    def _lead_prompt(
+        self,
+        pending: list[HandoffView],
+        run_id: str | None = None,
+        *,
+        recovery_attempt: int = 0,
+        retry_feedback: str | None = None,
+    ) -> str:
+        prompt = self._lead_prompt_production(
+            pending,
+            recovery_attempt=recovery_attempt,
+            retry_feedback=retry_feedback,
+        )
         # Surface the latest typed gate correction (#64) so Lead can repair the
         # public record or reroute with precise evidence rather than re-guessing.
         if run_id is not None:
@@ -1133,7 +1154,13 @@ class Orchestrator:
             return self._prompt_policy.decorate_lead(pending, prompt)
         return prompt
 
-    def _lead_prompt_production(self, pending: list[HandoffView]) -> str:
+    def _lead_prompt_production(
+        self,
+        pending: list[HandoffView],
+        *,
+        recovery_attempt: int = 0,
+        retry_feedback: str | None = None,
+    ) -> str:
         ids = [h.id for h in pending]
         if pending:
             blocks = []
@@ -1156,9 +1183,18 @@ class Orchestrator:
             )
         else:
             pending_block = "There are no pending handoffs (this is the run's first decision).\n"
+        recovery = (
+            f"RECOVERY ATTEMPT {recovery_attempt}: the prior Lead solicitation "
+            "did not yield exactly one applicable decision. Submit one decision "
+            "this turn.\n"
+            f"Prior failure: {retry_feedback or 'no valid decision'}\n"
+            if recovery_attempt
+            else ""
+        )
         return (
             f"You are Lead for `{self.cfg.target.remote}`. GOAL.md is at "
             f"`{self.ws.goal_md}`.\n"
+            f"{recovery}"
             f"{pending_block}"
             f"Ground your decision in these handoffs plus any live facts you "
             f"actually check. Decide what happens next and submit exactly one "

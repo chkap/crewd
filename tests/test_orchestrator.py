@@ -130,6 +130,8 @@ def test_invalid_solicitations_wait_after_cap(tmp_ws: Workspace):
     assert run.human_blocker is None
     assert run.wake_condition
     assert run.invalid_solicitations >= 3
+    assert "RECOVERY ATTEMPT 1" in fake.lead_calls[1].prompt
+    assert "Prior failure:" in fake.lead_calls[1].prompt
 
 
 # ── once=True advances exactly one step ──
