@@ -167,6 +167,25 @@ def test_terminal_handoff_to_unrelated_closed_task_is_invalid_target(tmp_ws: Wor
     assert pub.has_operator_block()
 
 
+def test_advisory_handoff_publishes_to_closed_task_without_pr(tmp_ws: Workspace):
+    """Advisory consultations legitimately close without an implementation PR."""
+    c = FakeGitHubClient(REPO)
+    _valid_worker_record(c, task_state="closed")
+    pub = _writer(tmp_ws, c)
+
+    outcome = pub.publish_role_handoff(
+        handoff_id="ho-advisory",
+        role="advisory",
+        outcome_class="completed",
+        task_number=TASK,
+        evidence="architecture recommendation posted",
+        changed="no repository changes",
+    )
+
+    assert outcome.route is Route.PROCEED and outcome.verified
+    assert pub.counts()["verified"] == 1 and pub.counts()["pending"] == 0
+
+
 def test_terminal_handoff_rejects_wrong_repository_goal_and_deleted_target(
     tmp_ws: Workspace,
 ):

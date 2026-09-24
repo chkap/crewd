@@ -12,6 +12,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retires its conversation, retries on one fresh session generation, and
   includes the prior failure in the recovery prompt instead of repeatedly
   resuming a context-stuck session.
+- Advisory handoffs can now publish to correctly bound consultation tasks that
+  were closed without an implementation PR; code-producing role handoffs retain
+  the merged-PR closure requirement.
 
 ## [0.1.1] — 2026-07-31
 

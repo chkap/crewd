@@ -796,7 +796,11 @@ class PublicBus:
 
     # -- terminal-publication authorization (issue #49) --
     def authorize_terminal(
-        self, *, task_number: int, pr_number: Optional[int] = None
+        self,
+        *,
+        task_number: int,
+        pr_number: Optional[int] = None,
+        allow_closed_without_pr: bool = False,
     ) -> PrereqOutcome:
         """Authorize a *terminal* attributed write to a bound task issue.
 
@@ -815,7 +819,9 @@ class PublicBus:
           when one was persisted) → ``PROCEED`` (closed-but-proven; comment
           permitted without reopening).
         * task **closed** with no such merged linked PR → ``REJECT``
-          (``UNVERIFIED``: unrelated/stale closure — do not post).
+          (``UNVERIFIED``: unrelated/stale closure — do not post), unless
+          ``allow_closed_without_pr`` is set for a non-code task such as an
+          Advisory consultation.
 
         A transient GitHub failure while reading the record surfaces as
         :attr:`Route.WAIT`/``PAUSE`` via :func:`route_for_error`, so a lookup
@@ -852,6 +858,11 @@ class PublicBus:
                 f"terminal target #{task_number} open",
                 task=task_number,
                 pr=(merged_pr.number if merged_pr else None),
+            )
+        if merged_pr is None and allow_closed_without_pr:
+            return PrereqOutcome.proceed(
+                f"terminal target #{task_number} closed without a PR as permitted",
+                task=task_number,
             )
         # Closed: require the verified linked merge as closure provenance.
         if merged_pr is None:
