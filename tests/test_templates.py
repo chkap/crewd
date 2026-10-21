@@ -5,6 +5,21 @@ import pytest
 from crewd.templates_render import render
 
 
+@pytest.mark.parametrize("role", ["lead", "worker", "verifier", "advisory"])
+def test_workspace_layout_matches_sdk_workspace_root(role):
+    out = render(
+        "agents/_workspace_layout.md.j2",
+        role_name=role,
+        target_repo="acme/widget",
+    )
+    assert "SDK starts your session at the **crewd workspace root**" in out
+    assert f"cd cfg/{role}/worktree/" in out
+    assert f"cfg/{role}/session-state/" in out
+    assert "git rev-parse --show-toplevel" in out
+    assert "../../GOAL.md" not in out
+    assert "`./worktree/`" not in out
+
+
 def test_render_lead_agent_includes_workspace_and_repo():
     out = render(
         "agents/lead.agent.md.j2",
