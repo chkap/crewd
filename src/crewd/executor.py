@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
@@ -567,6 +567,11 @@ class SdkAttemptExecutor:
                         "tainted": result.tainted,
                         "cleanup_confirmed": result.cleanup_confirmed,
                         "error": result.error,
+                        "usage": (
+                            asdict(result.usage)
+                            if result.usage is not None
+                            else {"complete": False, "errors": ["Usage unavailable"]}
+                        ),
                         "events": [
                             {"phase": ev.phase.value, "elapsed": ev.elapsed, "detail": ev.detail}
                             for ev in result.events
@@ -575,8 +580,8 @@ class SdkAttemptExecutor:
                     indent=2,
                 )
             )
-        except Exception:
-            pass
+        except OSError as error:
+            raise OSError(f"Cannot persist attempt accounting to {sidecar}: {error}") from error
 
 
 def _coerce_task_number(raw) -> Optional[int]:
