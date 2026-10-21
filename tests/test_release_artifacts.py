@@ -209,7 +209,7 @@ def _wheel_metadata(wheel: Path) -> tuple[email.message.Message, str]:
 
 def test_wheel_metadata_is_standards_compliant(artifacts):
     msg, _ = _wheel_metadata(artifacts["wheel"])
-    assert msg["Metadata-Version"] in {"2.1", "2.2", "2.3", "2.4"}, msg["Metadata-Version"]
+    assert msg["Metadata-Version"] in {"2.1", "2.2", "2.3", "2.4", "2.5"}, msg["Metadata-Version"]
     assert msg["Name"] == "crewd"
     assert msg["Version"] == VERSION
     # MIT expressed via the modern SPDX License-Expression (PEP 639).

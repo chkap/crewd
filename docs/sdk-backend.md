@@ -31,6 +31,15 @@ the state machine + tests), not conventions.
 
 ## Module layout
 
+Attempt sidecars include measured usage snapshots before and after each role
+attempt, their `delta_nano_aiu`, and live per-call token/cache counts. Snapshots
+are session-cumulative; sum attempt deltas, not resumed-session totals. A missing
+snapshot, counter decrease, or unsettled termination sets `complete: false`;
+missing cost is never converted to zero. Nano-AI units, premium-request cost,
+and model call counts are distinct quantities. Sidecar persistence errors are
+reported rather than silently dropping accounting. Resumed event histories are
+excluded from the new attempt's event summaries.
+
 | Module | Role | SDK import? |
 |--------|------|-------------|
 | `crewd.session_backend` | Domain port + attempt state machine + taint store. Fully unit-testable. | **No** — SDK-independent |

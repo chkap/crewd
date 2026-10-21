@@ -26,6 +26,8 @@ import threading
 from pathlib import Path
 
 from .session_backend import RunSignal, SdkError, SdkOps
+from .session_backend import redact
+from .usage import AttemptUsage, snapshot_from_metrics
 
 
 class _LoopThread:
@@ -109,6 +111,8 @@ class SdkRoleRuntime(SdkOps):
         self._client = None  # copilot.CopilotClient
         self._session = None  # copilot.CopilotSession
         self._event_count = 0
+        self._usage = AttemptUsage()
+        self._usage_call_ids: set[str] = set()
         # Guards single-issue of the SDK abort so an external cancel request and
         # the state machine's confirming abort never double-escalate the runtime.
         self._abort_lock = threading.Lock()
@@ -149,6 +153,9 @@ class SdkRoleRuntime(SdkOps):
                 )
             else:
                 self._session = self._loop.run(self._client.create_session(**kwargs))
+            self._session.on(self._on_usage_event)
+            self._usage.before = self._read_usage()
+            self._event_count = len(self._loop.run(self._session.get_events(), timeout=30))
         except SdkError:
             raise
         except Exception as e:
@@ -237,6 +244,39 @@ class SdkRoleRuntime(SdkOps):
             summaries.append(_summarise_event(ev))
         self._event_count = len(events)
         return summaries
+
+    def _on_usage_event(self, event) -> None:
+        event_type = getattr(event.type, "value", event.type)
+        if event_type != "assistant.usage":
+            return
+        data = event.data
+        call_id = data.api_call_id or event.id
+        if call_id in self._usage_call_ids:
+            return
+        self._usage_call_ids.add(call_id)
+        self._usage.calls.append({
+            "id": call_id,
+            "model": data.model,
+            "input_tokens": data.input_tokens,
+            "output_tokens": data.output_tokens,
+            "cache_read_tokens": data.cache_read_tokens,
+            "cache_write_tokens": data.cache_write_tokens,
+            "premium_request_cost": data.cost,
+        })
+
+    def _read_usage(self):
+        try:
+            metrics = self._loop.run(self._session.rpc.usage.get_metrics(), timeout=30)
+            return snapshot_from_metrics(metrics)
+        except Exception as error:
+            self._usage.errors.append(redact(f"Usage snapshot unavailable: {error}"))
+            return None
+
+    def get_usage(self, *, settled: bool = True) -> AttemptUsage:
+        self._usage.after = self._read_usage()
+        self._usage.settled = settled
+        self._usage.reconcile()
+        return self._usage
 
     def disconnect(self) -> None:
         try:

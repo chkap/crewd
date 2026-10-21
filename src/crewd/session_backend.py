@@ -34,6 +34,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
+from .usage import AttemptUsage
+
 
 # ─────────────────────────── outcomes & signals ───────────────────────────
 class AttemptOutcome(str, Enum):
@@ -160,6 +162,7 @@ class AttemptResult:
     # session is conservatively tainted so it is never silently resumed (R4/R5),
     # even though the work outcome itself may be a success.
     cleanup_confirmed: bool = True
+    usage: AttemptUsage | None = None
 
     def __post_init__(self) -> None:
         # Invariant: taint iff the terminal outcome taints OR cleanup was
@@ -551,6 +554,7 @@ def run_attempt(
     events: list[LifecycleEvent] = []
     drained: list[str] = []
     cleanup_ok = True
+    usage: AttemptUsage | None = None
 
     def emit(phase: LifecyclePhase, detail: str = "") -> None:
         events.append(
@@ -576,9 +580,16 @@ def run_attempt(
             error=redact(error) if error else None,
             session_event_summaries=list(drained),
             cleanup_confirmed=cleanup_ok,
+            usage=usage,
         )
 
-    def cleanup() -> None:
+    def capture_usage(*, settled: bool) -> None:
+        nonlocal usage
+        get_usage = getattr(ops, "get_usage", None)
+        if get_usage is not None:
+            usage = get_usage(settled=settled)
+
+    def cleanup(*, settled: bool = True) -> None:
         """Drain durable event summaries, then disconnect.
 
         On an unconfirmed disconnect the session id is tainted so it is never
@@ -589,6 +600,7 @@ def run_attempt(
             drained.extend(redact(s) for s in ops.drain_events())
         except SdkError as e:
             emit(LifecyclePhase.DISCONNECTED, f"event drain error: {e}")
+        capture_usage(settled=settled)
         try:
             ops.disconnect()
             emit(LifecyclePhase.DISCONNECTED, "clean")
@@ -625,7 +637,7 @@ def run_attempt(
     try:
         signal = ops.run(prompt, cfg.wait_timeout)
     except SdkError as e:
-        cleanup()
+        cleanup(settled=False)
         return finish(AttemptOutcome.SDK_ERROR, str(e))
 
     externally_cancelled = cancel is not None and cancel.is_requested
@@ -666,6 +678,7 @@ def run_attempt(
         drained.extend(redact(s) for s in ops.drain_events())
     except SdkError:
         pass
+    capture_usage(settled=False)
     try:
         ops.force_stop()
     except SdkError as e:
