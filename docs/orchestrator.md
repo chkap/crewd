@@ -102,6 +102,12 @@ overwriting into an apparently valid single candidate. `run_lead` returns a
 candidate only when `count == 1`; `count == 0` or `count > 1` resolves as an
 invalid solicitation with handoffs retained.
 
+A clean Lead turn that omits, duplicates, or malforms the required tool call
+retires that role's SDK conversation and advances to one fresh recovery
+generation. The next solicitation includes the prior protocol failure in a
+bounded `RECOVERY ATTEMPT N` prompt; transport failures keep their existing
+taint/cancellation handling.
+
 
 ## Role handoff channel (`submit_role_handoff`) (#12)
 

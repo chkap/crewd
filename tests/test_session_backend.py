@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from crewd.executor import AttemptRequest, SdkAttemptExecutor
 from crewd.session_backend import (
     AttemptConfig,
     AttemptOutcome,
@@ -452,6 +453,123 @@ def test_registry_tainted_active_advances_generation(tmp_path):
     assert d2.generation == d1.generation + 1  # advanced recovery generation
     assert d2.session_id != d1.session_id
     assert ts.is_tainted(d1.session_id)       # old taint record PRESERVED for audit
+
+
+def test_registry_retirement_starts_one_fresh_generation_then_resumes(tmp_path):
+    ts = TaintStore(tmp_path / "taint.txt")
+    reg = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    d1 = reg.decide(goal_label="goal:v1", role="lead", taint_store=ts)
+
+    assert reg.retire(
+        goal_label="goal:v1",
+        role="lead",
+        session_id=d1.session_id,
+        reason="missing decision tool call",
+    )
+    reopened = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    d2 = reopened.decide(goal_label="goal:v1", role="lead", taint_store=ts)
+    assert d2.resume is False
+    assert d2.generation == d1.generation + 1
+    assert d2.session_id != d1.session_id
+    assert d2.fresh_reason == "missing decision tool call"
+    assert not ts.is_tainted(d1.session_id)
+
+    reopened_again = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    d3 = reopened_again.decide(
+        goal_label="goal:v1", role="lead", taint_store=ts
+    )
+    assert d3.resume is True
+    assert d3.session_id == d2.session_id
+
+
+def test_registry_ignores_stale_retirement_request(tmp_path):
+    ts = TaintStore(tmp_path / "taint.txt")
+    reg = SessionRegistry(tmp_path / "sessions.json", workspace_id="ws1")
+    current = reg.decide(goal_label="goal:v1", role="lead", taint_store=ts)
+
+    assert not reg.retire(
+        goal_label="goal:v1",
+        role="lead",
+        session_id="stale-session",
+        reason="stale",
+    )
+    resumed = reg.decide(goal_label="goal:v1", role="lead", taint_store=ts)
+    assert resumed.resume is True
+    assert resumed.session_id == current.session_id
+
+
+def _lead_request(tmp_path) -> AttemptRequest:
+    return AttemptRequest(
+        role="lead",
+        model="test",
+        prompt="submit a decision",
+        config_dir=tmp_path / "cfg",
+        add_dirs=[],
+        cwd=tmp_path,
+        workspace_root=tmp_path,
+        goal_label="goal:v1",
+        timeout=1,
+        log_path=tmp_path / "lead.log",
+    )
+
+
+def test_lead_no_decision_retires_session_before_next_solicitation(tmp_path):
+    runtimes = []
+
+    def lead_factory(**kwargs):
+        ops = FakeOps(session_id=kwargs["session_id"], role="lead")
+        runtimes.append(ops)
+        return ops
+
+    req = _lead_request(tmp_path)
+    executor = SdkAttemptExecutor(lead_ops_factory=lead_factory)
+
+    first = executor.run_lead(req)
+    second = executor.run_lead(req)
+
+    assert first.decision is None
+    assert second.decision is None
+    assert first.generation == 0
+    assert second.generation == 1
+    assert first.session_id != second.session_id
+    assert runtimes[0].calls[0] == "open(resume=False)"
+    assert runtimes[1].calls[0] == "open(resume=False)"
+    assert "session retired" in req.log_path.read_text()
+
+
+def test_valid_lead_decision_keeps_session_resumable(tmp_path):
+    runtimes = []
+
+    def lead_factory(**kwargs):
+        capture = kwargs["capture"]
+
+        class DecisionOps(FakeOps):
+            def run(self, prompt: str, timeout: float) -> RunSignal:
+                capture.submit(
+                    {
+                        "kind": "dispatch",
+                        "role": "worker",
+                        "ack_handoff_ids": [],
+                    }
+                )
+                return super().run(prompt, timeout)
+
+        ops = DecisionOps(session_id=kwargs["session_id"], role="lead")
+        runtimes.append(ops)
+        return ops
+
+    req = _lead_request(tmp_path)
+    executor = SdkAttemptExecutor(lead_ops_factory=lead_factory)
+
+    first = executor.run_lead(req)
+    second = executor.run_lead(req)
+
+    assert first.decision is not None
+    assert second.decision is not None
+    assert first.generation == second.generation == 0
+    assert first.session_id == second.session_id
+    assert runtimes[0].calls[0] == "open(resume=False)"
+    assert runtimes[1].calls[0] == "open(resume=True)"
 
 
 # ─────────────────────── permission handler SDK contract ───────────────────────

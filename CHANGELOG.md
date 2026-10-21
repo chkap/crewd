@@ -4,6 +4,21 @@ All notable, user-facing changes to crewd are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crewd
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A clean Lead turn that fails the exactly-one decision-tool protocol now
+  retires its conversation, retries on one fresh session generation, and
+  includes the prior failure in the recovery prompt instead of repeatedly
+  resuming a context-stuck session.
+- Advisory handoffs can now publish to correctly bound consultation tasks that
+  were closed without an implementation PR; code-producing role handoffs retain
+  the merged-PR closure requirement.
+- Lead instructions now pin the exact canonical Worker-assignment attribution
+  line, preventing task routing loops caused by replacing the crew name with
+  descriptive prose.
+
 ## [0.1.1] — 2026-07-31
 
 Documentation and behavior refinements on top of 0.1.0. This is a

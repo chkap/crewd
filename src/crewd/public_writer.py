@@ -575,6 +575,7 @@ class PublicWriter:
             auth = self.bus.authorize_terminal(
                 task_number=task_number,
                 pr_number=(pr_number if pr_number else None),
+                allow_closed_without_pr=(role == "advisory"),
             )
             if not auth.ok:
                 disp = classify_route(auth.route)
@@ -694,8 +695,10 @@ class PublicWriter:
         task proceeds only when a merged linked PR closed it (idempotent terminal
         publication onto a legitimately-closed target); a wrong-repo/goal or
         deleted/unrelated-closed target is rejected as an invalid target rather
-        than blocking a human forever. ``pr_number`` is the linked PR carried as
-        closure provenance.
+        than blocking a human forever. Advisory tasks are the exception: they
+        intentionally produce no implementation PR, so a correctly bound closed
+        Advisory task remains a valid handoff target. ``pr_number`` is the linked
+        PR carried as closure provenance.
 
         The correlation id is the durable dispatcher ``handoff_id`` so the artifact
         is stable across crash/retry and the orchestrator can later prove the

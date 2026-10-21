@@ -437,6 +437,16 @@ class SessionRegistry:
         if entry is not None:
             active = entry.get("session_id")
             gen = int(entry.get("generation", 0))
+            if active and entry.get("create_pending"):
+                entry.pop("create_pending", None)
+                reason = entry.pop("fresh_reason", None)
+                self._save()
+                return SessionDecision(
+                    session_id=active,
+                    resume=False,
+                    generation=gen,
+                    fresh_reason=reason or f"retired prior {role} session",
+                )
             if active and not taint_store.is_tainted(active):
                 return SessionDecision(session_id=active, resume=True, generation=gen)
             # Active id is tainted → recover with a NEW generation (never reuse).
@@ -465,6 +475,40 @@ class SessionRegistry:
             generation=gen,
             fresh_reason="new (goal_epoch, role) session",
         )
+
+    def retire(
+        self,
+        *,
+        goal_label: str,
+        role: str,
+        session_id: str,
+        reason: str,
+    ) -> bool:
+        """Replace an active clean session after a role-protocol failure.
+
+        Retirement differs from tainting: the completed transport is not unsafe,
+        but its conversation should not be resumed after omitting the required
+        structured return. The expected-session check makes stale requests
+        harmless, and ``create_pending`` ensures the replacement is created once
+        before later attempts resume it normally.
+        """
+        state = self._load()
+        key = self._key(goal_label, role)
+        entry = state.get(key)
+        if entry is None or entry.get("session_id") != session_id:
+            return False
+
+        generation = int(entry.get("generation", 0)) + 1
+        state[key] = {
+            "session_id": build_session_id(
+                self.workspace_id, goal_label, role, generation
+            ),
+            "generation": generation,
+            "create_pending": True,
+            "fresh_reason": reason,
+        }
+        self._save()
+        return True
 
 
 # ─────────────────────────── the attempt state machine ───────────────────────────

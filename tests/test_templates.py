@@ -33,6 +33,8 @@ def test_render_lead_agent_includes_workspace_and_repo():
     # Dispatcher model: Lead routes via a single typed decision, not files/ticks.
     assert "submit_lead_decision" in out
     assert "Lead-directed dispatcher" in out
+    assert "> **[crewd:lead -> worker]** demo" in out
+    assert "never replace the crew name with `Assignment`" in out
     assert "finish" in out and "final_acceptance" in out
     assert "operator" in out  # operator stop distinct from finish
 
